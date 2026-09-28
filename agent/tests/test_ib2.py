@@ -28,7 +28,7 @@ import classifier
 import patch as patch_engine
 import triage
 from models import BlastRadiusTier
-from triage import TriagePolicy, triage_payload
+from triage import triage_payload
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 FIXTURE: Final[Path] = _REPO_ROOT / "tests" / "fixtures" / "oom-restartloop.yaml"
