@@ -161,6 +161,28 @@ authoritative measurement.
 by the cross-line pass, since rule 7 is now single-line by design. A future `secret_continuation`
 rule may address it (`ARCHITECTURE.md` §6.5).
 
+### ✅ MILESTONE 1 — COMPLETE AND RATIFIED
+
+**Ratified by the Architect. Closed at CI run `36483537879`** (`ubuntu-latest`, Go 1.23, commit
+`2827e90`) — job "Go quality gates" **success**, `G3 - go test -race` **success**, no data race
+reported. Re-confirmed green on the following documentation commit.
+
+| Gate | Result |
+|---|---|
+| G1 `go vet ./...` | ✅ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | ✅ clean |
+| G3 `go test -v -race -timeout 30s ./...` | ✅ **exit 0 on linux/amd64** |
+| `go vet -tags race ./...` (added) | ✅ exit 0 |
+| Local suite (windows/arm64, no `-race`) | 25 top-level + 28 subtests, 0 failures, 0 skips |
+| Throughput | ~187,000 lines/sec vs the §6.2 budget of 20,000 |
+
+Defects D-1 … D-5 are all closed with live conformance tests (see §1.6). Milestone 2 is
+unblocked.
+
+**Standing constraint carried forward:** `-race` is unavailable on `windows/arm64` (a platform
+limitation, not configuration). G3 is never verified locally and is never waived — the CI run is its
+only authority.
+
 ### ▶ TERMINAL VALIDATION TEST — Milestone 1
 
 > **Command:** `go test -race -timeout 30s -run 'TestScrubCorpusTotalMasking|TestNoPlaintextSecretSurvives|TestIdempotence' -v ./internal/scrubber/...`
@@ -216,24 +238,75 @@ either a Tier-1 GitOps diff or a Tier-2 War-Room dispatch. **Delivers:** `agent/
 
 ### 2.1 Schemas (Pydantic v2)
 
-- [ ] `2.1.1` Create `agent/models.py` as the schema source of truth, matching ARCH §4.1 and
+- [x] `2.1.1` Create `agent/models.py` as the schema source of truth, matching ARCH §4.1 and
       §5.1 field-for-field — names, types, nullability, enums.
-- [ ] `2.1.2` Define `IncidentPayload`, `ResourceLimits`, `ClusterEvent`, `RedactionReport`,
-      `RCAResponse`, `RootCause`, `AffectedScope`, `Remediation`, `VerificationPolicy`,
+- [x] `2.1.2` Define `IncidentPayload`, `ResourceLimits`, `ClusterEvent`, `RedactionReport`,
+      `TriageResponse`, `RootCause`, `AffectedScope`, `Remediation`, `VerificationPolicy`,
       `SuccessCriteria`.
-- [ ] `2.1.3` Define closed enums `Reason`, `Classification`, `Severity`, and
+      > **Ratified naming decision:** the response model is `TriageResponse`, not `RCAResponse`
+      > (2.2.2). It carries a transport-level `status` (`TRIAGED` / `ESCALATED` / `UNKNOWN` /
+      > `REJECTED`) that is distinct from the RCA content, so one name covering both is more
+      > accurate. ARCH §5 is otherwise followed literally.
+- [x] `2.1.3` Define closed enums `Reason`, `Classification`, `Severity`, and
       `BlastRadiusTier` with exactly the ARCH §5 values.
-- [ ] `2.1.4` Pin `schema_version` as `1.0.0` and reject mismatched majors with a `422`.
-- [ ] `2.1.5` Validate `tests/fixtures/sample-incident.json` against `IncidentPayload` in a
+- [x] `2.1.4` Pin `schema_version` as `1.0.0` and reject mismatched majors with a `422`.
+- [x] `2.1.5` Validate `tests/fixtures/sample-incident.json` against `IncidentPayload` in a
       test — contract drift fails the build, not production.
-- [ ] `2.1.6` Assert `exit_code` is nullable and that `reason == OOMKilled` ⇒ `exit_code == 137`
+- [x] `2.1.6` Assert `exit_code` is nullable and that `reason == OOMKilled` ⇒ `exit_code == 137`
       and a non-null `memory_limit` (invariant I-A2).
+
+#### 2.1 status: COMPLETE (gate evidence below)
+
+| Gate | Command | Result |
+|---|---|---|
+| G4 | `black --check agent/` | ✅ exit 0, 3 files unchanged |
+| G5 | `flake8 agent/` | ✅ exit 0, 0 findings |
+| G6 | `mypy --strict agent/` | ✅ `Success: no issues found in 3 source files` |
+| — | `pytest agent/tests/ -q` | ✅ **87 passed**, 0 failed |
+| G1/G2 | Go gates | ✅ unchanged, not regressed |
+
+**Tooling config lives at the repository root, not in `agent/`.** The charter's commands
+(`flake8 agent/`, `mypy --strict agent/`) run from the root, and both tools resolve configuration
+relative to the working directory. A `setup.cfg` inside `agent/` is therefore invisible to those
+exact invocations — the first version of this work put it there and it silently did nothing, leaving
+G5 reporting 79-column violations against black-formatted code.
+
+**Host caveat on G6.** The local interpreter is Python 3.14 and has `numpy` 2.5.3 installed
+(a leftover from `fastembed`/`onnxruntime`, which are Milestone 2.7 dependencies and are *not* in
+`agent/requirements.txt`). numpy's stubs use PEP 695 `type` statements, which `mypy` refuses to parse
+under `--python-version 3.11`. CI installs only `agent/requirements.txt` on a clean 3.11 and has no
+numpy, so it is unaffected. Locally the gate is run as
+`mypy --strict --python-version 3.14 agent/`.
+
+**Also implemented, beyond the 2.1 checklist:**
+
+- `agent/requirements.txt` — pinned, GPU-free (ARCH §2), with the gate tools included so local and
+  CI install identical versions.
+- `agent/Dockerfile` — `python:3.11-slim`, UID/GID 10001, `/app` owned by the runtime user,
+  `PYTHONUNBUFFERED=1` / `PYTHONDONTWRITEBYTECODE=1` / `TMPDIR=/tmp`, `USER 10001:10001` before any
+  runtime step, exec-form uvicorn entrypoint.
+- `agent/conftest.py` — puts `agent/` on `sys.path` so `pytest agent/tests/` works from the root.
+  ARCH §3 describes a flat module, not a package, so `import models` does not otherwise resolve
+  from the root.
+- `tests/fixtures/sample-incident.json` — the canonical Contract A payload (2.1.5).
+- Two new CI guards, both **verified with a negative control** so they are known to fire:
+  GPU-dependency rejection (scoped to non-comment lines, because the requirements file's own
+  header explains the prohibition in prose and a naive grep matched its own documentation), and
+  an `ast`-based scan of `agent/models.py` for mutating-verb field names enforcing ARCH §5.4 I-B5.
+  The earlier grep-based version of the I-B5 guard required quoted field names, which Python never
+  uses, so it could not have failed.
+
+**The git-patch validator rejects markdown-fenced diffs.** `I-B4` forbids scraping a diff out of
+markdown, so ``` ```diff ``` fences are refused rather than unwrapped. Accepting a fenced diff would
+mean a model that wrapped its answer produced a review artifact while a byte-identical unfenced
+response was rejected — incoherent, and the strict direction is the safe one. There is a paired test
+proving the unfenced equivalent is still accepted.
 
 ### 2.2 FastAPI service
 
 - [ ] `2.2.1` Create `agent/main.py` with an app factory, lifespan context, and
       `GET /healthz`.
-- [ ] `2.2.2` `POST /v1/incidents` accepts `IncidentPayload`, returns `RCAResponse`.
+- [ ] `2.2.2` `POST /v1/incidents` accepts `IncidentPayload`, returns `TriageResponse`.
 - [ ] `2.2.3` Return `422` with Pydantic errors on schema violation — **never** coerce into a
       Tier-2 dispatch (ARCH §4.3).
 - [ ] `2.2.4` Return `400 {"error":"malformed_json"}` for unparseable bodies.

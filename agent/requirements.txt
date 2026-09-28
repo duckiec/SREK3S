@@ -1,0 +1,20 @@
+# SREK3S Triage Agent — runtime and gate dependencies.
+#
+# ARCHITECTURE.md §2: Python 3.11-slim, Pydantic v2 + FastAPI, local inference
+# via fastembed or onnxruntime CPU only. NO PyTorch, NO CUDA, NO GPU packages.
+# The CI job greps this file for GPU dependencies and fails the build if one
+# appears, so that prohibition is mechanical rather than a convention.
+
+# --- runtime -------------------------------------------------------------
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+httpx>=0.27.0
+
+# --- quality gates (AGENTS.md §4: G4, G5, G6) ---------------------------
+# These are gates, not optional extras. They are pinned here so the local
+# environment and CI install the same tools.
+pytest>=8.0.0
+black>=24.1.0
+flake8>=7.0.0
+mypy>=1.8.0

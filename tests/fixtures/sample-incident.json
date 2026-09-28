@@ -1,0 +1,55 @@
+{
+  "_comment": [
+    "Canonical Contract A Incident Payload (ARCHITECTURE.md §4).",
+    "Synthetic. No real cluster, host, credential or identifier.",
+    "",
+    "ARCH §3.1 requires this file to be validated against agent/models.py in CI,",
+    "so drift between the Go emitter and the Python schemas fails the build",
+    "rather than surfacing as a production 422. See TestSampleIncidentFixtureMatchesSchema.",
+    "",
+    "Chosen to exercise the interesting cases at once:",
+    "  - reason=OOMKilled with exit_code=137, so I-A2 is actually checked",
+    "  - a non-null working_set alongside the limit, so the OOM story is coherent",
+    "  - logs that already contain the redaction sentinel, proving the payload",
+    "    arrived scrubbed",
+    "  - previous_reason set, for OOM-after-thrash detection"
+  ],
+  "schema_version": "1.0.0",
+  "incident_id": "inc_01HQ8S7G3M2K9X4B6D0F1R5TJA",
+  "timestamp": "2026-09-28T14:32:07.481Z",
+  "namespace": "payments",
+  "pod_name": "checkout-api-7d9f4b6c8d-x2k9p",
+  "container_name": "checkout-api",
+  "exit_code": 137,
+  "reason": "OOMKilled",
+  "resource_limits": {
+    "cpu_limit": "500m",
+    "cpu_request": "250m",
+    "memory_limit": "256Mi",
+    "memory_request": "128Mi",
+    "memory_working_set_bytes": 268435456
+  },
+  "restart_count": 4,
+  "previous_reason": "Completed",
+  "scrubbed_logs": [
+    "ts=2026-09-28T14:32:07.412Z level=error msg=\"alloc failure\" pod=10.42.3.19 conn=10.42.0.7:5432",
+    "ts=2026-09-28T14:32:07.419Z level=warn msg=\"retrying upstream\" request_id=8f14e45f-ceea-467a-9d9e-1f2b3c4d5e6f auth=Bearer [REDACTED]"
+  ],
+  "cluster_events": [
+    {
+      "type": "Warning",
+      "reason": "OOMKilled",
+      "message": "Container checkout-api was OOMKilled (exit code 137).",
+      "count": 4,
+      "first_timestamp": "2026-09-28T14:28:11.002Z",
+      "last_timestamp": "2026-09-28T14:32:07.470Z",
+      "involved_object": "pod/checkout-api-7d9f4b6c8d-x2k9p"
+    }
+  ],
+  "redaction_report": {
+    "total_redactions": 3,
+    "rules_triggered": ["aws_access_key_id", "bearer_token", "ipv4_address"]
+  },
+  "detection_latency_ms": 412,
+  "sentinel_version": "0.1.0"
+}

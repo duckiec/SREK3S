@@ -79,30 +79,38 @@ jobs:
     name: Python quality gates (G4, G5, G6)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Gated until the agent/ tree exists (Milestone 2). Kept in the file now so
-    # the gate set is complete and reviewed, rather than being retro-fitted
-    # later under time pressure.
-    if: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
+          # Pinned exactly, not to a range. The runtime image is
+          # python:3.11-slim (ARCH §2), and a floating 3.11.x would let the gate
+          # pass on an interpreter the container never runs.
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: agent/requirements.txt
 
       - name: Install agent dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install black flake8 mypy pytest
-          if [ -f agent/requirements.txt ]; then pip install -r agent/requirements.txt; fi
+          pip install -r agent/requirements.txt
+
+      - name: Reject GPU/torch dependencies (ARCH §2)
+        # AGENTS.md §2 forbids PyTorch, CUDA and GPU dependencies absolutely.
+        # Checked against non-comment lines only: the file's own header explains
+        # the prohibition in prose, and a naive grep matches its own
+        # documentation and fails the build for the wrong reason.
+        run: |
+          if grep -vE '^\s*#' agent/requirements.txt \
+             | grep -iE 'torch|cuda|cupy|nvidia|onnxruntime-gpu'; then
+            echo "::error::GPU dependency found in agent/requirements.txt (ARCH 2)"
+            exit 1
+          fi
+          echo "no GPU dependencies declared"
 
       - name: G4 — black
         run: black --check agent/
@@ -115,3 +123,50 @@ jobs:
 
       - name: Python unit tests
         run: pytest agent/tests/ -q
+
+      - name: No mutation verbs in the schema (ARCH 5.4 I-B5)
+        # I-B5: neither contract may contain a field capable of expressing a
+        # cluster write verb. A schema that grows an `apply_patch` or
+        # `kubectl_command` field would be the single most consequential
+        # regression this project can suffer.
+        #
+        # Introspected with `ast` rather than grepped. A grep on source text
+        # cannot distinguish a field from a comment or a docstring, and an
+        # earlier version of this step required quoted names, which Python
+        # field declarations never use - so it could not have failed.
+        run: |
+          python - <<'PY'
+          import ast, sys, pathlib
+
+          DENY = {
+              "apply", "apply_patch", "delete", "delete_resource", "patch",
+              "patch_resource", "scale", "rollout", "restart_rollout",
+              "exec", "exec_command", "cordon", "drain", "mutate",
+              "kubectl", "kubectl_command", "api_version", "rm", "replace",
+          }
+          # Legitimate names that contain a denied word as a substring.
+          ALLOW = {"git_patch", "patch_validated"}
+
+          src = pathlib.Path("agent/models.py").read_text(encoding="utf-8")
+          tree = ast.parse(src)
+
+          found, fields = set(), []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.ClassDef):
+                  for stmt in node.body:
+                      if isinstance(stmt, ast.AnnAssign) and isinstance(
+                          stmt.target, ast.Name
+                      ):
+                          fields.append((node.name, stmt.target.id))
+
+          for cls, name in fields:
+              if name in DENY and name not in ALLOW:
+                  found.add(f"{cls}.{name}")
+
+          print(f"schema fields inspected: {len(fields)}")
+          if found:
+              print("::error::mutating verb-shaped fields in agent/models.py: "
+                    + ", ".join(sorted(found)))
+              sys.exit(1)
+          print("no mutation verbs in schema")
+          PY
