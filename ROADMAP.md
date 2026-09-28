@@ -328,7 +328,12 @@ proving the unfenced equivalent is still accepted.
 - [x] `2.2.3` Return `422` with Pydantic errors on schema violation — **never** coerce into a
       Tier-2 dispatch (ARCH §4.3).
 - [x] `2.2.4` Return `400 {"error":"malformed_json"}` for unparseable bodies.
-- [ ] `2.2.5` `429 {"error":"sandbox_busy"}` when the sandbox budget is exhausted.
+- [x] `2.2.5` `429 {"error":"sandbox_busy"}` when the sandbox budget is exhausted.
+      **Implemented as a concurrency budget, not a cgroup sandbox.** `agent/budget.py` bounds
+      in-flight investigations and returns `429 {"error":"sandbox_busy"}` with `Retry-After`.
+      The envelope and the mechanism are real and tested, but the *sandbox* this is named after
+      does not exist until 2.4, so what is enforced today is concurrency only. Worth renaming
+      when the sandbox lands.
       **Deferred to 2.4.** No sandbox exists yet, so there is no budget to exhaust. The envelope
       is reserved in `main.py` and covered by the structured-error tests, but nothing can currently
       return 429. Ticking it now would claim a capability that does not exist.
@@ -419,15 +424,19 @@ this host cannot: layer resolution, `groupadd`/`useradd` succeeding in the slim 
 resolving on linux/amd64, and the read-only-rootfs runtime.
 
 ### 2.3 Deterministic classifier
-- [ ] `2.3.1` Create `agent/classifier.py` implementing the deny-by-default routing rule from
+- [x] `2.3.1` Create `agent/classifier.py` implementing the deny-by-default routing rule from
       ARCH §5.3 exactly.
-- [ ] `2.3.2` Implement all six Tier-1 preconditions: `OOMKilled`, `restart_count <=
+- [x] `2.3.2` Implement all six Tier-1 preconditions: `OOMKilled`, `restart_count <=
       policy.max_restarts` (default 5), single affected replica, healthy siblings, remedy shape
       in the `MEMORY_LIMIT_RECALIBRATION` allow-list, `risk_level != HIGH`.
-- [ ] `2.3.3` Default to `TIER_2_ARCHITECTURAL` when any precondition is unproven.
-- [ ] `2.3.4` Add table-driven tests: 10+ Tier-1 cases and 10+ Tier-2 cases, including
+- [x] `2.3.3` Default to `TIER_2_ARCHITECTURAL` when any precondition is unproven.
+- [x] `2.3.4` Add table-driven tests: 10+ Tier-1 cases and 10+ Tier-2 cases, including
+      10 Tier-1 and 10 Tier-2 cases, covering dependency failure, cascading 5xx and node-level
+      pressure. **Caveat:** "multi-pod correlation" is represented by node-pressure events
+      (`Evicted`, `MemoryPressure`, `NodeNotReady`), because Contract A carries a single pod and
+      cannot express genuine multi-pod correlation. That needs a wider input.
       multi-pod correlation, dependency failure, and cascading-error signatures.
-- [ ] `2.3.5` Assert the model's `confidence` value is **never** read by the router
+- [x] `2.3.5` Assert the model's `confidence` value is **never** read by the router
       (self-test: shuffle confidence, tier must not change).
 
 ### 2.4 Ephemeral investigation sandbox
@@ -448,15 +457,27 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       `RCAResponse`.
 - [ ] `2.5.2` Treat freeform markdown or non-JSON output as a **fatal** validation failure —
       no regex scrape, no best-effort parse, no partial response (invariant I-B4).
-- [ ] `2.5.3` Produce both deliverables: human-readable `rca_markdown` **and** machine-parsable
+- [x] `2.5.3` Produce both deliverables: human-readable `rca_markdown` **and** machine-parsable
+      Both `rca_markdown` and `remediation.git_patch` are populated on every response and asserted
+      separately; the patch is never fenced (I-B4).
       `remediation.git_patch`.
-- [ ] `2.5.4` Create `agent/patch.py` to synthesize a unified diff with `---`/`+++`/`@@`
+- [x] `2.5.4` Create `agent/patch.py` to synthesize a unified diff with `---`/`+++`/`@@`
       headers, repo-relative paths, no absolute paths, and no binary hunks.
 - [ ] `2.5.5` Validate every patch with `git apply --check --whitespace=nowarn` against the
+      **NOT DONE - and the current `patch_validated: true` is weaker than this checkbox.**
+      `patch_validated` is set after an in-process round-trip: the diff is applied back against
+      the real manifest text and asserted to change exactly the resolved line and no other. That
+      is a genuine verification of *applies to this manifest*, but it is not the `git apply
+      --check` that ARCH §5.4 I-B2 names and this checkbox requires - there is no GitOps checkout
+      to run it against. **I-B2 is therefore only partially satisfied, and this needs a
+      decision:** either wire a real `git apply --check` in, or amend I-B2 to say that
+      positional round-trip verification satisfies it.
       target manifest before setting `patch_validated: true`.
 - [ ] `2.5.6` On apply-check failure, **downgrade to Tier-2** with an empty patch. Never emit an
+      Not done: the downgrade path is real and tested, but it triggers on the positional
+      verification, not on the `git apply --check` failure this checkbox names.
       unvalidated diff (PRD R2).
-- [ ] `2.5.7` Enforce Tier-2 ⇒ `git_patch == ""` and `patch_validated == false` (invariant I-B1).
+- [x] `2.5.7` Enforce Tier-2 ⇒ `git_patch == ""` and `patch_validated == false` (invariant I-B1).
 - [ ] `2.5.8` Apply the ARCH §6 rule set as a defence-in-depth re-scan to every outbound string
       (invariant I-B6), using the same rule IDs.
 
@@ -465,26 +486,78 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 - [ ] `2.6.1` Create `agent/warroom.py` emitting an RCA + evidence bundle with no patch.
 - [ ] `2.6.2` Include incident identity, affected scope, scrubbed evidence, and the explicit
       "do not apply blindly" marker.
-- [ ] `2.6.3` Assert Tier-2 output contains **no** field capable of expressing a cluster write
+- [x] `2.6.3` Assert Tier-2 output contains **no** field capable of expressing a cluster write
       verb (invariant I-B5).
 
 ### 2.7 Dependencies and hardening
 
-- [ ] `2.7.1` Create `agent/requirements.txt` and `agent/pyproject.toml` with Pydantic v2 and
+- [x] `2.7.1` Create `agent/requirements.txt` and `agent/pyproject.toml` with Pydantic v2 and
       FastAPI.
-- [ ] `2.7.2` Add a CI assertion that **no** `torch`, `nvidia-*`, `cuda*`, or `tensorflow`
+- [x] `2.7.2` Add a CI assertion that **no** `torch`, `nvidia-*`, `cuda*`, or `tensorflow`
       package is present in the dependency tree (AGENTS §2).
 - [ ] `2.7.3` Add `deploy/agent.yaml` with `runAsUser/Group: 10001`, `readOnlyRootFilesystem:
       true`, `capabilities.drop: ["ALL"]`, `allowPrivilegeEscalation: false`,
       `seccompProfile: RuntimeDefault`, writable `emptyDir` at `/tmp` only.
-- [ ] `2.7.4` Set `PYTHONDONTWRITEBYTECODE=1` and `TMPDIR=/tmp` in the agent container.
+- [x] `2.7.4` Set `PYTHONDONTWRITEBYTECODE=1` and `TMPDIR=/tmp` in the agent container.
 
 ### 2.8 Milestone 2 quality gate
 
-- [ ] `2.8.1` `black --check agent/` exits `0`.
-- [ ] `2.8.2` `flake8 agent/` exits `0`.
-- [ ] `2.8.3` `mypy --strict agent/` exits `0`.
-- [ ] `2.8.4` `pytest agent/ -q` exits `0`.
+- [x] `2.8.1` `black --check agent/` exits `0`.
+      Verified on CI run `36492481971`, commit `abf7b15`, real CPython 3.11.16: 12 files unchanged, exit 0.
+- [x] `2.8.2` `flake8 agent/` exits `0`.
+      Verified on CI run `36492481971`: exit 0, 0 findings.
+- [x] `2.8.3` `mypy --strict agent/` exits `0`.
+      Verified on CI run `36492481971`: no issues in 12 source files.
+- [x] `2.8.4` `pytest agent/ -q` exits `0`.
+      Verified on CI run `36492481971`: **249 passed**, 0 failed.
+
+### 2.8 status: GATES GREEN, MILESTONE NOT COMPLETE
+
+**All quality gates pass.** CI run `36492481971`, commit `abf7b15`, conclusion `success`:
+
+| Gate | Result |
+|---|---|
+| G1 `go vet ./...` | ✅ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | ✅ clean |
+| G3 `go test -v -race -timeout 30s ./...` | ✅ green (never waived, ARCH AD-10) |
+| G4 `black --check agent/` | ✅ exit 0, 12 files |
+| G5 `flake8 agent/` | ✅ exit 0 |
+| G6 `mypy --strict agent/` | ✅ no issues in 12 source files |
+| `pytest agent/tests/ -q` | ✅ **249 passed** |
+| Container build | ✅ `docker build` green on ubuntu-latest |
+| Container runtime smoke | ✅ `main:app` imports; effective uid `10001` |
+
+**Milestone 2 is nevertheless NOT complete, and is deliberately not marked as such.** Gates passing
+says the code that exists is well-formed; it does not say the milestone's scope was built. Fourteen
+checkboxes remain open:
+
+- **`2.4.1`–`2.4.6` — the ephemeral investigation sandbox does not exist.** `agent/sandbox.py` is
+  absent. The concurrency budget in `agent/budget.py` bounds in-flight requests, which is what
+  `2.2.5` needed, but there is no disposable worker, no cgroup enforcement (`256Mi` / `500m`), no
+  monotonic deadline, and no teardown-on-timeout. The task brief described step 3 as "bounded
+  concurrency & 429 load shedding", which is the budget, not the sandbox.
+- **`2.5.1`/`2.5.2` — constrained decoding does not exist.** No `agent/llm.py`, so I-B4 (freeform
+  model output is a fatal failure) is unenforced. Milestone 2's analysis is entirely deterministic,
+  which is safe but is not the capability this milestone specifies.
+- **`2.5.5`/`2.5.6` — no `git apply --check`.** See the note on `2.5.5`: `patch_validated` currently
+  rests on positional round-trip verification, not the `git apply --check` ARCH §5.4 I-B2 names.
+  **This is the one item where the shipped behaviour is weaker than the written contract, and it
+  needs a decision rather than a checkbox.**
+- **`2.5.8` — no ARCH §6 defence-in-depth re-scan** of outbound strings. The Go node remains the
+  only control, contrary to I-B6.
+- **`2.6.1`/`2.6.2` — no `agent/warroom.py`.** `rca_markdown` carries an RCA, but there is no
+  evidence bundle and no explicit "do not apply blindly" marker as its own artifact.
+- **`2.7.3` — no `deploy/agent.yaml`.** The image is hardened and CI now asserts uid `10001` at
+  runtime, but the pod spec that would carry `readOnlyRootFilesystem`, `capabilities.drop`, and the
+  `/tmp` `emptyDir` is missing.
+
+**The Milestone 2 terminal validation test cannot pass as written.** It invokes
+`agent/tests/test_contracts.py`, `agent/tests/test_patch.py` and `agent/tests/test_classifier.py`,
+none of which exist — the coverage lives in `test_schemas.py`, `test_triage.py` and `test_api.py`.
+It also requires `tests/fixtures/oom-restartloop.yaml`, which is absent, and asserts the generated
+patch passes `git apply --check` against it, which is exactly the unimplemented `2.5.5`. Renaming
+the test files to match reality is a spec change and is left for ratification rather than done
+quietly.
 
 ### ▶ TERMINAL VALIDATION TEST — Milestone 2
 
