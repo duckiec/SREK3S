@@ -315,18 +315,79 @@ proving the unfenced equivalent is still accepted.
 
 ### 2.2 FastAPI service
 
-- [ ] `2.2.1` Create `agent/main.py` with an app factory, lifespan context, and
+- [x] `2.2.1` Create `agent/main.py` with an app factory, lifespan context, and
       `GET /healthz`.
-- [ ] `2.2.2` `POST /v1/incidents` accepts `IncidentPayload`, returns `TriageResponse`.
-- [ ] `2.2.3` Return `422` with Pydantic errors on schema violation — **never** coerce into a
+- [x] `2.2.2` `POST /v1/incidents` accepts `IncidentPayload`, returns `TriageResponse`.
+      **Both paths are served, one handler.** `/v1/incidents` is the canonical contract (ARCH §4,
+      and ROADMAP 3.4.4 has the Go emitter POST there in Milestone 3); `/api/v1/triage` is the
+      versioned-prefix form this task specified. The mistake is not symmetric — serving only the
+      alias would leave M3's emitter posting to a 404, surfacing only at integration — so both are
+      mounted on a single handler and `TestBothTriagePaths` asserts they cannot diverge. **Worth
+      ratifying:** if only one path is wanted, remove the other and update ARCH §4 plus 3.4.4 in the
+      same change.
+- [x] `2.2.3` Return `422` with Pydantic errors on schema violation — **never** coerce into a
       Tier-2 dispatch (ARCH §4.3).
-- [ ] `2.2.4` Return `400 {"error":"malformed_json"}` for unparseable bodies.
-- [ ] `2.2.5` Return `429 {"error":"sandbox_busy"}` when the sandbox budget is exhausted.
-- [ ] `2.2.6` Return `500 {"error":"analysis_failed"}` on unrecoverable failure, with the
+- [x] `2.2.4` Return `400 {"error":"malformed_json"}` for unparseable bodies.
+- [ ] `2.2.5` `429 {"error":"sandbox_busy"}` when the sandbox budget is exhausted.
+      **Deferred to 2.4.** No sandbox exists yet, so there is no budget to exhaust. The envelope
+      is reserved in `main.py` and covered by the structured-error tests, but nothing can currently
+      return 429. Ticking it now would claim a capability that does not exist.
+- [x] `2.2.6` Return `500 {"error":"analysis_failed"}` on unrecoverable failure, with the
       incident escalated to Tier-2.
 
-### 2.3 Deterministic classifier
+#### 2.2 status: COMPLETE (except 2.2.5, deferred to 2.4)
 
+| Gate | Result |
+|---|---|
+| G4 `black --check agent/` | ✅ exit 0, 7 files unchanged |
+| G5 `flake8 agent/` | ✅ exit 0, 0 findings |
+| G6 `mypy --strict agent/` | ✅ no issues in 7 source files |
+| `pytest agent/tests/ -q` | ✅ **143 passed**, 0 failed |
+| G1/G2 (Go) | ✅ unregressed |
+| Dockerfile static audit | ✅ **20/20** checks |
+| `docker build` | ❌ **BLOCKED — no container runtime on this host** |
+
+**Triage behaviour.** `OOMKilled` with a readable manifest and a container-local fault produces
+`TIER_1_TOIL` with a one-line unified diff raising `256Mi → 512Mi`. Everything else escalates:
+node pressure, a restart count above the policy ceiling, a crash loop, a dependency fault, an
+unparseable quantity, an unreadable manifest, or a manifest without the target line.
+
+**The running service escalates by default.** It is wired to `unreadable_manifest_provider()`, so
+with no GitOps checkout it cannot satisfy I-B2 and emits no patch. Fail-closed is the *normal* path
+until Milestone 2.5 provides a real checkout — not a corner case.
+
+**Three real bugs caught by the tests, all now fixed:**
+
+1. **Byte formatter iterated suffixes smallest-first**, so any multiple of 1024 rendered as `Ki`.
+   A 256Mi limit doubled to `524288Ki` instead of `512Mi` — numerically correct, but a form no
+   engineer writes and a reviewer has to stop and decode.
+2. **The replacement line lost its indentation.** The diff emitted `+memory: "512Mi"` at column 0,
+   which would produce an invalid manifest. A patch that breaks the file it claims to fix is worse
+   than no patch. The original line's leading whitespace is now preserved, and a test asserts the
+   indent is unchanged rather than matching a literal space count.
+3. **`"upstream"` was too weak a dependency signal.** The shared fixture contains
+   `retrying upstream call`, so a crash-loop incident was classified `DEPENDENCY_FAILURE` instead
+   of `CONFIGURATION_ERROR`. Both are Tier-2, so the safety property held, but the incident would
+   have reached the wrong war-room queue. Markers now require an actual *failed* connection.
+
+**Sibling health is an inference, and is labelled as one.** Contract A carries no observation of
+sibling containers, so `_siblings_healthy` infers containment from the fact that a *container-local*
+`OOMKilled` means the kernel enforced that container's cgroup limit — and returns `False` whenever a
+node-level signal (`Evicted`, `MemoryPressure`, …) is present. Without this predicate the Tier-1 path
+would be unreachable; with it, a node-wide memory shortage cannot be "fixed" by raising a limit that
+was never the problem. Milestone 2.4's sandbox replaces the inference with a direct observation.
+
+**Container build is BLOCKED, not waived.** `docker`, `podman`, `nerdctl` and `buildah` are all
+absent and no container service is running, so `docker build -t srek3s-agent:test -f agent/Dockerfile .`
+could not be executed. What *was* verified statically: 20/20 hardening checks (base image, UID/GID
+10001, nologin shell, `/app` ownership, `PYTHONDONTWRITEBYTECODE`, `TMPDIR`, `USER` preceding
+`ENTRYPOINT`, exec form, no `--privileged`/`cap_add`/`security_opt`, no root fallback, layer
+ordering), both `COPY` sources resolve from the repo-root build context, and `main:app` imports and
+registers its routes with only `agent/` on the path. What a real build would additionally prove and
+this host cannot: layer resolution, `groupadd`/`useradd` succeeding in the slim image, pip
+resolving on linux/amd64, and the read-only-rootfs runtime.
+
+### 2.3 Deterministic classifier
 - [ ] `2.3.1` Create `agent/classifier.py` implementing the deny-by-default routing rule from
       ARCH §5.3 exactly.
 - [ ] `2.3.2` Implement all six Tier-1 preconditions: `OOMKilled`, `restart_count <=
