@@ -170,3 +170,38 @@ jobs:
               sys.exit(1)
           print("no mutation verbs in schema")
           PY
+
+      # M2 container gate. AGENTS.md §2 requires a hardened runtime image, and
+      # ARCH §8's requirements are only meaningful if the image actually builds.
+      # ubuntu-latest ships a working Docker daemon, so this is the authority the
+      # development host cannot provide.
+      #
+      # Build context is the REPOSITORY ROOT, not agent/. The Dockerfile's COPY
+      # sources are repo-relative (`COPY agent/ /app/` and
+      # `COPY agent/requirements.txt`), so an agent/-rooted context would ask for
+      # agent/agent/, which does not exist, and the build would fail before
+      # reaching any of the hardening it exists to verify.
+      - name: Container build (hardened agent image)
+        run: |
+          docker build -t srek3s-agent:ci -f agent/Dockerfile .
+          echo "image built:"
+          docker images srek3s-agent:ci --format '  {{.Repository}}:{{.Tag}} {{.Size}}'
+
+      # A successful build is not proof the image can start. This catches the
+      # failure where the ENTRYPOINT names a module that does not resolve, or the
+      # app cannot be imported as the unprivileged runtime user - both of which
+      # would otherwise surface only at deploy time.
+      - name: Container runtime smoke (entrypoint resolves, runs as UID 10001)
+        run: |
+          echo "--- entrypoint target main:app must import ---"
+          docker run --rm --entrypoint python srek3s-agent:ci \
+            -c "import main; print('  main:app imported')"
+          echo "--- image must not run as root ---"
+          uid=$(docker run --rm --entrypoint id srek3s-agent:ci -u)
+          echo "  effective uid: $uid"
+          test "$uid" = "10001" || {
+            echo "::error::container runs as uid $uid, expected 10001 (AGENTS.md 2, ARCH 8)"
+            exit 1
+          }
+          echo "--- declared entrypoint ---"
+          docker inspect --format '  ENTRYPOINT {{json .Config.Entrypoint}}' srek3s-agent:ci

@@ -1,0 +1,32 @@
+# Build context exclusions for the agent image (AGENTS.md §2, ARCH §8).
+#
+# The context is the repository root because agent/Dockerfile COPYs repo-relative
+# paths. Without this file the daemon uploads everything, including host build
+# artefacts that would otherwise be baked into a production image.
+#
+# __pycache__ matters specifically: it holds bytecode compiled by whatever
+# interpreter the developer happened to use. Copying it into an image built on a
+# different Python version ships stale, useless bytecode and inflates the layer.
+
+# Host build artefacts
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/venv/
+**/.venv/
+
+# Version control
+.git/
+.github/
+
+# Test fixtures are not needed at runtime
+tests/
+
+# Nothing outside agent/ is consumed by the image
+internal/
+cmd/
+docs/
+*.md
