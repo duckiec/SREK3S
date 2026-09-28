@@ -577,7 +577,14 @@ func TestContextCancellation(t *testing.T) {
 		// Each line carries a secret unique to its index, so any unmasked line
 		// is detected unambiguously. The deadline is short enough to land
 		// mid-batch, and the assertion holds whether or not it fires.
-		const n = 4000
+		//
+		// Scaled down under -race: 4000 lines x 11 patterns is heavy, and
+		// ROADMAP 1.5.3 budgets 30s for the entire binary. The assertion is
+		// identical, only the batch is smaller.
+		n := 4000
+		if raceEnabled {
+			n = 600
+		}
 		lines := make([]string, n)
 		for i := range lines {
 			lines[i] = fmt.Sprintf(
@@ -714,10 +721,18 @@ func TestEmptyAndEdgeInputs(t *testing.T) {
 		if testing.Short() {
 			t.Skip("1 MiB single line skipped in -short mode")
 		}
-		big := strings.Repeat("password=hunter2 ", 1<<16)
+		// Halved under -race. Eleven patterns over 1 MiB of attacker-shaped text
+		// is the most expensive test in the package, and ROADMAP 1.5.3 gives the
+		// whole binary 30s. The behaviour under test (no panic, secret removed)
+		// is identical at half the size; only the volume differs.
+		shift := uint(16)
+		if raceEnabled {
+			shift = 15
+		}
+		big := strings.Repeat("password=hunter2 ", 1<<shift)
 		out := ScrubString(context.Background(), big)
 		if strings.Contains(out, "hunter2") {
-			t.Error("secret survived in a 1 MiB line")
+			t.Errorf("secret survived in a %d KiB line", len(big)>>10)
 		}
 	})
 

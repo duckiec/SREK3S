@@ -124,6 +124,20 @@ func BenchmarkScrubThroughputSynthetic(b *testing.B) {
 // a budget that silently regresses, so the same workload is measured here and
 // checked against the floor.
 func TestThroughputMeetsBudget(t *testing.T) {
+	// Skipped entirely under -race, not merely re-thresholded.
+	//
+	// ROADMAP 1.5.3 makes `go test -race -timeout 30s` the gate, and -timeout is
+	// a budget for the whole test binary, not per test. Measuring throughput
+	// inside a race-instrumented binary costs 5-20x, and the result is
+	// meaningless anyway: it measures the instrumentation, not the scrubber.
+	// A relaxed floor still spends that budget to produce a number nobody should
+	// act on, which is how a 30s gate starts timing out.
+	//
+	// The authoritative figures come from BenchmarkScrubThroughput, run
+	// uninstrumented in CI.
+	if raceEnabled {
+		t.Skip("throughput is not measurable under -race; see BenchmarkScrubThroughput")
+	}
 	if testing.Short() {
 		t.Skip("throughput assertion skipped in -short mode")
 	}
