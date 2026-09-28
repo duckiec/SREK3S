@@ -1,0 +1,109 @@
+name: ci
+
+# Remote execution of the AGENTS.md §4 quality gates.
+#
+# Why this exists: gate G3 is `go test -race`, and the Go race detector is not
+# supported on windows/arm64, which is the primary development host. G3 is
+# never waived (ARCHITECTURE.md AD-10), so it runs here on ubuntu-latest
+# instead. This workflow is the authoritative G3 record, and it is also the
+# authoritative measurement of the 20 MiB/s scrubber throughput target, which is
+# asserted at full strength only on the linux target platform.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.23"
+
+jobs:
+  go-gates:
+    name: Go quality gates (G1, G2, G3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Show toolchain
+        run: |
+          go version
+          go env GOOS GOARCH
+          echo "race detector available: $(go env GOOS)/$(go env GOARCH)"
+
+      - name: Resolve module dependencies
+        run: go mod download
+
+      - name: G1 — go vet
+        run: go vet ./...
+
+      - name: G2 — gofmt
+        # The charter's gate is: test -z "$(gofmt -l .)"
+        run: test -z "$(gofmt -l .)"
+
+      - name: G3 — go test -race
+        run: go test -v -race -timeout 30s ./...
+
+      - name: Benchmarks (informational)
+        # Not a gate: benchmarks report, they do not fail. The throughput
+        # *assertion* lives in the test suite; these runs are the human-readable
+        # record of it.
+        run: go test -run XXX -bench . -benchmem ./...
+
+  python-gates:
+    name: Python quality gates (G4, G5, G6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Gated until the agent/ tree exists (Milestone 2). Kept in the file now so
+    # the gate set is complete and reviewed, rather than being retro-fitted
+    # later under time pressure.
+    if: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 mypy pytest
+          if [ -f agent/requirements.txt ]; then pip install -r agent/requirements.txt; fi
+
+      - name: G4 — black
+        run: black --check agent/
+
+      - name: G5 — flake8
+        run: flake8 agent/
+
+      - name: G6 — mypy --strict
+        run: mypy --strict agent/
+
+      - name: Python unit tests
+        run: pytest agent/tests/ -q

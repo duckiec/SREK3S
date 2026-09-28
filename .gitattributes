@@ -1,0 +1,12 @@
+# Normalise line endings on checkout; keep LF in the repository.
+#
+# Without this, Windows converts the Go sources to CRLF in the working copy and
+# `test -z "$(gofmt -l .)"` (AGENTS.md §4 gate G2) becomes platform-dependent.
+
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf

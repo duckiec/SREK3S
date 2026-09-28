@@ -1,0 +1,27 @@
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/pprof/
+
+# Go
+*.test
+coverage.*
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local scratch
+tmpdump/
+probe_*.go
+scrubber.test
+cpu*.out

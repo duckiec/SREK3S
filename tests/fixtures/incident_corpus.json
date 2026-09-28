@@ -1,0 +1,347 @@
+{
+  "_comment": [
+    "SREK3S synthetic masking corpus (ROADMAP 1.4.1, PRD AC-2).",
+    "EVERY value in this file is fabricated. No real credential, key, host,",
+    "customer or identifier appears here, and none ever may: a leaked fixture",
+    "is itself a compliance incident.",
+    "Consumed by TestCorpusTotalMasking, TestNoPlaintextSecretSurvives and",
+    "BenchmarkScrubThroughput. `expect_masked: false` marks a negative control",
+    "that must survive untouched, so over-masking is caught alongside leaks."
+  ],
+  "version": "1.0.0",
+  "groups": [
+    {
+      "name": "basic_auth_uris",
+      "rule": "basic_auth_url",
+      "note": "ARCH 6.3: password only. Scheme, user, @, host and port survive.",
+      "cases": [
+        {
+          "id": "uri-postgres-ip",
+          "line": "dialing postgres://payments:hunter2@10.4.2.9:5432/payments",
+          "secret": "hunter2",
+          "expect_masked": true,
+          "must_survive": ["postgres://payments:", ":5432", "/payments"]
+        },
+        {
+          "id": "uri-mysql-hostname",
+          "line": "connecting mysql://root:s3cr3tP4ss@db.internal:3306/checkout",
+          "secret": "s3cr3tP4ss",
+          "expect_masked": true,
+          "must_survive": ["mysql://root:", "@db.internal:3306", "/checkout"]
+        },
+        {
+          "id": "uri-redis-db",
+          "line": "cache connect redis://cache-user:authToken99@redis.internal:6379/0",
+          "secret": "authToken99",
+          "expect_masked": true,
+          "must_survive": ["redis://cache-user:", "@redis.internal:6379", "/0"]
+        },
+        {
+          "id": "uri-amqp-vhost",
+          "line": "broker amqp://svc:pa55word@broker.internal/vhost",
+          "secret": "pa55word",
+          "expect_masked": true,
+          "must_survive": ["amqp://svc:", "@broker.internal", "/vhost"]
+        },
+        {
+          "id": "uri-no-credentials",
+          "line": "registry https://registry.internal:8443/v2/checkout",
+          "expect_masked": false,
+          "must_survive": ["https://registry.internal:8443/v2/checkout"]
+        }
+      ]
+    },
+    {
+      "name": "generic_secret_kv",
+      "rule": "generic_secret_kv",
+      "note": "ARCH 6.4 (D-1): JSON form, quote-separated keys and multi-word keys all match.",
+      "cases": [
+        {
+          "id": "kv-equals",
+          "line": "password=hunter2",
+          "secret": "hunter2",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-yaml-colon",
+          "line": "password: hunter2",
+          "secret": "hunter2",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-json-object",
+          "line": "{\"password\":\"hunter2\",\"user\":\"svc-checkout\"}",
+          "secret": "hunter2",
+          "expect_masked": true,
+          "must_survive": ["svc-checkout"]
+        },
+        {
+          "id": "kv-json-nested",
+          "line": "{\"db\":{\"api_key\":\"sk-live-abcdef123456\"},\"replicas\":3}",
+          "secret": "sk-live-abcdef123456",
+          "expect_masked": true,
+          "must_survive": ["replicas"]
+        },
+        {
+          "id": "kv-auth-token",
+          "line": "auth_token=abc123xyz789",
+          "secret": "abc123xyz789",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-access-token",
+          "line": "access_token=qqq111222333",
+          "secret": "qqq111222333",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-refresh-token",
+          "line": "refresh_token=zzz999888777",
+          "secret": "zzz999888777",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-hyphenated-key",
+          "line": "x-api-key=sk-live-9f8a7b6c5d4e3f2a1b",
+          "secret": "sk-live-9f8a7b6c5d4e3f2a1b",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-prefixed-key",
+          "line": "db_password=hunter2",
+          "secret": "hunter2",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-passphrase",
+          "line": "passphrase=correcthorsebattery",
+          "secret": "correcthorsebattery",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-authorization",
+          "line": "authorization=Basic dXNlcjpwYXNzd29yZA==",
+          "secret": "dXNlcjpwYXNzd29yZA==",
+          "expect_masked": true
+        },
+        {
+          "id": "kv-negative-token-count",
+          "line": "token_count=12345",
+          "expect_masked": false,
+          "must_survive": ["token_count=12345"]
+        },
+        {
+          "id": "kv-negative-secret-version",
+          "line": "secret_version=v3",
+          "expect_masked": false,
+          "must_survive": ["secret_version=v3"]
+        },
+        {
+          "id": "kv-negative-substring-key",
+          "line": "mytokenizer=abcdefgh",
+          "expect_masked": false,
+          "must_survive": ["mytokenizer=abcdefgh"]
+        },
+        {
+          "id": "kv-negative-password-policy",
+          "line": "password_policy=strict-mode-value",
+          "expect_masked": false,
+          "must_survive": ["password_policy=strict-mode-value"]
+        }
+      ]
+    },
+    {
+      "name": "aws",
+      "rule": "aws_access_key_id, aws_secret_access_key",
+      "cases": [
+        {
+          "id": "aws-access-key",
+          "line": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
+          "secret": "AKIAIOSFODNN7EXAMPLE",
+          "expect_masked": true
+        },
+        {
+          "id": "aws-access-key-role",
+          "line": "assume-role AROAI44QH8DHBEXAMPLE proceeding",
+          "secret": "AROAI44QH8DHBEXAMPLE",
+          "expect_masked": true,
+          "must_survive": ["assume-role", "proceeding"]
+        },
+        {
+          "id": "aws-secret-key",
+          "line": "aws_secret_access_key = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"",
+          "secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          "expect_masked": true
+        }
+      ]
+    },
+    {
+      "name": "tokens",
+      "rule": "jwt, bearer_token",
+      "cases": [
+        {
+          "id": "jwt",
+          "line": "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+          "secret": "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+          "expect_masked": true
+        },
+        {
+          "id": "bearer",
+          "line": "Authorization: Bearer abc123def456ghi789jkl",
+          "secret": "abc123def456ghi789jkl",
+          "expect_masked": true
+        }
+      ]
+    },
+    {
+      "name": "identifiers",
+      "rule": "uuid, ipv4_address",
+      "cases": [
+        {
+          "id": "uuid",
+          "line": "trace 7f3a1b2c-4d5e-4f60-8a9b-0c1d2e3f4a5b done",
+          "secret": "7f3a1b2c-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+          "expect_masked": true,
+          "must_survive": ["trace", "done"]
+        },
+        {
+          "id": "ipv4",
+          "line": "dialing 10.4.2.9:5432",
+          "secret": "10.4.2.9",
+          "expect_masked": true,
+          "must_survive": [":5432"]
+        },
+        {
+          "id": "ipv4-negative-invalid-octet",
+          "line": "version 999.1.1.1 is not a valid address",
+          "expect_masked": false,
+          "must_survive": ["999.1.1.1"]
+        },
+        {
+          "id": "ipv4-negative-three-octets",
+          "line": "client 10.4.2",
+          "expect_masked": false,
+          "must_survive": ["10.4.2"]
+        }
+      ]
+    },
+    {
+      "name": "k8s_service_accounts",
+      "rule": "k8s_secret_mount",
+      "note": "ARCH 6.4 (D-2): both word orders accepted.",
+      "cases": [
+        {
+          "id": "k8s-token-path-first",
+          "line": "reading /var/run/secrets/kubernetes.io/serviceaccount/token for kube-system",
+          "secret": "kube-system",
+          "expect_masked": true
+        },
+        {
+          "id": "k8s-namespace-first",
+          "line": "kube-system reading ca.crt for the apiserver",
+          "secret": "kube-system",
+          "expect_masked": true
+        },
+        {
+          "id": "k8s-node-lease",
+          "line": "kube-node-lease ca.crt loaded",
+          "secret": "kube-node-lease",
+          "expect_masked": true
+        },
+        {
+          "id": "k8s-negative-tokenizer",
+          "line": "tokenizer latency 4ms",
+          "expect_masked": false,
+          "must_survive": ["tokenizer latency 4ms"]
+        }
+      ]
+    },
+    {
+      "name": "pem_blocks",
+      "rule": "pem_private_key, private_key_pem_body",
+      "note": "Multi-line. D-3: the block body must not survive (ARCH 6.5).",
+      "multiline": true,
+      "cases": [
+        {
+          "id": "pem-rsa",
+          "lines": [
+            "loading key material",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEAy8Dbv8prpJ0kKhlGeJYozo2t60EG8L0561g13R29LvMR5hy",
+            "-----END RSA PRIVATE KEY-----",
+            "key material loaded"
+          ],
+          "secret": "MIIEowIBAAKCAQEAy8Dbv8prpJ0kKhlGeJYozo2t60EG8L0561g13R29LvMR5hy",
+          "expect_masked": true,
+          "must_survive": ["loading key material", "key material loaded"]
+        },
+        {
+          "id": "pem-pkcs8",
+          "lines": [
+            "-----BEGIN PRIVATE KEY-----",
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+            "-----END PRIVATE KEY-----"
+          ],
+          "secret": "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+          "expect_masked": true
+        },
+        {
+          "id": "pem-openssh",
+          "lines": [
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz",
+            "-----END OPENSSH PRIVATE KEY-----"
+          ],
+          "secret": "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz",
+          "expect_masked": true
+        },
+        {
+          "id": "pem-orphaned-begin",
+          "line": "truncated log: -----BEGIN RSA PRIVATE KEY----- <eof>",
+          "secret": "-----BEGIN RSA PRIVATE KEY-----",
+          "expect_masked": true,
+          "must_survive": ["truncated log:", "<eof>"]
+        }
+      ]
+    },
+    {
+      "name": "negative_controls",
+      "rule": null,
+      "note": "Ordinary operational telemetry. Must survive byte-for-byte.",
+      "cases": [
+        {
+          "id": "clean-session",
+          "line": "2026-09-28T14:03:11.001Z INFO checkout started tenant=acme-corp latency_ms=42",
+          "expect_masked": false,
+          "must_survive": ["2026-09-28T14:03:11.001Z INFO checkout started tenant=acme-corp latency_ms=42"]
+        },
+        {
+          "id": "clean-pool",
+          "line": "2026-09-28T14:03:11.233Z DEBUG pool checkout acquired conn id=1284 wait_ms=3",
+          "expect_masked": false
+        },
+        {
+          "id": "clean-query",
+          "line": "2026-09-28T14:03:11.455Z INFO db query ok table=orders rows=17 duration_ms=8",
+          "expect_masked": false
+        },
+        {
+          "id": "clean-retry",
+          "line": "2026-09-28T14:03:11.349Z WARN retrying upstream call attempt=2 backoff_ms=100",
+          "expect_masked": false
+        },
+        {
+          "id": "clean-probe",
+          "line": "2026-09-28T14:03:11.561Z INFO health probe /readyz status=200 duration_ms=2",
+          "expect_masked": false
+        },
+        {
+          "id": "clean-akia-prose",
+          "line": "the AKIA prefix is used by AWS",
+          "expect_masked": false,
+          "must_survive": ["the AKIA prefix is used by AWS"]
+        }
+      ]
+    }
+  ]
+}
