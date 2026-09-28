@@ -113,7 +113,7 @@ mypy --strict agent/
 
 - [x] `1.5.1` `go vet ./...` exits `0`.
 - [x] `1.5.2` `test -z "$(gofmt -l .)"` exits `0`.
-- [ ] `1.5.3` `go test -race -timeout 30s ./internal/scrubber/...` exits `0` with **no** data
+- [x] `1.5.3` `go test -race -timeout 30s ./internal/scrubber/...` exits `0` with **no** data
       races and **no** skipped tests.
 
 ### 1.6 Defects found in the ratified spec — RESOLVED
@@ -171,6 +171,40 @@ rule may address it (`ARCHITECTURE.md` §6.5).
 > **Maps to:** PRD AC-2, ARCH §6, invariants I-A1 and I-A5.
 >
 > **Done when:** all boxes in Milestone 1 are `[x]`, §1.5 is green, and this command exits `0`.
+
+#### ✅ Milestone 1 status: COMPLETE
+
+**G3 evidence.** CI run **36483324256**, `ubuntu-latest`, Go 1.23, commit `a48ac34` — job
+"Go quality gates" **success**, with `G3 - go test -race` **success** and no data race reported.
+This is the first and only run in which G3 executed rather than failing to build.
+
+| Gate | Result |
+|---|---|
+| G1 `go vet ./...` | ✅ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | ✅ clean |
+| G3 `go test -v -race -timeout 30s ./...` | ✅ **exit 0 on linux/amd64** |
+| `go vet -tags race ./...` (added) | ✅ exit 0 |
+| Local suite (windows/arm64, no `-race`) | 25 top-level + 28 subtests, 0 failures, 0 skips |
+| Throughput (windows/arm64) | ~187,000 lines/sec vs the §6.2 budget of 20,000 |
+
+**Three corrections made during the G3 push, recorded so they are not repeated:**
+
+1. **My first diagnosis of the G3 failure was wrong.** I attributed it to the 30s budget from
+   run *duration* alone and shipped a fix to test sizes. The actual cause was a **build-tag
+   defect**: `targetPlatform()`/`goPlatform()` lived in a `//go:build !race` file while
+   `benchmark_test.go` (untagged) called them, so the `-race` build failed to link. G1 and G2
+   could not see it because they typecheck the opposite variant. Corrected in `73ef836`.
+2. **The diagnostic step I added to surface the error broke the workflow.** Runs `36482677704`
+   and `36483065331` report **zero jobs** — the signature of a workflow that fails to parse, as
+   opposed to a step that fails. Two CI cycles lost to my own instrumentation. Reverted.
+3. **Prevention added:** `go vet -tags race ./...` in CI. It typechecks the exact file set G3
+   compiles, needs no race runtime, and turns this class of defect into a cheap red step before
+   G3 rather than an opaque link error.
+
+**Standing constraint:** `-race` is unavailable on `windows/arm64` (a platform limitation, not a
+configuration error). G3 is therefore never verified locally and is *never waived* — the CI run is
+its only authority. Any future change to build tags or platform-dependent test helpers must be
+checked against the `-race` file set, not just the default one.
 
 ---
 
