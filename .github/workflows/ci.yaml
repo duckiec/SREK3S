@@ -54,12 +54,12 @@ jobs:
       - name: G1 — go vet
         run: go vet ./...
 
-      # Not in AGENTS.md §4, but it is the check that would have caught a real
-      # outage: a helper defined only in a `!race`-tagged file is undefined
-      # under the -race build, so G3 fails to *compile* while G1 and G2 pass.
-      # Those two gates cannot see it, because they typecheck the other variant.
-      # This typechecks the -race file set without needing a race runtime.
-      - name: Typecheck the -race build variant
+      # Not in AGENTS.md 4, but it is the check that would have caught a real
+      # outage. A helper defined only in a "!race"-tagged file is undefined
+      # under the -race build, so G3 fails to compile while G1 and G2 pass:
+      # those two typecheck the other variant. This typechecks the -race file
+      # set without needing a race runtime.
+      - name: Typecheck -race build variant
         run: go vet -tags race ./...
 
       - name: G2 — gofmt
@@ -67,39 +67,7 @@ jobs:
         run: test -z "$(gofmt -l .)"
 
       - name: G3 — go test -race
-        # tee so the output is both shown in the log and captured to a file.
-        run: |
-          set -o pipefail
-          go test -v -race -timeout 30s ./... 2>&1 | tee ci-g3-output.txt
-
-      # TEMPORARY diagnostic, removed once G3 is green and stable. The Actions
-      # log API requires admin rights, so a red G3 is otherwise undiagnosable
-      # from outside. This republishes the output to a file in the repository,
-      # which is readable without authentication.
-      - name: Publish G3 output on failure
-        if: failure()
-        permissions:
-          contents: write
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p .ci-diagnostics
-          {
-            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "commit: ${{ github.sha }}"
-            echo "--- go test -v -race output ---"
-            cat ci-g3-output.txt 2>/dev/null || echo "(no captured output)"
-          } > .ci-diagnostics/g3-output.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .ci-diagnostics
-          if git diff --cached --quiet; then
-            echo "nothing new to publish"
-          else
-            git commit -m "ci: publish G3 output for run ${{ github.run_number }}"
-            git push || echo "push failed (branch may be protected)"
-          fi
-          rm -f ci-g3-output.txt || true
+        run: go test -v -race -timeout 30s ./...
 
       - name: Benchmarks (informational)
         # Not a gate: benchmarks report, they do not fail. The throughput
