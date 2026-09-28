@@ -688,8 +688,16 @@ class TestNoMarkdownContamination:
         assert not patch.lstrip().startswith("```")
 
     def test_schema_rejects_a_fenced_patch(self) -> None:
-        """The validator is the backstop if a future producer starts fencing."""
-        fenced = f"```diff\n{'-memory: \"256Mi\"'}\n```"
+        """The validator is the backstop if a future producer starts fencing.
+
+        The removed line is bound to a name first rather than embedded in the
+        f-string expression. A backslash inside an f-string expression is
+        PEP 701 and therefore Python 3.12+; CI runs 3.11 (AGENTS.md §2), where
+        it is a hard SyntaxError. Writing it inline made G5 fail on CI while
+        passing locally on 3.14 - see ``test_compat.py``.
+        """
+        removal = '-memory: "256Mi"'
+        fenced = f"```diff\n{removal}\n```"
         with pytest.raises(ValidationError, match="markdown-fenced"):
             Remediation.model_validate(
                 {

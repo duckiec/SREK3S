@@ -1,0 +1,28 @@
+# Black configuration for the Python gates (AGENTS.md §4, G4).
+#
+# Placed in agent/ rather than the repository root, deliberately.
+#
+# The gate command is `black --check agent/`, so black discovers configuration
+# from the common base of its sources - agent/ - and finds this file. The same
+# placement keeps it invisible to `mypy --strict agent/`: mypy resolves its
+# configuration relative to the *current working directory* (the repo root), so
+# it continues to read the [mypy] section of setup.cfg. Adding a pyproject.toml
+# at the root instead would have hijacked mypy's discovery and silently dropped
+# `mypy_path = agent`, which the flat module layout depends on.
+#
+# Why target-version is pinned rather than auto-detected:
+#
+# black infers a file's target versions from the syntax it finds, and that
+# inference is sensitive to the *host* interpreter. The same black 26.5.1
+# reformatted one file differently under CPython 3.11 than under 3.14. Left
+# unpinned, `black --check` is therefore not deterministic across development
+# hosts and CI, and G4 can pass locally while failing remotely for no reason
+# related to the code.
+#
+# Pinning to py311 matches the runtime image (python:3.11-slim, AGENTS.md §2)
+# and the interpreter CI installs. It also makes black refuse to *emit* syntax
+# newer than 3.11, so a PEP 701 construct fails G4 on the developer's machine
+# instead of surfacing as an E999 on CI. See agent/tests/test_compat.py, which
+# asserts the same property independently of black.
+[tool.black]
+target-version = ["py311"]
