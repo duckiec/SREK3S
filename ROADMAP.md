@@ -255,15 +255,26 @@ either a Tier-1 GitOps diff or a Tier-2 War-Room dispatch. **Delivers:** `agent/
 - [x] `2.1.6` Assert `exit_code` is nullable and that `reason == OOMKilled` ⇒ `exit_code == 137`
       and a non-null `memory_limit` (invariant I-A2).
 
-#### 2.1 status: COMPLETE (gate evidence below)
+#### 2.1 status: COMPLETE
 
-| Gate | Command | Result |
+**Confirmed on the remote runner.** CI run **36485670189** (`ubuntu-latest`, Python 3.11, commit
+`baf7b9b`): job "Python quality gates" **success**, every step green. The Go job also stayed green in
+the same run, so nothing regressed.
+
+| Gate | Local | CI (run 36485670189) |
 |---|---|---|
-| G4 | `black --check agent/` | ✅ exit 0, 3 files unchanged |
-| G5 | `flake8 agent/` | ✅ exit 0, 0 findings |
-| G6 | `mypy --strict agent/` | ✅ `Success: no issues found in 3 source files` |
-| — | `pytest agent/tests/ -q` | ✅ **87 passed**, 0 failed |
-| G1/G2 | Go gates | ✅ unchanged, not regressed |
+| G1 `go vet ./...` | ✅ exit 0 | ✅ success |
+| G2 `test -z "$(gofmt -l .)"` | ✅ clean | ✅ success |
+| G3 `go test -race -timeout 30s ./...` | n/a (unsupported on windows/arm64) | ✅ success |
+| G4 `black --check agent/` | ✅ exit 0 | ✅ success |
+| G5 `flake8 agent/` | ✅ exit 0 | ✅ success |
+| G6 `mypy --strict agent/` | ✅ 3 source files clean | ✅ success on **Python 3.11** |
+| — `pytest agent/tests/ -q` | ✅ 87 passed | ✅ success |
+| — GPU-dependency guard (ARCH §2) | ✅ verified | ✅ success |
+| — I-B5 mutation-verb guard (ARCH §5.4) | ✅ verified with negative control | ✅ success |
+
+The CI run of G6 on a genuine 3.11 with only `agent/requirements.txt` installed confirms the host
+caveat below was a local artifact and not a schema problem.
 
 **Tooling config lives at the repository root, not in `agent/`.** The charter's commands
 (`flake8 agent/`, `mypy --strict agent/`) run from the root, and both tools resolve configuration
