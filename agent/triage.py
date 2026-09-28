@@ -355,19 +355,27 @@ def _build_remediation_diff(
     )
 
     diff = patch_engine.build_diff(manifest_text, target, new_limit, TARGET_MANIFEST)
-    if not patch_engine.verify_patch(manifest_text, diff, target, new_limit):
+    # I-B2, in full: a structural round-trip *and* `git apply --check`. Both must
+    # pass before the patch may be emitted, and neither substitutes for the other.
+    verification = patch_engine.verify_patch(
+        manifest_text, diff, target, new_limit, TARGET_MANIFEST
+    )
+    if not verification.ok:
         return (
             None,
             None,
             [
-                "the synthesized diff did not apply cleanly to the target manifest, "
-                "so it is discarded rather than emitted unvalidated (ROADMAP 2.5.6)"
+                "I-B2 verification failed, so the patch is discarded rather than "
+                "emitted unvalidated (ROADMAP 2.5.6): " + verification.reason_text()
             ],
         )
 
     reasons.append(
         f"verified diff raises {memory_limit} to {new_limit} at "
         f"{target.indent.count(' ')} spaces of indentation"
+    )
+    reasons.append(
+        "I-B2 satisfied: structural round-trip and `git apply --check` both passed"
     )
     return diff, new_limit, reasons
 

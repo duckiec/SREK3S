@@ -40,17 +40,25 @@ incident is escalated - while a silent mis-read is not.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 __all__ = [
     "CONTEXT_LINES",
+    "GIT_APPLY_TIMEOUT_SECONDS",
     "MemoryLine",
+    "VerificationResult",
     "apply_unified_diff",
     "build_diff",
     "find_container_memory_limit",
+    "git_apply_check",
     "memory_values",
     "verify_patch",
+    "verify_patch_structure",
 ]
 #: Lines of context either side, matching git's default of 3.
 CONTEXT_LINES: Final[int] = 3
@@ -163,6 +171,13 @@ def find_container_memory_limit(
 
     in_named_container = False
     container_indent = -1
+    #: Effective indent of the `containers:` sequence entries. Kubernetes
+    #: manifests are full of *other* `- name:` sequence entries - named ports
+    #: and volume mounts use exactly that shape - and the only thing separating
+    #: them from a container entry is how deep they sit. The first `- name:`
+    #: directly under a `containers:` block establishes that depth; anything
+    #: deeper belongs to something else.
+    container_seq_indent: int | None = None
     # Enclosing scopes, innermost last.
     scopes: list[tuple[int, str]] = []
 
@@ -184,12 +199,41 @@ def find_container_memory_limit(
         indent = _indent_of(line) + (2 if is_item else 0)
 
         if is_item and key == "name":
-            # A new container scope opens. This also correctly *closes* the
-            # previous one, which is what keeps a sidecar from being mistaken
-            # for the target.
+            if "containers" not in [k for _, k in scopes]:
+                continue
+            if container_seq_indent is None:
+                container_seq_indent = indent
+            if indent != container_seq_indent:
+                # A named port or volume mount, not a container. Ignoring it is
+                # the whole point: treating these as containers silently
+                # switched the target off against any realistic Deployment, so
+                # every Tier-1 patch failed to locate its target. It failed
+                # closed - no wrong patch was emitted - but it escalated
+                # incidents that were cleanly remediable, which is the other
+                # half of being wrong. Found by tests/fixtures/oom-restartloop.yaml.
+                continue
+            # A container entry at the sequence's own depth. Opening a scope here
+            # also closes the previous container's, which is what stops a
+            # sibling container's limits being collected as candidates.
             in_named_container = value.strip("\"'") == container_name
             container_indent = indent
-            scopes = [(indent, "container")]
+            # `containers` is deliberately preserved rather than dropped, so a
+            # later sibling `- name:` at the same depth is still recognised as a
+            # container entry.
+            scopes = [entry for entry in scopes if entry[1] == "containers"] + [
+                (indent, "container")
+            ]
+            continue
+
+        # `containers` must be tracked before the container is known, because the
+        # `- name:` test above depends on it. Gating this behind
+        # in_named_container meant `containers` was never recorded, the guard
+        # could never pass, and *every* lookup returned None.
+        if key == "containers":
+            while scopes and scopes[-1][0] >= indent:
+                scopes.pop()
+            scopes.append((indent, "containers"))
+            container_seq_indent = None
             continue
 
         if not in_named_container:
@@ -198,7 +242,7 @@ def find_container_memory_limit(
         while scopes and scopes[-1][0] >= indent:
             scopes.pop()
 
-        if key in {"containers", "resources", "limits", "requests"}:
+        if key in {"resources", "limits", "requests"}:
             scopes.append((indent, key))
             continue
         if key != "memory":
@@ -334,7 +378,9 @@ def apply_unified_diff(original: str, diff: str) -> str | None:
     return "\n".join([*source[:old_start], *added, *source[old_start + old_count :]])
 
 
-def verify_patch(original: str, diff: str, target: MemoryLine, new_limit: str) -> bool:
+def verify_patch_structure(
+    original: str, diff: str, target: MemoryLine, new_limit: str
+) -> bool:
     """Confirm a diff applies and changes **only** the intended line.
 
     The check is positional, not value-based: the patched document must differ
@@ -363,3 +409,164 @@ def verify_patch(original: str, diff: str, target: MemoryLine, new_limit: str) -
     if differing != [target.index]:
         return False
     return after[target.index] == _render_replacement(target, new_limit)
+
+
+# ---------------------------------------------------------------------------
+# I-B2: `git apply --check`
+# ---------------------------------------------------------------------------
+
+#: Bound on every `git` invocation. AGENTS.md §3.2 requires every blocking
+#: operation to be deadline-bounded; an unbounded subprocess on the triage path
+#: is a way to wedge the very service that exists to respond to incidents.
+GIT_APPLY_TIMEOUT_SECONDS: Final[float] = 10.0
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """The combined I-B2 verdict, with the reasons it failed.
+
+    A bare boolean would be enough to gate on, but the caller has to record *why*
+    a patch was discarded in its escalation audit trail, so the failures travel
+    with the result rather than being dropped or recomputed.
+    """
+
+    ok: bool
+    structural_ok: bool
+    git_apply_ok: bool
+    failures: tuple[str, ...] = ()
+
+    def reason_text(self) -> str:
+        """A single line suitable for a Tier-2 escalation reason."""
+        return "; ".join(self.failures) if self.failures else "verified"
+
+
+def git_apply_check(
+    manifest_text: str,
+    diff: str,
+    path: str,
+    timeout_seconds: float = GIT_APPLY_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Run ``git apply --check`` against ``manifest_text`` placed at ``path``.
+
+    The manifest is materialised into a throwaway repository so the check runs
+    against the exact bytes the patch was derived from, with no dependency on a
+    GitOps checkout being present. That matters: I-B2 requires the patch to be
+    known to apply *to this manifest*, and validating against some other copy of
+    the repository would prove nothing about the file being patched.
+
+    Returns ``(passed, reason)``. Fails closed in every uncertain case - git
+    absent, git unable to initialise, a timeout - because an unverified patch
+    must never be presented as ``patch_validated``.
+    """
+    if path.startswith("/") or ":" in path:
+        return False, f"patch path must be repo-relative, got {path!r}"
+
+    git = shutil.which("git")
+    if git is None:
+        return False, "git is not available, so `git apply --check` cannot run"
+
+    with tempfile.TemporaryDirectory(prefix="srek3s-ib2-") as tmp:
+        root = Path(tmp)
+        target = root / path
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # newline="" so the bytes on disk match the manifest exactly. A
+            # platform newline translation would make the context lines differ
+            # from those in the diff for reasons unrelated to the patch, and the
+            # check would fail spuriously on Windows.
+            target.write_text(manifest_text, encoding="utf-8", newline="")
+            patch_file = root / "candidate.patch"
+            patch_file.write_text(
+                diff if diff.endswith("\n") else diff + "\n",
+                encoding="utf-8",
+                newline="",
+            )
+        except OSError as exc:
+            return False, f"could not stage the manifest for verification: {exc}"
+
+        try:
+            init = subprocess.run(
+                [git, "init", "-q"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            if init.returncode != 0:
+                return False, f"git init failed: {init.stderr.strip()[:120]}"
+
+            # `-c safe.directory=*` avoids the dubious-ownership refusal some
+            # hosts raise for a freshly created temp directory. Passing it
+            # per-invocation means no user or system git config is read or
+            # written, which matters for a process that handles incident data.
+            checked = subprocess.run(
+                [
+                    git,
+                    "-c",
+                    "safe.directory=*",
+                    "apply",
+                    "--check",
+                    "--whitespace=nowarn",
+                    str(patch_file),
+                ],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"`git apply --check` exceeded {timeout_seconds}s"
+        except OSError as exc:
+            return False, f"`git apply --check` could not be executed: {exc}"
+
+        if checked.returncode == 0:
+            return True, "git apply --check passed"
+        diagnostic = checked.stderr.strip() or checked.stdout.strip() or "no diagnostic"
+        return False, f"`git apply --check` rejected the patch: {diagnostic[:160]}"
+
+
+def verify_patch(
+    original: str,
+    diff: str,
+    target: MemoryLine,
+    new_limit: str,
+    path: str,
+    git_checker: bool = True,
+) -> VerificationResult:
+    """Full I-B2 verification: structural round-trip **and** ``git apply --check``.
+
+    Both checks must pass. The structural check proves the diff changes exactly
+    the resolved line and nothing else; ``git apply --check`` proves an
+    independent implementation of the unified-diff format accepts it against
+    this manifest. Neither subsumes the other - the first would not notice a
+    malformed hunk header if the line arithmetic happened to work out, and the
+    second cannot tell a correct patch from one aimed at the wrong field.
+
+    ``git_checker`` exists so the fail-closed path can be exercised on a host
+    with no git binary. It is not a production escape hatch: callers leave it on.
+    """
+    failures: list[str] = []
+
+    structural_ok = verify_patch_structure(original, diff, target, new_limit)
+    if not structural_ok:
+        failures.append(
+            "structural round-trip failed: applying the diff to the manifest did "
+            "not change exactly the resolved line and nothing else"
+        )
+
+    git_ok = False
+    if git_checker:
+        git_ok, git_reason = git_apply_check(original, diff, path)
+        if not git_ok:
+            failures.append(git_reason)
+    else:
+        failures.append("`git apply --check` was disabled for this call")
+
+    return VerificationResult(
+        ok=structural_ok and git_ok,
+        structural_ok=structural_ok,
+        git_apply_ok=git_ok,
+        failures=tuple(failures),
+    )
