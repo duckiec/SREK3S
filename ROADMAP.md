@@ -337,15 +337,46 @@ proving the unfenced equivalent is still accepted.
 
 #### 2.2 status: COMPLETE (except 2.2.5, deferred to 2.4)
 
+**Authoritative evidence: CI run `36489573043`, commit `ab659c0`, conclusion `success`.** Every Python
+step green on real CPython 3.11, and G3 `go test -race` green (never waived, ARCH AD-10).
+
 | Gate | Result |
 |---|---|
-| G4 `black --check agent/` | ✅ exit 0, 7 files unchanged |
+| G4 `black --check agent/` | ✅ exit 0, 8 files unchanged |
 | G5 `flake8 agent/` | ✅ exit 0, 0 findings |
-| G6 `mypy --strict agent/` | ✅ no issues in 7 source files |
-| `pytest agent/tests/ -q` | ✅ **143 passed**, 0 failed |
-| G1/G2 (Go) | ✅ unregressed |
+| G6 `mypy --strict agent/` | ✅ no issues in 8 source files |
+| `pytest agent/tests/ -q` | ✅ **148 passed**, 0 failed |
+| G1/G2/G3 (Go) | ✅ unregressed; G3 green on CI |
 | Dockerfile static audit | ✅ **20/20** checks |
 | `docker build` | ❌ **BLOCKED — no container runtime on this host** |
+
+**The first 2.2 commit passed every local gate and still failed CI's G5.** Worth recording because the
+signature was misleading: G4 *passed* and G5 *failed*, which reads like a formatting disagreement but
+was actually the interpreter.
+
+`agent/tests/test_api.py:692` contained an f-string with a backslash inside its expression part — PEP
+701, valid from Python 3.12. The dev host runs 3.14, where it parses; CI pins 3.11 (AGENTS.md §2),
+where it is a hard `SyntaxError`, so flake8 reported **E999** remotely while black, mypy and pytest
+were all green locally. Confirmed by compiling every source with a real CPython 3.11.16:
+`f-string expression part cannot include a backslash`.
+
+Three gaps this exposed, all now closed:
+
+1. **`ast.parse(feature_version=(3,11))` does not gate PEP 701.** The cheap syntax check gave a false
+   pass. Detection in `test_compat.py` is therefore textual, and additionally compiles every source
+   with a real 3.11 when one is reachable.
+2. **`black --check` was not deterministic across hosts.** The same black 26.5.1 reformatted a file
+   differently under 3.11 than 3.14, because auto target-detection is host-sensitive.
+   `agent/pyproject.toml` pins `target-version = ["py311"]`. It lives in `agent/` rather than the repo
+   root on purpose: black resolves config from the common base of its sources, but **mypy** resolves it
+   from the CWD, so a root `pyproject.toml` would have hijacked mypy's discovery and silently dropped
+   `mypy_path = agent`. Verified empirically that mypy still reads `setup.cfg`.
+3. **A UTF-8 BOM in `pyproject.toml` breaks black** with `TOMLDecodeError` at line 1. BOMs are
+   forbidden by the TOML spec; stripped, and the repo is audited clean.
+
+The new guard was validated with a negative control: planting the exact construct fails it on **both**
+3.14 and 3.11, and real 3.11 rejects the plant. (A first control attempt planted `chr(92)` instead of
+a literal backslash and passed — the guard was right and the control was wrong.)
 
 **Triage behaviour.** `OOMKilled` with a readable manifest and a container-local fault produces
 `TIER_1_TOIL` with a one-line unified diff raising `256Mi → 512Mi`. Everything else escalates:
