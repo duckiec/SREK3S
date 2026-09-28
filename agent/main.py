@@ -13,7 +13,7 @@ Status       Body                                Meaning
 ===========  ==================================  ===========================
 ``400``      ``{"error":"malformed_json"}``      body is not parseable JSON
 ``422``      Pydantic validation errors          contract violation; fatal
-``429``      ``{"error":"sandbox_busy"}``        sandbox at budget; retry
+``429``      ``{"error":"sandbox_busy"}``        active-job budget reached
 ``500``      ``{"error":"analysis_failed"}``     unrecoverable; Tier-2
 ===========  ==================================  ===========================
 
@@ -33,19 +33,28 @@ conceal exactly the signal that matters.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Final
 
 from fastapi import FastAPI, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 import triage
+from budget import JobBudget, budget_from_env
 from models import IncidentPayload, TriageResponse
 
-__all__ = ["TRIAGE_PATH", "TRIAGE_PATH_ALIAS", "app", "create_app"]
+__all__ = [
+    "TRIAGE_PATH",
+    "TRIAGE_PATH_ALIAS",
+    "JobBudget",
+    "app",
+    "create_app",
+]
 
 logger = logging.getLogger("srek3s.agent")
 
@@ -54,6 +63,12 @@ logger = logging.getLogger("srek3s.agent")
 _CORRELATION_HEADER: Final[str] = "X-SREK3S-Request-Id"
 
 _ERROR_MALFORMED_JSON: Final[str] = "malformed_json"
+_ERROR_SANDBOX_BUSY: Final[str] = "sandbox_busy"
+
+#: Seconds a refused caller should wait before retrying. Long enough that a
+#: saturated service is not immediately re-saturated by the same client, short
+#: enough that shedding load recovers quickly.
+_RETRY_AFTER_SECONDS: Final[int] = 2
 _ERROR_ANALYSIS_FAILED: Final[str] = "analysis_failed"
 _ERROR_NOT_FOUND: Final[str] = "not_found"
 _ERROR_METHOD_NOT_ALLOWED: Final[str] = "method_not_allowed"
@@ -69,7 +84,7 @@ TRIAGE_PATH_ALIAS: Final[str] = "/api/v1/triage"
 _TRIAGE_RESPONSES: Final[dict[int | str, dict[str, str]]] = {
     400: {"description": "unparseable body"},
     422: {"description": "contract violation; not retried (ARCH 4.3)"},
-    429: {"description": "sandbox at budget; retry with jitter (reserved, see 2.4)"},
+    429: {"description": "active-job budget reached; retry with jitter"},
     500: {"description": "analysis failed; incident escalated to Tier-2"},
 }
 
@@ -83,16 +98,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     environment because the read-only root filesystem forbids a log file, so
     logs go to stdout for the container runtime to collect (ARCH §8).
     """
-    import os
-
     logging.basicConfig(
         level=os.environ.get("SREK3S_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    budget = getattr(app.state, "job_budget", None)
     logger.info(
         "srek3s agent starting: version=%s manifest_provider=unreadable "
-        "(tier-1 patches require a GitOps checkout, ARCH 5.4 I-B2)",
+        "(tier-1 patches require a GitOps checkout, ARCH 5.4 I-B2) "
+        "max_active_jobs=%s",
         triage.AGENT_VERSION,
+        getattr(budget, "max_active", "unknown"),
     )
     yield
     logger.info("srek3s agent shutting down")
@@ -107,11 +123,37 @@ def _error(status_code: int, code: str, request_id: str) -> JSONResponse:
     )
 
 
-def create_app() -> FastAPI:
+def _busy(request_id: str, budget: JobBudget) -> JSONResponse:
+    """The 429 envelope (ARCH §4.3, ROADMAP §2.2.5).
+
+    ``Retry-After`` is included because 429 is defined as retryable, and the
+    caller is told how long to wait. The Sentinel is expected to add jitter: a
+    synchronised retry against a saturated service is how a brief overload
+    becomes a sustained one.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": _ERROR_SANDBOX_BUSY,
+            "request_id": request_id,
+            "retry_after_seconds": _RETRY_AFTER_SECONDS,
+        },
+        headers={
+            _CORRELATION_HEADER: request_id,
+            "Retry-After": str(_RETRY_AFTER_SECONDS),
+        },
+    )
+
+
+def create_app(job_budget: JobBudget | None = None) -> FastAPI:
     """Application factory.
 
     A factory rather than a module-level singleton so tests can build an
     isolated instance per test without leaking state between them.
+
+    ``job_budget`` is injectable so a test can set a tiny budget, or hold a slot
+    open deliberately, and observe the 429 path against the real handler rather
+    than against a mock of it.
     """
     application = FastAPI(
         title="SREK3S Triage Agent",
@@ -142,9 +184,19 @@ def create_app() -> FastAPI:
         response.headers[_CORRELATION_HEADER] = request_id
         return response
 
+    # The budget lives on app.state so the handler can reach it, so tests can
+    # inspect counters, and so it is replaced wholesale per instance rather than
+    # shared between tests through a module global.
+    application.state.job_budget = job_budget or budget_from_env()
+
     # -- Health probes -----------------------------------------------------
     # Deliberately unauthenticated and deliberately trivial: a probe that
     # depends on a downstream service turns a restart loop into a cascade.
+    #
+    # Probes are explicitly *not* subject to the job budget. A probe queued
+    # behind saturated analysis would fail exactly when the service is least
+    # able to help, and the kubelet would then restart a process that was
+    # behaving correctly - turning load into a crash loop.
 
     @application.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -193,6 +245,31 @@ def create_app() -> FastAPI:
         """
         request_id = getattr(request.state, "request_id", uuid.uuid4().hex)
 
+        # Admission control, before any parsing or analysis work is done.
+        #
+        # The budget is acquired around the *whole* handler so the slot covers
+        # every unit of work the request causes, not just the triage call. The
+        # release is in a `finally` on the lease, so an exception or a client
+        # disconnect cannot leak a slot; a leaked slot would ratchet the service
+        # into refusing everything, which is the worst failure mode available to
+        # a guard whose job is to keep the service serving.
+        budget: JobBudget = request.app.state.job_budget
+        with budget.slot() as admitted:
+            if not admitted:
+                # Refused immediately, not queued: see agent/budget.py.
+                logger.warning(
+                    "job budget saturated incident_id=%s request_id=%s "
+                    "active=%d max_active=%d",
+                    "<unparsed>",
+                    request_id,
+                    budget.active,
+                    budget.max_active,
+                )
+                return _busy(request_id, budget)
+            return await _triage_locked(request, request_id)
+
+    async def _triage_locked(request: Request, request_id: str) -> Any:
+        """The triage handler proper, run with a job slot held."""
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001 - any parse failure is malformed_json
@@ -239,8 +316,26 @@ def create_app() -> FastAPI:
                 headers={_CORRELATION_HEADER: request_id},
             )
 
+        # The triage engine is synchronous and CPU-bound. Calling it inline from
+        # an async handler blocks the event loop for its whole duration, which
+        # stalls *every other request*, including the liveness probe.
+        #
+        # Measured with a 500 ms triage and a probe issued once triage had begun:
+        # inline, the probe returned after 516 ms; in the threadpool, after
+        # 14 ms. That matters because a probe that stalls past
+        # timeoutSeconds x failureThreshold is reported as a failed check, and the
+        # kubelet restarts a process that is behaving correctly - so load would
+        # become a crash loop.
+        #
+        # A note on what this does *not* change: the job budget above would bind
+        # either way. Concurrency comes from `await request.json()` suspending
+        # before the budget check, not from this. An earlier version of this
+        # comment claimed otherwise, and a negative control disproved it.
+        #
+        # The slot is still acquired and released on the event loop, so the
+        # counter's check-and-increment atomicity is unchanged.
         try:
-            outcome = triage.triage_payload(payload)
+            outcome = await run_in_threadpool(triage.triage_payload, payload)
         except Exception:  # noqa: BLE001 - catch-all, see module docstring
             # The traceback stays server-side. An unrecoverable failure escalates
             # the incident to Tier-2, which is the safe direction: a human sees

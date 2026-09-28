@@ -19,16 +19,19 @@ The tests are grouped by what they are protecting:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from pathlib import Path
 from typing import Any, Final, Iterator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import triage
+from budget import DEFAULT_MAX_ACTIVE, MAX_ACTIVE_ENV, JobBudget, budget_from_env
 from main import TRIAGE_PATH, TRIAGE_PATH_ALIAS, create_app
 from models import (
     BlastRadiusTier,
@@ -179,7 +182,9 @@ class TestSuccessfulTriage:
         outcome = triage_payload(payload, manifest_provider=provider)
 
         assert outcome.tier is BlastRadiusTier.TIER_1_TOIL
-        assert outcome.reasons == []
+        # A Tier-1 outcome records how the diff was verified, not just that it
+        # was emitted. The audit trail is the reason `reasons` exists at all.
+        assert any("verified diff raises 256Mi to 512Mi" in r for r in outcome.reasons)
         response = outcome.response
         assert response.blast_radius_tier is BlastRadiusTier.TIER_1_TOIL
         assert response.status.value == "TRIAGED"
@@ -450,10 +455,22 @@ class TestFailClosed:
 
         Correcting an entrypoint or a config error requires reading the
         application, which is outside the enumerated Tier-1 remedy shapes.
+
+        A configuration *verdict* needs a configuration signal. The fixture's own
+        logs ("alloc failure", "retrying upstream") carry none, so they are
+        replaced here with one that does - otherwise the honest classification
+        would be UNKNOWN, which the next test covers.
         """
         document = sample_document()
         document.update(
-            {"reason": "CrashLoopBackOff", "exit_code": 1, "restart_count": 4}
+            {
+                "reason": "CrashLoopBackOff",
+                "exit_code": 1,
+                "restart_count": 4,
+                "scrubbed_logs": [
+                    "Traceback (most recent call last): entrypoint not found"
+                ],
+            }
         )
         payload = IncidentPayload.model_validate(document)
         outcome = triage_payload(
@@ -465,6 +482,32 @@ class TestFailClosed:
 
         assert outcome.tier is BlastRadiusTier.TIER_2_ARCHITECTURAL
         assert outcome.response.classification is Classification.CONFIGURATION_ERROR
+        assert outcome.response.remediation.git_patch == ""
+        assert outcome.response.remediation.risk_level.value == "HIGH"
+
+    def test_crashloop_without_any_signal_is_unknown_not_configuration(self) -> None:
+        """A crash-loop *reason* is a symptom; it is not a root cause.
+
+        Treating ``reason == CrashLoopBackOff`` as sufficient proof of a
+        configuration fault meant an incident with no recognisable evidence at
+        all could never reach UNKNOWN - exactly backwards from fail-closed, and
+        it sent unclassifiable incidents to a specific, wrong queue instead of
+        the generic one.
+        """
+        document = sample_document()
+        document.update(
+            {
+                "reason": "CrashLoopBackOff",
+                "exit_code": 1,
+                "restart_count": 4,
+                "scrubbed_logs": ["  ", "zzz", "\x01\x02"],
+            }
+        )
+        payload = IncidentPayload.model_validate(document)
+        outcome = triage_payload(payload)
+        assert outcome.response.classification is Classification.UNKNOWN
+        assert outcome.response.status.value == "UNKNOWN"
+        assert outcome.tier is BlastRadiusTier.TIER_2_ARCHITECTURAL
         assert outcome.response.remediation.git_patch == ""
         assert outcome.response.remediation.risk_level.value == "HIGH"
 
@@ -585,7 +628,9 @@ class TestFailClosed:
 
         assert outcome.tier is BlastRadiusTier.TIER_2_ARCHITECTURAL
         assert outcome.response.remediation.git_patch == ""
-        assert any("cannot be proven" in r for r in outcome.reasons)
+        assert any(
+            "could not uniquely locate" in r for r in outcome.reasons
+        ), outcome.reasons
 
     def test_unreadable_manifest_forces_tier2(self) -> None:
         payload = IncidentPayload.model_validate(sample_document())
@@ -660,6 +705,408 @@ class TestFailClosed:
         # invariants correctly reject the rest, so the matrix is not padded with
         # invalid rows to reach a rounder number.
         assert checked >= 80, f"matrix shrank unexpectedly: {checked} cases"
+
+
+# ---------------------------------------------------------------------------
+# Active-job budget: 429 sandbox_busy (ROADMAP 2.2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestJobBudgetUnit:
+    """The guard in isolation, before any HTTP is involved."""
+
+    def test_acquires_up_to_the_limit_then_refuses(self) -> None:
+        budget = JobBudget(max_active=2)
+        assert budget.try_acquire() is True
+        assert budget.try_acquire() is True
+        assert budget.try_acquire() is False
+        assert budget.rejected == 1
+
+    def test_release_frees_a_slot(self) -> None:
+        budget = JobBudget(max_active=1)
+        assert budget.try_acquire() is True
+        assert budget.try_acquire() is False
+        budget.release()
+        assert budget.try_acquire() is True
+
+    def test_slot_releases_even_when_the_body_raises(self) -> None:
+        """A leaked slot would ratchet the service into permanent 429s.
+
+        The guard exists to keep the service serving; if it can be broken by an
+        ordinary exception it becomes the outage instead of preventing one.
+        """
+        budget = JobBudget(max_active=1)
+        with pytest.raises(RuntimeError):
+            with budget.slot() as admitted:
+                assert admitted is True
+                raise RuntimeError("analysis blew up")
+        assert budget.active == 0
+        with budget.slot() as admitted:
+            assert admitted is True
+
+    def test_slot_yields_false_when_exhausted_and_does_not_leak(self) -> None:
+        budget = JobBudget(max_active=1)
+        with budget.slot() as first:
+            assert first is True
+            with budget.slot() as second:
+                assert second is False
+        # The refused slot must not have decremented the held one.
+        assert budget.active == 0
+
+    def test_available_and_saturated_track_state(self) -> None:
+        budget = JobBudget(max_active=3)
+        assert budget.available == 3
+        assert budget.saturated is False
+        budget.try_acquire()
+        budget.try_acquire()
+        assert budget.available == 1
+        budget.try_acquire()
+        assert budget.available == 0
+        assert budget.saturated is True
+
+    def test_peak_is_tracked(self) -> None:
+        budget = JobBudget(max_active=2)
+        budget.try_acquire()
+        budget.try_acquire()
+        budget.release()
+        budget.try_acquire()
+        assert budget.peak == 2
+
+    def test_release_never_drifts_negative(self) -> None:
+        """A double release must not silently raise the effective budget."""
+        budget = JobBudget(max_active=2)
+        budget.release()
+        budget.release()
+        budget.release()
+        assert budget.active == 0
+        assert budget.available == 2
+
+    def test_nonsense_budget_is_clamped_rather_than_honoured(self) -> None:
+        """A budget of 0 would refuse everything and look like an outage."""
+        assert JobBudget(max_active=0).max_active == 1
+        assert JobBudget(max_active=-5).max_active == 1
+
+    def test_default_budget_is_usable(self) -> None:
+        assert budget_from_env({}).max_active == DEFAULT_MAX_ACTIVE
+
+    def test_env_budget_is_honoured(self) -> None:
+        assert budget_from_env({MAX_ACTIVE_ENV: "7"}).max_active == 7
+
+    def test_malformed_env_budget_falls_back_and_does_not_raise(self) -> None:
+        """An agent that refuses to start over a ConfigMap typo is an outage."""
+        assert budget_from_env({MAX_ACTIVE_ENV: "not-a-number"}).max_active == (
+            DEFAULT_MAX_ACTIVE
+        )
+
+    def test_zero_env_budget_is_clamped(self) -> None:
+        assert budget_from_env({MAX_ACTIVE_ENV: "0"}).max_active == 1
+
+
+class TestJobBudgetOverHttp:
+    """429 behaviour through the real handler, not a mock of it."""
+
+    def test_saturated_budget_returns_429(self) -> None:
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            # Hold the only slot, exactly as an in-flight analysis would.
+            with budget.slot():
+                response = client.post(TRIAGE_PATH, json=sample_document())
+        assert response.status_code == 429
+        assert response.json()["error"] == "sandbox_busy"
+
+    def test_429_carries_retry_after(self) -> None:
+        """429 is defined as retryable, so the caller is told how long to wait."""
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                response = client.post(TRIAGE_PATH, json=sample_document())
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "2"
+        assert response.json()["retry_after_seconds"] == 2
+
+    def test_429_carries_a_correlation_id(self) -> None:
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                response = client.post(TRIAGE_PATH, json=sample_document())
+        assert response.json()["request_id"]
+        assert "X-SREK3S-Request-Id" in response.headers
+
+    def test_429_leaks_no_host_detail(self) -> None:
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                body = client.post(TRIAGE_PATH, json=sample_document()).text
+        for leak in ("Traceback", "/app/", "site-packages", 'File "', "pydantic_core"):
+            assert leak not in body, f"429 envelope leaked {leak!r}"
+
+    def test_both_paths_shed_load_identically(self) -> None:
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                canonical = client.post(TRIAGE_PATH, json=sample_document())
+                alias = client.post(TRIAGE_PATH_ALIAS, json=sample_document())
+        assert canonical.status_code == alias.status_code == 429
+
+    def test_slot_is_released_after_a_successful_request(self) -> None:
+        """Sequential requests must never accumulate leases."""
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            for _ in range(5):
+                assert (
+                    client.post(TRIAGE_PATH, json=sample_document()).status_code == 200
+                )
+        assert budget.active == 0
+        assert budget.peak == 1
+
+    def test_slot_is_released_after_a_rejected_request(self) -> None:
+        """A 400 must not leak a slot; only the analysis path is expensive."""
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            assert client.post(TRIAGE_PATH, content=b"{bad").status_code == 400
+            assert client.post(TRIAGE_PATH, json=sample_document()).status_code == 200
+        assert budget.active == 0
+
+    def test_slot_is_released_after_a_validation_failure(self) -> None:
+        budget = JobBudget(max_active=1)
+        document = sample_document()
+        del document["namespace"]
+        with TestClient(create_app(job_budget=budget)) as client:
+            assert client.post(TRIAGE_PATH, json=document).status_code == 422
+            assert client.post(TRIAGE_PATH, json=sample_document()).status_code == 200
+        assert budget.active == 0
+
+    def test_health_probes_are_exempt_from_the_budget(self) -> None:
+        """A probe queued behind analysis would restart a healthy process.
+
+        The kubelet would see a saturated agent as unhealthy and restart it,
+        turning a load spike into a crash loop. Probes must answer regardless.
+        """
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                assert client.get("/healthz").status_code == 200
+                assert client.get("/readyz").status_code == 200
+
+    def test_a_full_budget_recovers_once_slots_are_returned(self) -> None:
+        """Shedding must be transient, not sticky."""
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                assert (
+                    client.post(TRIAGE_PATH, json=sample_document()).status_code == 429
+                )
+            assert client.post(TRIAGE_PATH, json=sample_document()).status_code == 200
+        assert budget.rejected == 1
+
+    def test_rejections_are_counted_for_observability(self) -> None:
+        budget = JobBudget(max_active=1)
+        with TestClient(create_app(job_budget=budget)) as client:
+            with budget.slot():
+                for _ in range(3):
+                    client.post(TRIAGE_PATH, json=sample_document())
+        assert budget.rejected == 3
+
+    def test_larger_budget_admits_more_concurrent_slots(self) -> None:
+        budget = JobBudget(max_active=3)
+        with TestClient(create_app(job_budget=budget)) as client:
+            held = [budget.slot() for _ in range(3)]
+            for lease in held:
+                lease.__enter__()
+            try:
+                assert (
+                    client.post(TRIAGE_PATH, json=sample_document()).status_code == 429
+                )
+            finally:
+                for lease in held:
+                    lease.__exit__(None, None, None)
+            assert client.post(TRIAGE_PATH, json=sample_document()).status_code == 200
+
+
+class TestJobBudgetUnderRealConcurrency:
+    """429 under genuine simultaneous load, not by holding slots by hand.
+
+    The other tests in this section drive the guard directly, which proves the
+    accounting but not that the handler actually reaches it. This one fires
+    concurrent requests at the real ASGI app with a deliberately slow triage and
+    checks that some of them are shed.
+
+    Note on scope: an earlier draft of this class claimed it would catch a
+    design flaw where the inline triage call blocked the event loop. A negative
+    control disproved that - the budget binds either way, because concurrency
+    comes from `await request.json()` suspending before the budget check.
+    The blocking flaw is real but different, and it is covered by
+    `test_liveness_probe_answers_while_a_slow_triage_is_in_flight` below.
+    """
+
+    @staticmethod
+    def _slow_triage(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace triage with a version that yields the event loop.
+
+        ``time.sleep`` rather than ``asyncio.sleep``: the real engine is
+        synchronous and runs in the threadpool, so blocking a worker thread is
+        exactly the condition the budget exists to bound.
+        """
+        import time as time_module
+
+        original = triage.triage_payload
+
+        def slow(payload: object) -> object:
+            time_module.sleep(0.25)
+            return original(payload)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(triage, "triage_payload", slow)
+
+    def test_concurrent_burst_is_shed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        asyncio.run(self._burst(monkeypatch, 8, expect_shed=True))
+
+    def test_budget_never_exceeds_its_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        asyncio.run(self._observe_peak(monkeypatch, 3, 10))
+
+    def test_all_slots_are_returned_after_a_burst(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        asyncio.run(self._recover(monkeypatch, 2))
+
+    def test_liveness_probe_answers_while_a_slow_triage_is_in_flight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blocked event loop turns load into a crash loop.
+
+        The engine is synchronous. Called inline it blocks the loop, so a probe
+        issued during a long triage cannot be answered until that triage
+        finishes. Past ``timeoutSeconds x failureThreshold`` the kubelet reads
+        that as a failed check and restarts a process that was working fine, so
+        the guard here is what stops a busy agent from being killed by the
+        liveness probe.
+
+        Measured against the moment triage actually began, with a 1 s triage:
+        inline the probe returns after ~1 s, in the threadpool after ~15 ms. The
+        threshold is set far from both so the test is not timing-flaky - it only
+        has to distinguish "waited for the triage" from "did not".
+        """
+        import time as time_module
+
+        original = triage.triage_payload
+        began: list[float] = []
+
+        def slow(payload: object) -> object:
+            began.append(time_module.perf_counter())
+            time_module.sleep(1.0)
+            return original(payload)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(triage, "triage_payload", slow)
+        app = create_app(job_budget=JobBudget(max_active=8))
+
+        async def body() -> float:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as http:
+                post = asyncio.create_task(
+                    http.post(TRIAGE_PATH, json=sample_document())
+                )
+                while not began:
+                    await asyncio.sleep(0.001)
+                probe = await http.get("/healthz")
+                assert probe.status_code == 200
+                elapsed = time_module.perf_counter() - began[0]
+                await post
+                return elapsed
+
+        elapsed = asyncio.run(body())
+        assert elapsed < 0.5, (
+            f"liveness probe waited {elapsed:.3f}s for a 1s triage - the event "
+            "loop is being blocked, so the kubelet would see a failed probe and "
+            "restart a healthy process"
+        )
+
+    # -- coroutine bodies ---------------------------------------------------
+    # Driven with asyncio.run from synchronous tests rather than through
+    # pytest-asyncio. That keeps a plugin and an asyncio marker out of the
+    # dependency set for three tests, which is a better trade than adding one.
+
+    async def _burst(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        clients: int,
+        expect_shed: bool,
+    ) -> None:
+        self._slow_triage(monkeypatch)
+        budget = JobBudget(max_active=2)
+        app = create_app(job_budget=budget)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            responses = await asyncio.gather(
+                *(
+                    http.post(TRIAGE_PATH, json=sample_document())
+                    for _ in range(clients)
+                )
+            )
+
+        codes = [r.status_code for r in responses]
+        if expect_shed:
+            assert 429 in codes, f"expected shedding under load, got {codes}"
+        for response in responses:
+            if response.status_code == 429:
+                assert response.json()["error"] == "sandbox_busy"
+
+    async def _observe_peak(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int, clients: int
+    ) -> None:
+        """The cap must hold under contention.
+
+        A check-then-increment that raced would overshoot, and a budget that
+        overshoots is worse than no budget: it looks enforced.
+        """
+        self._slow_triage(monkeypatch)
+        budget = JobBudget(max_active=limit)
+        app = create_app(job_budget=budget)
+        observed: list[int] = []
+
+        original_triage = triage.triage_payload
+
+        def watching(payload: object) -> object:
+            observed.append(budget.active)
+            return original_triage(payload)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(triage, "triage_payload", watching)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            await asyncio.gather(
+                *(
+                    http.post(TRIAGE_PATH, json=sample_document())
+                    for _ in range(clients)
+                )
+            )
+
+        assert observed, "no request reached triage"
+        assert (
+            max(observed) <= limit
+        ), f"budget overshot: peak {max(observed)} > {limit}"
+
+    async def _recover(self, monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
+        """Shedding must be transient. Leaked slots mean permanent refusal."""
+        self._slow_triage(monkeypatch)
+        budget = JobBudget(max_active=limit)
+        app = create_app(job_budget=budget)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            await asyncio.gather(
+                *(http.post(TRIAGE_PATH, json=sample_document()) for _ in range(6))
+            )
+            # With every slot returned, a fresh request must be admitted.
+            response = await http.post(TRIAGE_PATH, json=sample_document())
+
+        assert response.status_code == 200
+        assert budget.active == 0
 
 
 # ---------------------------------------------------------------------------
