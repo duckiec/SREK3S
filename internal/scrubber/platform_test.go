@@ -1,5 +1,3 @@
-//go:build !race
-
 package scrubber
 
 import "runtime"
@@ -10,8 +8,15 @@ import "runtime"
 //
 // The ARCH §6.2 throughput budget of 20,000 lines/sec/core is stated for that
 // platform. Go's regexp is pure Go and its cost varies materially by
-// architecture, so the budget is only enforced at full strength here and
-// elsewhere a reduced floor applies. See TestThroughputMeetsBudget.
+// architecture, so the budget is only enforced at full strength here; other
+// build contexts use a reduced floor. See linesPerSecondFloor.
+//
+// This file deliberately has NO build tag. An earlier version defined these
+// helpers in a file tagged `!race`, which meant that under `-race` — the exact
+// build AGENTS.md §4 gate G3 requires — the symbols were undefined and the
+// package failed to compile. The helper is platform logic, not race logic, so
+// it must be present in every build. Only raceEnabled, which genuinely varies,
+// is behind a build tag.
 func targetPlatform() bool {
 	if runtime.GOOS != "linux" {
 		return false

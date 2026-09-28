@@ -54,6 +54,14 @@ jobs:
       - name: G1 — go vet
         run: go vet ./...
 
+      # Not in AGENTS.md §4, but it is the check that would have caught a real
+      # outage: a helper defined only in a `!race`-tagged file is undefined
+      # under the -race build, so G3 fails to *compile* while G1 and G2 pass.
+      # Those two gates cannot see it, because they typecheck the other variant.
+      # This typechecks the -race file set without needing a race runtime.
+      - name: Typecheck the -race build variant
+        run: go vet -tags race ./...
+
       - name: G2 — gofmt
         # The charter's gate is: test -z "$(gofmt -l .)"
         run: test -z "$(gofmt -l .)"
