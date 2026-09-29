@@ -249,59 +249,111 @@ jobs:
           sudo k3s ctr version
           echo "containerd socket reachable as $(id -un) via sudo"
 
-      - name: Pull and Tag Busybox in k3s containerd
-        timeout-minutes: 10
+      # ---------------------------------------------------------------
+      # 5b. Pull busybox, and split from tagging so a failure names itself.
+      #
+      # History, because the reasoning here is not obvious from the code.
+      # This step passed once (run 36641223509, sha 2d1f968) and then failed
+      # twice with byte-identical code (36642545390, 36643340284). The first
+      # failure had no retry loop at all and the second had one, so "the pull
+      # is flaky and needs retrying" is refuted by the data: the second run
+      # had a single attempt and the third had six, and neither passed.
+      #
+      # The real defect is that `ctr`'s global --timeout flag DEFAULTS TO 0,
+      # which means wait-forever. A stalled TCP connection to the registry
+      # therefore blocks until the step's own timeout-minutes kills the
+      # process, and GitHub reports a killed step with conclusion=failure -
+      # byte-identical to a pull that returned an error. Both failures are
+      # consistent with a hang, and a hang is invisible without logs.
+      #
+      # A retry loop cannot fix an unbounded wait: every attempt inherits the
+      # same wait and the step timeout kills the process partway through the
+      # first one. Bounding each attempt is what converts a hang into a
+      # retryable failure. The budget below is chosen to fit:
+      #   30s gate + 4 x 60s attempts + 3+6+9s backoff = 228s, against 600s.
+      # Six attempts at 90s would be 615s and would not fit - the previous
+      # revision's loop was arithmetically incapable of completing.
+      # ---------------------------------------------------------------
+      - name: Pull Busybox into k3s containerd
+        timeout-minutes: 15
         run: |
           set -euo pipefail
-          MIRROR="public.ecr.aws/docker/library/busybox:1.36.1"
-          # Readiness gate, then a resilient pull. Both exist because this step
-          # passed on 2d1f968 and failed on 8254b91 with byte-identical code, so
-          # it is a race or a transient rather than a deterministic fault, and a
-          # first-failure abort is the wrong response to either.
-          #
-          # The gate is the substantive part. The previous step confirmed the
-          # containerd *socket* answers `ctr version`, which proves the daemon
-          # process is up and not that its image service is serving. Neither does
-          # the apiserver's /readyz: the apiserver can be ready while containerd
-          # is still initialising its content and image stores. That is the same
-          # shape as the namespace-scoping defect found in Milestone 3 - a
-          # precondition satisfied by the wrong check.
+
+          # Wait for containerd's image service specifically, not just its
+          # socket. `ctr version` succeeding proves the daemon process is up,
+          # which is not the same as its content and image stores being
+          # initialised - the same shape as the M3 namespace-scoping defect,
+          # a precondition satisfied by the wrong check.
           echo "Waiting for containerd image service..."
-          for i in $(seq 1 30); do
-            if sudo k3s ctr --namespace k8s.io images list >/dev/null 2>&1; then
-              echo "containerd image service is ready."
+          ready=0
+          for i in $(seq 1 20); do
+            if sudo k3s ctr --timeout 5s --namespace k8s.io images list \
+                 >/dev/null 2>&1; then
+              ready=1
               break
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "::error::containerd image service did not become ready."
-              exit 1
             fi
             sleep 1
           done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::containerd image service did not become ready in 20 attempts"
+            exit 1
+          fi
+          echo "containerd image service is ready."
 
-          # Backoff, not a tight loop: the remaining candidate is a transient
-          # registry pull from a shared runner, and retrying immediately would
-          # reproduce the condition that caused the failure.
-          for attempt in 1 2 3 4 5 6; do
-            if sudo k3s ctr --namespace k8s.io images pull "$MIRROR"; then
-              echo "Pull successful."
-              break
-            fi
-            if [ "$attempt" -eq 6 ]; then
-              echo "::error::pull failed after 6 attempts"
-              exit 1
-            fi
-            echo "  pull attempt $attempt failed; retrying in $((attempt * 3))s"
-            sleep $((attempt * 3))
+          # --timeout 60s on EVERY attempt. This is the load-bearing flag. It
+          # is a global ctr flag, before the subcommand, exactly like
+          # --namespace, and its default of 0 means "no timeout" rather than
+          # "instant". Without it a single stalled connection consumes the
+          # entire step budget and no retry can be reached.
+          ATTEMPT=60s
+
+          # Two registries, and the zero-auth one is tried first.
+          #
+          # public.ecr.aws requires a token dance: manifest GET returns 401
+          # with a WWW-Authenticate challenge, then a second request to the
+          # token endpoint, then the manifest. That is three round trips and
+          # three places to fail, on the critical path of a step that is
+          # already the slowest thing in the workflow.
+          #
+          # mirror.gcr.io answers the manifest directly with 200 and no
+          # authentication at all. Both were verified reachable from outside
+          # before being written here. Order is not cosmetic: the first entry
+          # is the one that usually succeeds, and if it is the one that hangs
+          # the bounded timeout moves us to the second rather than to a step
+          # failure.
+          REF=""
+          for candidate in \
+            "mirror.gcr.io/library/busybox:1.36.1" \
+            "public.ecr.aws/docker/library/busybox:1.36.1"; do
+            for attempt in 1 2 3; do
+              echo "pull attempt $attempt: $candidate (timeout $ATTEMPT)"
+              if sudo k3s ctr --timeout "$ATTEMPT" --namespace k8s.io \
+                   images pull "$candidate"; then
+                REF="$candidate"
+                break 2
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "  attempt $attempt failed; sleeping $((attempt * 3))s"
+                sleep $((attempt * 3))
+              fi
+            done
+            echo "  giving up on $candidate"
           done
+          if [ -z "$REF" ]; then
+            echo "::error::could not pull busybox from either registry"
+            exit 1
+          fi
+          echo "pulled $REF"
 
-          # Both names. The fixtures reference `busybox:1.36.1`, which containerd
-          # resolves to `docker.io/library/busybox:1.36.1`; tagging only the mirror
-          # name would leave the reference unresolvable and every fixture pod would
-          # report ImagePullBackOff on a cluster that has the image.
-          sudo k3s ctr --namespace k8s.io images tag \
-            "$MIRROR" docker.io/library/busybox:1.36.1
-          sudo k3s ctr --namespace k8s.io images tag "$MIRROR" busybox:1.36.1
+          # --namespace k8s.io, not ctr's default `default`. The kubelet reads
+          # k8s.io, so an image in `default` is present and invisible: every
+          # fixture pod would report ImagePullBackOff on a cluster that
+          # demonstrably has the image. `k3s ctr` overrides the socket address
+          # and nothing else, so it does not change this default.
+          sudo k3s ctr --timeout 30s --namespace k8s.io images tag \
+            "$REF" docker.io/library/busybox:1.36.1
+          sudo k3s ctr --timeout 30s --namespace k8s.io images tag \
+            "$REF" busybox:1.36.1
 
       - name: Verify k3s Image Registration
         timeout-minutes: 5
