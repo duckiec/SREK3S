@@ -328,7 +328,23 @@ def build_diff(
 
     count = end - start
     header = f"@@ -{start + 1},{count} +{start + 1},{count} @@"
-    return "\n".join([f"--- a/{path}", f"+++ b/{path}", header, *hunk])
+    # Newline-terminated, and this is load-bearing rather than stylistic.
+    #
+    # A unified diff whose last line carries no terminator is not a diff git can
+    # read: `git apply --check` rejects it with "corrupt patch" and a non-zero
+    # exit. This function used to return the join without a trailing newline, so
+    # **every** patch the agent emitted was unapplyable by a real GitOps
+    # pipeline, while `patch_validated: True` was reported alongside it.
+    #
+    # It went unnoticed because `git_apply_check` appended the missing newline
+    # before verifying, so the gate checked a repair of the artifact rather than
+    # the artifact. Both halves are fixed; see that function and
+    # TestGitApplyCheckDoesNotForgiveAnUnterminatedDiff.
+    #
+    # POSIX "\n" specifically, not os.linesep: a CRLF diff has \r on every context
+    # line, which will not match an LF-terminated manifest, so emitting CRLF would
+    # trade one unapplyable patch for another.
+    return "\n".join([f"--- a/{path}", f"+++ b/{path}", header, *hunk]) + "\n"
 
 
 def apply_unified_diff(original: str, diff: str) -> str | None:
@@ -493,11 +509,27 @@ def git_apply_check(
             # check would fail spuriously on Windows.
             target.write_text(manifest_text, encoding="utf-8", newline="")
             patch_file = root / "candidate.patch"
-            patch_file.write_text(
-                diff if diff.endswith("\n") else diff + "\n",
-                encoding="utf-8",
-                newline="",
-            )
+            # The diff is written **exactly as given**. No normalisation, no
+            # repair, no "helpful" trailing newline.
+            #
+            # This line previously read `diff if diff.endswith("\n") else diff +
+            # "\n"`, which silently fixed `build_diff`'s missing terminator before
+            # verifying. The consequence was a gate that could not fail on the
+            # defect it existed to catch: the check passed on a *repaired* copy
+            # while the agent shipped the broken original, and reported "I-B2
+            # satisfied" for a patch no GitOps pipeline would have accepted.
+            #
+            # A verifier that edits its input is not a verifier. If the generator
+            # emits a malformed diff, the correct outcome is a failed check and a
+            # Tier-2 escalation, not a passing check on a substituted artifact.
+            #
+            # `newline=""` is retained, and it is not a mutation: it disables
+            # platform newline *translation* so the bytes on disk equal the bytes
+            # supplied. Without it, Windows would rewrite every "\n" to "\r\n",
+            # putting a \r on each context line, and the check would fail for a
+            # reason that has nothing to do with the patch. The manifest above is
+            # written the same way, and the two must agree.
+            patch_file.write_text(diff, encoding="utf-8", newline="")
         except OSError as exc:
             return False, f"could not stage the manifest for verification: {exc}"
 
