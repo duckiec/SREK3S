@@ -542,9 +542,9 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 
 **All quality gates pass, and all 42 Milestone 2 checkboxes are now ticked and individually evidenced.**
 
-Authoritative record: CI run for the commit that carries this work, on `ubuntu-latest`, `success` —
-including G3 `go test -race` (never waived, ARCH AD-10), the container build, and the runtime
-assertion that the effective uid is `10001` and `main:app` imports.
+**Authoritative record: CI run `36519511237`, commit `f41a91f`, conclusion `success`** — all 13 Go
+steps and all 15 Python steps green, including G3 `go test -race` (never waived, ARCH AD-10), the
+container build, and the runtime assertion that the effective uid is `10001` and `main:app` imports.
 
 | Gate | Result |
 |---|---|
