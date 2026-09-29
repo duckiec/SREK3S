@@ -254,27 +254,51 @@ jobs:
         run: |
           set -euo pipefail
           MIRROR="public.ecr.aws/docker/library/busybox:1.36.1"
-          # `--namespace k8s.io` is passed as a *global* ctr flag, before the
-          # subcommand, and it is required on every command here.
+          # Readiness gate, then a resilient pull. Both exist because this step
+          # passed on 2d1f968 and failed on 8254b91 with byte-identical code, so
+          # it is a race or a transient rather than a deterministic fault, and a
+          # first-failure abort is the wrong response to either.
           #
-          # ctr's default namespace is `default`, and `k3s ctr` only overrides the
-          # socket address - not the namespace. An image pulled or tagged without
-          # this flag lands in `default`, while the kubelet reads `k8s.io`, so the
-          # image would be present and invisible: every fixture pod would report
-          # ImagePullBackOff on a cluster that demonstrably has the image. That is
-          # the same class of failure as the namespace-scoping defect found in
-          # Milestone 3, and the verification step below asserts against the same
-          # namespace the pull wrote to so the two cannot drift apart.
-          #
-          # public.ecr.aws rather than Docker Hub: anonymous Docker Hub pulls are
-          # capped at 100/hour per source IP and GitHub runners share IPs, so it
-          # fails intermittently rather than reproducibly - the worst shape for a
-          # gate. The mirror path was verified to exist before being written here.
-          sudo k3s ctr --namespace k8s.io images pull "$MIRROR"
+          # The gate is the substantive part. The previous step confirmed the
+          # containerd *socket* answers `ctr version`, which proves the daemon
+          # process is up and not that its image service is serving. Neither does
+          # the apiserver's /readyz: the apiserver can be ready while containerd
+          # is still initialising its content and image stores. That is the same
+          # shape as the namespace-scoping defect found in Milestone 3 - a
+          # precondition satisfied by the wrong check.
+          echo "Waiting for containerd image service..."
+          for i in $(seq 1 30); do
+            if sudo k3s ctr --namespace k8s.io images list >/dev/null 2>&1; then
+              echo "containerd image service is ready."
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::containerd image service did not become ready."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Backoff, not a tight loop: the remaining candidate is a transient
+          # registry pull from a shared runner, and retrying immediately would
+          # reproduce the condition that caused the failure.
+          for attempt in 1 2 3 4 5 6; do
+            if sudo k3s ctr --namespace k8s.io images pull "$MIRROR"; then
+              echo "Pull successful."
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::error::pull failed after 6 attempts"
+              exit 1
+            fi
+            echo "  pull attempt $attempt failed; retrying in $((attempt * 3))s"
+            sleep $((attempt * 3))
+          done
 
           # Both names. The fixtures reference `busybox:1.36.1`, which containerd
           # resolves to `docker.io/library/busybox:1.36.1`; tagging only the mirror
-          # name would leave the reference unresolvable.
+          # name would leave the reference unresolvable and every fixture pod would
+          # report ImagePullBackOff on a cluster that has the image.
           sudo k3s ctr --namespace k8s.io images tag \
             "$MIRROR" docker.io/library/busybox:1.36.1
           sudo k3s ctr --namespace k8s.io images tag "$MIRROR" busybox:1.36.1
