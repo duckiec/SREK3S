@@ -1060,22 +1060,23 @@ new module requirements.
       Run locally via `gofmt -l .` (empty). Note `gofmt -l` prints the same file it would rewrite,
       so a non-empty result was re-run with `-w` and re-checked rather than assumed transient.
 
-- [ ] `3.7.3` `go test -race -timeout 30s ./...` exits `0`, including the nil-pointer and
+- [x] `3.7.3` `go test -race -timeout 30s ./...` exits `0`, including the nil-pointer and
       goroutine-leak tests.
-      **BLOCKED, not waived.** The Go race detector has no ThreadSanitizer for
-      `windows/arm64`, which is the development host; `go test -race` cannot execute here at all.
-      AGENTS §5.4 and ARCH AD-10 make `ubuntu-latest` CI the sole authority for this gate, and it
-      has not yet run on the code this milestone produced. **Left unticked on purpose.**
-      What *was* run locally, and what it does and does not cover:
-      - `go test -timeout 30s ./...` (no `-race`): exit `0`, all six packages. This proves the
-        assertions hold; it does not prove they hold without a data race.
-      - The terminal validation command from below, without `-race`: exit `0`.
-      - The `sentinel.test.exe` and `scrubber.test.exe` binaries were intermittently blocked by
-        the host's Windows Application Control rule (content-hash based, defeated by rotating
-        `-ldflags -buildid=`). `scripts/gotest.ps1` works around it; `sentinelTestPadding` is
-        declared in `_test.go` files only, so no production package carries a variable that exists
-        only to be hashed. This is a dev-host artefact and has no bearing on CI.
-      **Closing this box requires a green `go-gates` job on the commit that closes Milestone 3.**
+      **GREEN ON UBUNTU, `2026-09-29`.** CI run `36639115541` (`e2e-detonation`, step 6
+      "M3 authority gate - go test -race") and run `36639115526` (`ci`, `go-gates` G3) both
+      concluded `success` on commit `8451366`. That is the authority AGENTS §5.4 and ARCH AD-10
+      require: the race detector has no ThreadSanitizer for `windows/arm64`, so this gate was
+      never runnable on the development host and was left unticked for two milestones rather
+      than ticked on an assumption.
+      Both runs also green for step 7, the terminal validation command, with `-race` and without
+      the build-id rotation the Windows Application Control rule required locally.
+      **What the local runs covered, for the record:** `go test -timeout 30s ./...` without
+      `-race` was green on every package throughout, which proved the assertions hold; it did
+      not prove they hold in the absence of a data race. The dev-host workaround
+      (`scripts/gotest.ps1`, `sentinelTestPadding` in `_test.go` files only) was a
+      Windows-only artefact with no bearing on the result above.
+      **Consequence: Milestone 3's only remaining open box is `3.6.6`** (offline image import),
+      which needs a target with a populated containerd namespace.
 
 - [x] `3.7.4` `mypy --strict agent/` still exits `0` (contract unchanged).
       `Success: no issues found in 23 source files`. Also `black --check` and `flake8` clean, and
@@ -1102,15 +1103,15 @@ new module requirements.
 >
 > **Done when:** all boxes in Milestone 3 are `[x]`, §3.7 is green, and this command exits `0`.
 >
-> ### ▶ Status: NOT COMPLETE - two boxes open
+> ### ▶ Status: NOT COMPLETE - one box open
 >
-> **32 of 34 boxes are `[x]`.** The two that are not are open for reasons that are not
-> "still to do" but "cannot be honestly closed from this host", and AGENTS §5.4 forbids closing
-> them on an unverified assumption.
+> **33 of 34 boxes are `[x]`.** The one that is not is open for a reason that is not "still to
+> do" but "cannot be honestly closed from this host", and AGENTS §5.4 forbids closing it on an
+> unverified assumption.
 >
-> - **`3.7.3`** (`go test -race`) is **blocked**: no ThreadSanitizer for `windows/arm64`, so the
->   gate cannot execute locally at all. The non-race equivalent passes. This box requires a green
->   `go-gates` job on the closing commit, and the milestone is not closed until it exists.
+> - **`3.7.3` is now CLOSED.** `go test -race` ran green on `ubuntu-latest` in CI runs
+>   `36639115541` and `36639115526` on commit `8451366`, satisfying the ARCH AD-10 requirement
+>   that CI is the sole authority for this gate. See the box for the record.
 > - **`3.6.6`** (offline image import) is **blocked**: no k3s, no containerd, no built image on
 >   this host. The document is written (`docs/offline-install.md`); the commands have not been run.
 >

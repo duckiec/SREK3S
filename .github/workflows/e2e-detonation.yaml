@@ -162,22 +162,40 @@ jobs:
       # ---------------------------------------------------------------
       - name: Install k3s
         # Bounded twice over: the step has a wall-clock budget, and the download
-        # has its own. A step timeout alone would leave a half-written k3s
-        # binary and a runner that looks busy.
+        # has its own. A step timeout alone would leave a half-written k3s binary
+        # and a runner that looks busy.
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          # `curl -sfL ... | sh -` without pipefail is a silent-success trap: a
-          # failed download pipes an empty body to `sh`, which exits 0, and the
-          # step reports green. Every subsequent step then fails against a cluster
-          # that was never installed. The default Actions shell sets -e but NOT
-          # pipefail, so this has to be explicit.
+          # `curl ... | sh -` without pipefail is a silent-success trap: a failed
+          # download pipes an empty body to `sh`, which exits 0, the step reports
+          # green, and every later step then fails against a cluster that was
+          # never installed. The default Actions shell sets -e but NOT pipefail,
+          # so this has to be explicit.
+          #
+          # INSTALL_K3S_EXEC is set because of a real defect found on the first
+          # remote run: k3s writes /etc/rancher/k3s/k3s.yaml mode 0600 owned by
+          # root, and the Actions shell runs as `runner`. Every subsequent kubectl
+          # call would then fail with "permission denied" on the kubeconfig - a
+          # failure that reads as a cluster problem and is not one. 644 is the
+          # documented remedy and is safe here: the file is inside an ephemeral
+          # runner VM that is destroyed when the job ends.
           curl -fsSL --retry 3 --retry-delay 2 --max-time 300 \
             https://get.k3s.io \
-            | INSTALL_K3S_VERSION=v1.29.9+k3s1 sh -
+            | INSTALL_K3S_VERSION=v1.29.9+k3s1 \
+              INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644" sh -
           echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+
+          # Client-only checks, deliberately. `kubectl version` *without* --client
+          # contacts the apiserver, and this step runs before the readiness wait,
+          # so it raced the very thing the next step waits for. That was a
+          # regression introduced by the pre-push audit, which added `set -e` and in
+          # the same edit removed the `||` fallback that had been hiding it.
+          # The server-contacting check now lives in the readiness step, after the
+          # cluster is provably up, and `scripts/audit_workflow.py` asserts that
+          # ordering rather than trusting the comment above.
           k3s --version
-          kubectl version
+          kubectl version --client=true
 
       - name: Wait for the API server
         timeout-minutes: 5
@@ -186,6 +204,14 @@ jobs:
           for i in $(seq 1 90); do
             if kubectl get --raw /readyz >/dev/null 2>&1; then
               echo "apiserver ready after ${i}s"
+              # The server-contacting version check, and deliberately here rather
+              # than in the install step: this is the first point at which the
+              # cluster is provably up, so this is the first point at which
+              # `kubectl version` without --client is meaningful. It also proves
+              # the kubeconfig is readable as the unprivileged `runner` user, which
+              # is the symptom of a missing --write-kubeconfig-mode and is cheaper
+              # to diagnose here than three steps downstream.
+              kubectl version
               kubectl get nodes -o wide
               exit 0
             fi
