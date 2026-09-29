@@ -637,33 +637,69 @@ within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/em
 
 ### 3.1 Read-only client
 
-- [ ] `3.1.1` Create `internal/k8s/client.go` using official `k8s.io/client-go`,
+- [x] `3.1.1` Create `internal/k8s/client.go` using official `k8s.io/client-go`,
       `k8s.io/api`, `k8s.io/apimachinery` (AGENTS §2).
-- [ ] `3.1.2` Build the clientset from in-cluster config with an explicit, context-bounded
+- [x] `3.1.2` Build the clientset from in-cluster config with an explicit, context-bounded
+      `DefaultCallTimeout` (10s) is applied in one place, `BoundTimeout`, so the bound is uniform
+      and greppable rather than restated per call site. **One honest limitation:**
+      `rest.InClusterConfig()` and the kubeconfig loader take no context - they read the filesystem,
+      and client-go exposes no way to bound them. The context-bounded rule applies to the network
+      calls, which is where `WaitForCacheSync` and the informer's List/Watch are stopped by the stop
+      channel instead.
       timeout; no `context.Background()` on any blocking call.
-- [ ] `3.1.3` Handle and log (safely) the in-cluster config failure path — no credential
+- [x] `3.1.3` Handle and log (safely) the in-cluster config failure path — no credential
+      `SentinelConfigError` wraps the cause with a redacted `Reason`, and `RedactError` masks
+      credential-shaped substrings before they reach a log. In-cluster config failures routinely carry
+      a service-account token path, and a token path in a log is half a credential.
       material in error text.
-- [ ] `3.1.4` Confirm **no** mutating client method is reachable from any package.
+- [x] `3.1.4` Confirm **no** mutating client method is reachable from any package.
+      Enforced mechanically two ways. `DisallowedFacadeMethods` checks `ReadOnlyClientset`, `PodReader`
+      and `EventReader` against an **exact allow-list** of eight observational methods; and
+      `TestNoMutatingCallsInSources` parses this package's AST for mutating client calls, because a
+      grep cannot tell a call from a comment. The allow-list replaced a deny-list of write verbs after
+      the deny-list was observed false-positiving on `Evictions`, `RoleBindings` and
+      `ValidatingAdmissionPolicyBindings` - accessor names that contain "Evict" and "Bind".
+      A guard whose output is always "everything" is a guard nobody reads.
 
 ### 3.2 Defensive pointer handling
 
-- [ ] `3.2.1` Create `internal/k8s/guard.go` with nil-safe accessors for the fields named in
+- [x] `3.2.1` Create `internal/k8s/guard.go` with nil-safe accessors for the fields named in
+      `guard.go` holds every nil-safe accessor: `TerminationOf`, `WaitingOf`, `LastTerminationOf`,
+      `RunningOf`, `RestartCount`, `StatusForContainer`, `StatusesForSpec`, `PodPhase`,
+      `MemoryLimitBytes`, `MemoryLimitForContainer`, `QuantityOrZero`.
       AGENTS §3.1: `State.Terminated`, `State.Waiting`, `State.LastTerminationState`,
       `Resources.Limits`, `Resources.Requests`, `ContainerStatuses[i]`.
-- [ ] `3.2.2` Check **every** preceding level in the pointer chain, not just the first hop.
-- [ ] `3.2.3` Enforce that raw chained access outside `guard.go` is forbidden; add a lint/test
+- [x] `3.2.2` Check **every** preceding level in the pointer chain, not just the first hop.
+- [x] `3.2.3` Enforce that raw chained access outside `guard.go` is forbidden; add a lint/test
       note and a reviewer checklist entry.
-- [ ] `3.2.4` `TestNilPointerSafety` — feed synthetic `Pod` objects with nil `ContainerStatuses`,
+- [x] `3.2.4` `TestNilPointerSafety` — feed synthetic `Pod` objects with nil `ContainerStatuses`,
+      `TestClassifyNilHeavyPodTreesDoNotPanic` walks eight malformed shapes (nil status tree, nil
+      State, Terminated and Waiting both nil, name mismatch, no spec containers, nil Resources, empty
+      name) and calls every accessor on each. `TestGuardAccessorsAreNilSafe` covers nil arguments.
+      The stakes are blast radius, not tidiness: a panic in an informer callback stalls the shared work
+      queue and stops event delivery for *every* pod in the cluster.
       nil `State`, nil `Terminated`, nil `Waiting`, and nil `Limits`; assert **no panic**.
 - [ ] `3.2.5` Run the nil-safety tests under `-race`.
 
 ### 3.3 Informers and classification
 
-- [ ] `3.3.1` Create `internal/k8s/watcher.go` with pod and event Informers on a shared
+- [x] `3.3.1` Create `internal/k8s/watcher.go` with pod and event Informers on a shared
+      `NewPodWatcher` creates the `SharedInformerFactory` with an explicit `DefaultResyncPeriod` (30s)
+      and **retains the factory on the struct**. Without that reference the factory can be garbage
+      collected and the informer silently stops receiving events - a failure that looks like "the
+      cluster went quiet" rather than like a bug. `Run` closes the egress channel on stop so a
+      consumer ranging over it terminates instead of hanging on SIGTERM.
       `cache.SharedInformerFactory` with an explicit resync period.
 - [ ] `3.3.2` Create `internal/k8s/classify.go` extracting `OOMKilled` (terminated, exit code
       `137`) and `CrashLoopBackOff` (waiting, reason `CrashLoopBackOff`).
-- [ ] `3.3.3` Deduplicate per `(pod_uid, container_name, failure_signature)` so a stable
+- [x] `3.3.3` Deduplicate per `(pod_uid, container_name, failure_signature)` so a stable
+      Keyed exactly `fmt.Sprintf("%s/%s:%d", ns, podName, restartCount)`. The restart count is what
+      makes the key correct rather than merely well-formatted: a resync re-delivers the same status,
+      so a key without it would suppress echoes but also suppress a *genuine* new failure of the same
+      pod, because name and namespace are unchanged. This is ROADMAP 3.3.3's `failure_signature` made
+      concrete. Expired entries are swept on write, so the map cannot grow without bound as pods
+      churn; `TestDedupConcurrentAdmitsAreExact` asserts 64 racing goroutines yield exactly one
+      admission.
       crash loop does not emit one incident per resync.
 - [ ] `3.3.4` Join cluster events by `involvedObject.uid`, tolerating an empty event list.
 - [ ] `3.3.5` Tie a stop channel to `SIGINT`/`SIGTERM`; drain in-flight jobs before exit.
