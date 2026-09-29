@@ -754,7 +754,18 @@ new module requirements.
       churn; `TestDedupConcurrentAdmitsAreExact` asserts 64 racing goroutines yield exactly one
       admission.
       crash loop does not emit one incident per resync.
-- [ ] `3.3.4` Join cluster events by `involvedObject.uid`, tolerating an empty event list.
+- [x] `3.3.4` Join cluster events by `involvedObject.uid`, tolerating an empty event list.
+      `internal/k8s/telemetry.go`. Logs via `GetLogs` with **both** bounds enforced - `TailLines: 100`
+      and `LimitBytes: 51200` - and `Previous: true`. Events via `List` with a `FieldSelector` on
+      `involvedObject.uid`, joining on UID rather than name so a recreated pod does not inherit the
+      previous pod's events. Each call is bounded by its own `context.WithTimeout(ctx, 3*time.Second)`,
+      so a slow log fetch cannot consume the event fetch's budget. `TestLogsPassesTheBoundsToTheAPI`
+      reads the options back off the fake's recorded action, so it fails if `Logs()` stops passing them -
+      a test asserting the constants directly would pass even if the call site dropped them.
+      **`Previous: true` is correct for *both* incident shapes.** For an OOMKill the dead container may
+      already have been replaced; for a CrashLoopBackOff the live instance is the one kubelet keeps
+      failing to start, which is blank by construction. Getting it wrong returns a blank log with no
+      error - the worst outcome for evidence collection.
 - [ ] `3.3.5` Tie a stop channel to `SIGINT`/`SIGTERM`; drain in-flight jobs before exit.
 
 ### 3.4 Egress and scrubbing integration

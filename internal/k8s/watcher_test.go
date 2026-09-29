@@ -137,8 +137,8 @@ func TestClassifyCatchesOOMKilled(t *testing.T) {
 	if got.Namespace != "payments" || got.PodName != "p1" {
 		t.Errorf("identity wrong: %s/%s", got.Namespace, got.PodName)
 	}
-	if got.DedupKey != "payments/p1:3" {
-		t.Errorf("DedupKey = %q, want payments/p1:3", got.DedupKey)
+	if got.DedupKey != "uid-p1/checkout-api:3" {
+		t.Errorf("DedupKey = %q, want uid-p1/checkout-api:3", got.DedupKey)
 	}
 }
 
@@ -153,8 +153,8 @@ func TestClassifyCatchesCrashLoopBackOff(t *testing.T) {
 	if records[0].Reason != "CrashLoopBackOff" {
 		t.Errorf("Reason = %q", records[0].Reason)
 	}
-	if records[0].DedupKey != "payments/p2:9" {
-		t.Errorf("DedupKey = %q, want payments/p2:9", records[0].DedupKey)
+	if records[0].DedupKey != "uid-p2/checkout-api:9" {
+		t.Errorf("DedupKey = %q, want uid-p2/checkout-api:9", records[0].DedupKey)
 	}
 }
 
@@ -381,9 +381,86 @@ func TestStatusesForSpecAlignsByName(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDedupKeyFormat(t *testing.T) {
-	// The format is specified: "<namespace>/<pod>:<restartCount>".
-	if got := DedupKeyFor("payments", "checkout-7d9", 5); got != "payments/checkout-7d9:5" {
+	// The format is specified: "<podUID>/<containerName>:<restartCount>".
+	if got := DedupKeyFor("uid-abc", "checkout-api", 5); got != "uid-abc/checkout-api:5" {
 		t.Errorf("DedupKeyFor = %q", got)
+	}
+}
+
+// TestDedupKeySeparatesContainersInOnePod is the regression for the bug this key
+// was corrected for.
+//
+// The previous key was "<namespace>/<podName>:<restartCount>" - no container
+// component - so a sidecar OOMKill and an application CrashLoopBackOff in the same
+// pod with the same restart count produced the *same* key, and the second
+// incident was silently dropped. These are different incidents with different
+// remediations; losing one is not deduplication.
+func TestDedupKeySeparatesContainersInOnePod(t *testing.T) {
+	uid := types.UID("uid-shared")
+	app := DedupKeyFor(uid, "checkout-api", 2)
+	sidecar := DedupKeyFor(uid, "envoy-sidecar", 2)
+	if app == sidecar {
+		t.Fatalf("two containers in one pod shared dedup key %q; one incident would be lost", app)
+	}
+
+	// And end to end through the cache: both must be admitted.
+	cache := newDedupCache(time.Minute, time.Now)
+	if !cache.admit(app) {
+		t.Error("the application container was suppressed")
+	}
+	if !cache.admit(sidecar) {
+		t.Error("the sidecar was suppressed by the application's key")
+	}
+
+	// A genuine repeat of the *same* container is still suppressed.
+	if cache.admit(app) {
+		t.Error("a true repeat of the same container was admitted")
+	}
+}
+
+// TestDedupKeySeparatesPodsRecreatedWithTheSameName covers the other half of
+// why the UID is in the key.
+func TestDedupKeySeparatesPodsRecreatedWithTheSameName(t *testing.T) {
+	old := DedupKeyFor(types.UID("uid-old"), "checkout-api", 0)
+	recreated := DedupKeyFor(types.UID("uid-new"), "checkout-api", 0)
+	if old == recreated {
+		t.Fatalf("a recreated pod with the same name shared key %q; a new failure would be hidden for the TTL", old)
+	}
+}
+
+// TestTwoFailingContainersProduceTwoIncidents is the same guarantee at the
+// classifier level rather than the key level.
+func TestTwoFailingContainersProduceTwoIncidents(t *testing.T) {
+	pod := newPod("multi")
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+		Name: "envoy-sidecar",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceMemory: quantity("128Mi")},
+		},
+	})
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		crashLooping(4), // checkout-api
+		{Name: "envoy-sidecar", RestartCount: 4, // same restart count
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: OOMExitCode, Reason: "OOMKilled",
+			}}},
+	}
+
+	records := classify(pod, time.Now())
+	if len(records) != 2 {
+		t.Fatalf("want 2 incidents (one per failing container), got %d: %+v", len(records), records)
+	}
+	keys := map[string]bool{}
+	kinds := map[string]bool{}
+	for _, r := range records {
+		if keys[r.DedupKey] {
+			t.Errorf("duplicate dedup key across containers: %q", r.DedupKey)
+		}
+		keys[r.DedupKey] = true
+		kinds[string(r.Kind)] = true
+	}
+	if len(kinds) != 2 {
+		t.Errorf("want two distinct failure kinds, got %v", kinds)
 	}
 }
 

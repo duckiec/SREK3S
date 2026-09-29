@@ -75,34 +75,126 @@ var CredentialHints = []string{
 // The replacement is the literal "[REDACTED]", matching internal/scrubber and
 // ARCH §6 M1, so a redacted token and a scrubbed token are indistinguishable to a
 // reader - which is the point.
+// RedactError strips credential material from err's text.
+//
+// It is a last line of defence, not the control. The control is that error text is
+// logged only in a redacted form; this exists because an upstream library can put a
+// token into an error and we should not have to audit every upstream string.
+//
+// It keeps the *name* of the credential and the separator around it, and removes
+// only the value: "password: hunter2" becomes "password: [REDACTED]", which still
+// says what failed. Removing everything would satisfy the letter of the rule while
+// making the log useless, and a log nobody reads is a log nobody trusts.
 func RedactError(err error) string {
 	if err == nil {
 		return ""
 	}
-	lowered := err.Error()
+	text := err.Error()
 	for _, hint := range CredentialHints {
-		for {
-			index := indexFold(lowered, hint)
-			if index < 0 {
-				break
-			}
-			// Redact the hint and the token that follows it, up to a delimiter.
-			end := index + len(hint)
-			for end < len(lowered) && !isDelimiter(lowered[end]) {
-				end++
-			}
-			lowered = lowered[:index] + "[REDACTED]" + lowered[end:]
-		}
+		text = redactHint(text, hint)
 	}
-	return lowered
+	return text
 }
 
-func indexFold(haystack, needle string) int {
+// redactHint replaces every occurrence of hint, and the value that follows it,
+// with [REDACTED].
+//
+// Two shapes needed handling, both found by a test that failed rather than by
+// reading the code:
+//
+//   - "bearer token abcdef": the word after the hint is *itself* a hint, so a single
+//     value scan consumed "token" and left the credential behind.
+//   - "password: hunter2" and "api_key=sk-live-1234": the value is separated by a
+//     delimiter, so scanning only non-delimiter characters after the hint stopped
+//     immediately and leaked the value.
+func redactHint(text, hint string) string {
+	// The search only ever moves forward.
+	//
+	// An earlier version restarted from index 0 after each replacement. That is
+	// not just slower: when the hint word is preserved (as it is here, so the log
+	// still says *which* credential was involved) the same hint is found again,
+	// the replacement is applied again, and the string grows without bound. It
+	// surfaced as a test-suite timeout rather than as an obvious hang, because the
+	// growth is fast enough to look like slow progress.
+	from := 0
+	for {
+		rel := indexFoldFrom(text, hint, from)
+		if rel < 0 {
+			return text
+		}
+		index := rel
+		head := index + len(hint)
+		cursor := head
+		// Absorb separators, and any further hint words, before taking the value.
+		for {
+			for cursor < len(text) && isSeparator(text[cursor]) {
+				cursor++
+			}
+			if cursor >= len(text) {
+				break
+			}
+			wordEnd := cursor
+			for wordEnd < len(text) && !isSeparator(text[wordEnd]) {
+				wordEnd++
+			}
+			if isCredentialWord(text[cursor:wordEnd]) {
+				cursor = wordEnd
+				continue
+			}
+			break
+		}
+		if cursor >= len(text) {
+			// Only separators after the hint: mask the hint alone.
+			text = text[:index] + "[REDACTED]" + text[head:]
+			from = index + len("[REDACTED]")
+			continue
+		}
+		valueEnd := cursor
+		for valueEnd < len(text) && !isSeparator(text[valueEnd]) {
+			valueEnd++
+		}
+		// Keep the separators so the log still shows the shape of the failure
+		// ("password: [REDACTED]"), and keep the hint name for the same reason.
+		text = text[:head] + text[head:cursor] + "[REDACTED]" + text[valueEnd:]
+		from = head + (cursor - head) + len("[REDACTED]")
+	}
+}
+
+// isCredentialWord reports whether a bare word is itself one of the hints.
+func isCredentialWord(word string) bool {
+	trimmed := word
+	for len(trimmed) > 0 && isSeparator(trimmed[len(trimmed)-1]) {
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	for _, hint := range CredentialHints {
+		if equalFold(trimmed, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSeparator reports whether a character can sit between a credential's name and
+// its value.
+func isSeparator(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '"', '\'', '`', '=', ':', ',', ';',
+		'(', ')', '{', '}', '[', ']', '/', '\\', '|':
+		return true
+	}
+	return false
+}
+
+// indexFoldFrom finds needle in haystack at or after `from`, case-insensitively.
+func indexFoldFrom(haystack, needle string, from int) int {
 	n := len(needle)
 	if n == 0 || n > len(haystack) {
 		return -1
 	}
-	for i := 0; i+n <= len(haystack); i++ {
+	if from < 0 {
+		from = 0
+	}
+	for i := from; i+n <= len(haystack); i++ {
 		if equalFold(haystack[i:i+n], needle) {
 			return i
 		}
@@ -127,14 +219,6 @@ func equalFold(a, b string) bool {
 		}
 	}
 	return true
-}
-
-func isDelimiter(c byte) bool {
-	switch c {
-	case ' ', '\t', '\n', '\r', '"', '\'', '=', ':', ',', ';', ')', '}', ']', '/', '\\':
-		return true
-	}
-	return false
 }
 
 // NewClientset builds a read-only client.

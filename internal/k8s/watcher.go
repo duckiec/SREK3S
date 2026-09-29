@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -76,21 +77,28 @@ type IncidentRecord struct {
 
 // DedupKeyFor builds the deduplication signature.
 //
-// Format is exactly `<namespace>/<pod>:<restartCount>`, as specified. The
-// restart count is what makes this correct rather than merely formatted: a
-// crash-looping pod re-delivers the same status on every resync, and a key
-// without the count would suppress those but also suppress a *genuine* new
-// failure of the same pod, because the pod name and namespace are unchanged.
-// Restart count increments when a container actually restarts, so it separates
-// "the same failure, observed again" from "a new failure".
+// Format is exactly `"<podUID>/<containerName>:<restartCount>"`, per ROADMAP §3.3.3.
 //
-// ROADMAP 3.3.3 describes this triple as (pod_uid, container_name,
-// failure_signature); the restart count *is* the failure signature, made
-// concrete. Keying on pod UID instead of name would additionally survive a pod
-// being recreated with the same name, which name-keying would treat as a
-// duplicate and hide.
-func DedupKeyFor(namespace, podName string, restartCount int32) string {
-	return fmt.Sprintf("%s/%s:%d", namespace, podName, restartCount)
+// Every component earns its place, and the container name is the one whose absence
+// was an actual bug. An earlier version keyed on `"<namespace>/<podName>:<restartCount>"`,
+// which carried no container component at all - so two containers failing in the
+// *same* pod with the *same* restart count collided and one incident was silently
+// suppressed. A sidecar OOMKill and an application CrashLoopBackOff are different
+// incidents with different remediations; deduplicating one against the other is not
+// deduplication, it is losing an incident.
+//
+// Pod UID rather than name matters for a second reason: a pod deleted and recreated
+// under the same name restarts its restart counts at zero, so a name-keyed cache
+// would treat a genuinely new failure of a replacement pod as a repeat of the old
+// one and stay silent for the full TTL.
+//
+// The restart count makes the key correct rather than merely well-formatted: a
+// crash-looping pod re-delivers the same status on every resync, and a key without
+// the count would suppress those but also suppress a real new failure. Restart count
+// increments when a container actually restarts, so it separates "the same failure,
+// observed again" from "a new failure".
+func DedupKeyFor(podUID types.UID, containerName string, restartCount int32) string {
+	return fmt.Sprintf("%s/%s:%d", podUID, containerName, restartCount)
 }
 
 // dedupCache suppresses repeat deliveries of one signature.
@@ -176,7 +184,10 @@ func classify(pod *corev1.Pod, now time.Time) []IncidentRecord {
 		}
 
 		restarts := RestartCount(status)
-		key := DedupKeyFor(pod.Namespace, pod.Name, restarts)
+		// Pod UID and container name, not namespace and pod name. See
+		// DedupKeyFor: omitting the container name made two failing containers in
+		// one pod collide, which suppressed a real incident.
+		key := DedupKeyFor(pod.UID, container.Name, restarts)
 
 		// Terminated with a non-zero exit. Exit code 137 is SIGKILL from the
 		// memory cgroup; other non-zero exits are application errors. Both are
