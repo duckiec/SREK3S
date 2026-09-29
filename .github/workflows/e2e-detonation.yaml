@@ -116,7 +116,9 @@ jobs:
         run: go test -v -race -timeout 30s ./...
 
       - name: M3 terminal validation
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
           go test -race -timeout 30s \
             -run 'TestNilPointerSafety|TestNoGoroutineLeak|TestIncidentPayloadContract' \
             -v ./...
@@ -125,6 +127,29 @@ jobs:
         run: |
           go build -o bin/sentinel ./cmd/sentinel
           ./bin/sentinel -version
+
+      # ---------------------------------------------------------------
+      # OFFLINE GATE. No cluster, no network, a few seconds.
+      #
+      # This is the check whose absence let the P0 ship: it asks real `git` about a
+      # diff the *generator* actually produced, which no unit test did, because
+      # every earlier check either used a hand-written diff or went through
+      # `git_apply_check` - and that checker repaired its input before verifying.
+      #
+      # Placed here, before k3s, on purpose. It needs nothing from the cluster, so
+      # running it first means a regression in the patch path costs seconds and
+      # fails with a legible message, instead of after a 21-step cluster bring-up
+      # that then reports a patch error at the far end.
+      # ---------------------------------------------------------------
+      - name: Offline gate — generate a patch and verify it with real git
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PYTHONUNBUFFERED=1 python tests/e2e/verify_patch.py \
+            --manifest tests/fixtures/oom-restartloop.yaml \
+            --path deploy/payments/checkout-api.yaml \
+            --container checkout-api \
+            --from-limit 256Mi --to-limit 512Mi
 
       # ---------------------------------------------------------------
       # 4. A lightweight local cluster.
@@ -136,16 +161,29 @@ jobs:
       # import is not an optimisation but a requirement.
       # ---------------------------------------------------------------
       - name: Install k3s
+        # Bounded twice over: the step has a wall-clock budget, and the download
+        # has its own. A step timeout alone would leave a half-written k3s
+        # binary and a runner that looks busy.
+        timeout-minutes: 10
         run: |
-          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.29.9+k3s1 sh -
-          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          set -euo pipefail
+          # `curl -sfL ... | sh -` without pipefail is a silent-success trap: a
+          # failed download pipes an empty body to `sh`, which exits 0, and the
+          # step reports green. Every subsequent step then fails against a cluster
+          # that was never installed. The default Actions shell sets -e but NOT
+          # pipefail, so this has to be explicit.
+          curl -fsSL --retry 3 --retry-delay 2 --max-time 300 \
+            https://get.k3s.io \
+            | INSTALL_K3S_VERSION=v1.29.9+k3s1 sh -
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
           k3s --version
-          kubectl version --short 2>/dev/null || kubectl version
+          kubectl version
 
       - name: Wait for the API server
+        timeout-minutes: 5
         run: |
-          for i in $(seq 1 60); do
+          set -uo pipefail
+          for i in $(seq 1 90); do
             if kubectl get --raw /readyz >/dev/null 2>&1; then
               echo "apiserver ready after ${i}s"
               kubectl get nodes -o wide
@@ -153,7 +191,7 @@ jobs:
             fi
             sleep 1
           done
-          echo "::error::apiserver did not become ready within 60s"
+          echo "::error::apiserver did not become ready within 90s"
           kubectl get pods -A || true
           exit 1
 
@@ -168,6 +206,7 @@ jobs:
       # mistake, so the verification step below is not optional.
       # ---------------------------------------------------------------
       - name: Import busybox into the k8s.io containerd namespace
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           docker pull "$BUSYBOX_IMAGE"
@@ -235,18 +274,26 @@ jobs:
       # assumed to cover the other.
       # ---------------------------------------------------------------
       - name: Start the triage agent
+        timeout-minutes: 5
         run: |
           set -euo pipefail
+          # PYTHONUNBUFFERED matters twice: uvicorn's access log is the only
+          # visibility into which incidents arrived, and a buffered stream means
+          # the Actions console shows nothing until the job ends. The sentinel
+          # writes to /tmp/sentinel.log separately, but the agent's does not.
           SREK3S_SANDBOX=1 \
           SREK3S_LOG_LEVEL=INFO \
+          PYTHONUNBUFFERED=1 \
           PYTHONPATH="$PWD/agent" \
             nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
             > /tmp/agent.log 2>&1 &
           echo $! > /tmp/agent.pid
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+            # --max-time: without it a hung TCP connect to a dead port can sit
+            # past the kernel's default and eat the whole step budget.
+            if curl -fsS --max-time 5 http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
               echo "agent healthy after ${i}s"
-              curl -fsS http://127.0.0.1:8000/healthz
+              curl -fsS --max-time 5 http://127.0.0.1:8000/healthz
               echo
               exit 0
             fi
@@ -265,6 +312,7 @@ jobs:
       # checking the flag would have passed against a cluster-wide watch.
       # ---------------------------------------------------------------
       - name: Start the Sentinel, scoped to the chaos namespace
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           ./bin/sentinel \
@@ -294,12 +342,16 @@ jobs:
       # that is working perfectly.
       # ---------------------------------------------------------------
       - name: Apply the OOM chaos fixture (ROADMAP 4.1.2)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           kubectl apply -f deploy/chaos/oom-leak.yaml
           kubectl -n "$CHAOS_NAMESPACE" get pods -l srek3s.io/chaos=oom -o wide
 
       - name: Watch the pod reach its failure state
+        # Bounded independently of the loop's own deadline, so a wedged
+        # `kubectl` call cannot outlive it.
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           window="${OBSERVATION_WINDOW:-90}"
@@ -321,9 +373,13 @@ jobs:
           exit 1
 
       - name: Run the E2E invariant runner (ROADMAP 4.2.1)
+        # The runner prints a NOTE line per sample, which is the live view of the
+        # Sentinel's progress. Unbuffered, or the console shows nothing for the
+        # whole observation window and then a verdict.
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
+          PYTHONUNBUFFERED=1 python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
             --namespace "$CHAOS_NAMESPACE" \
             --observe-seconds "${OBSERVATION_WINDOW:-90}"
 
@@ -337,18 +393,13 @@ jobs:
       # generator output against a checker that silently repaired it, and never
       # asked git about a diff the generator had actually produced.
       # ---------------------------------------------------------------
-      - name: Generate a patch and verify it with real git
-        run: |
-          set -euo pipefail
-          python tests/e2e/verify_patch.py \
-            --manifest tests/fixtures/oom-restartloop.yaml \
-            --path deploy/payments/checkout-api.yaml \
-            --container checkout-api \
-            --from-limit 256Mi --to-limit 512Mi
-
       - name: Agent log (for triage on failure)
         if: failure()
+        # `continue-on-error`: a diagnostic step that fails would replace the real
+        # failure with its own, which is the worst outcome for a triage log.
+        continue-on-error: true
         run: |
+          set -uo pipefail
           echo "=== agent ==="; cat /tmp/agent.log || true
           echo "=== sentinel ==="; cat /tmp/sentinel.log || true
           echo "=== sentinel stats ==="
@@ -356,7 +407,10 @@ jobs:
 
       - name: Teardown
         if: always()
+        # No timeout needed: every command in it is `|| true` or a kill, and a
+        # teardown that hangs would keep the runner reserved for its own budget.
         run: |
+          set -uo pipefail
           # The fixtures are disposable and the namespace is labelled for exactly
           # this, but leaving a crash-looping pod on a shared runner wastes the
           # minutes before the job's own timeout ends.

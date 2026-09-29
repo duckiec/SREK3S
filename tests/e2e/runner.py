@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """E2E runner skeleton (ROADMAP 4.2.1).
 
 **This file does not run anything on import.** Every entry point is behind

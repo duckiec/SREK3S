@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Generate a patch and verify it with real git. ROADMAP 4.2.1 / 4.3.1.
 
 Exists because the agent cannot produce a patch over HTTP: ``create_app`` takes
