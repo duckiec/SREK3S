@@ -224,77 +224,79 @@ jobs:
       # ---------------------------------------------------------------
       # 5. Get busybox into the k3s containerd namespace.
       #
-      # Split into three named steps on purpose. The previous version was one step
-      # running `docker pull`, `docker save` and `k3s ctr images import` under
-      # `set -e`, so the first failure aborted the step and the conclusion said
-      # only "Import busybox" - three commands, one answer. CI logs need repository
-      # admin rights and return 403 unauthenticated, so a step's *name* is the
-      # finest diagnostic available. Three steps means the failing name says which
-      # half broke, without anyone reading a log.
+      # Native `k3s ctr`, no Docker. The previous revision pulled with `docker
+      # pull` and `docker save` and imported the archive; that path failed on
+      # ubuntu-latest at the `docker pull`, and the registry was not the cause -
+      # the mirror manifest answers 200 from outside. The remaining candidate was
+      # the Docker daemon itself, and removing it removes the question along with
+      # a whole runtime from the critical path: no daemon to be unavailable, no
+      # save-then-reimport round trip, and no host-daemon -> containerd translation
+      # that could put the image somewhere the kubelet does not read.
+      #
+      # Split into named steps for the same reason as the previous revision: CI
+      # logs return 403 without admin rights, so a step's name is the finest
+      # diagnostic a reviewer has. Three steps, and the failing one says which
+      # half broke.
       # ---------------------------------------------------------------
-      - name: Pull and Archive Busybox Image
-        timeout-minutes: 10
+      - name: Verify k3s containerd socket access
+        timeout-minutes: 5
         run: |
           set -euo pipefail
-          # public.ecr.aws, not Docker Hub. Anonymous Docker Hub pulls are limited
-          # to 100/hour *per source IP* and GitHub runners share IPs, so a pull
-          # that works from a workstation fails intermittently in CI - the worst
-          # shape for a gate, because it is not reproducible. ECR Public serves the
-          # same official image with no such ceiling. Tag existence is asserted
-          # rather than assumed: this path was checked before it was written
-          # because a mirror path guessed from memory is exactly the sort of thing
-          # that is right until it is not.
-          MIRROR="public.ecr.aws/docker/library/busybox:1.36.1"
-          docker pull "$MIRROR"
-
-          # Both names, and both are needed. The fixtures reference
-          # `busybox:1.36.1`, which containerd normalises to
-          # `docker.io/library/busybox:1.36.1`. Importing only the mirror name
-          # leaves the kubelet unable to resolve the reference, and the failure
-          # presents as ImagePullBackOff on a cluster that visibly has the image -
-          # which reads as a network problem and is not one.
-          docker tag "$MIRROR" busybox:1.36.1
-          docker tag "$MIRROR" docker.io/library/busybox:1.36.1
-          docker save busybox:1.36.1 docker.io/library/busybox:1.36.1 -o /tmp/busybox.tar
-
-          # A successful `docker save` that wrote nothing is not worth
-          # discovering two steps later.
-          test -s /tmp/busybox.tar || {
-            echo "::error::docker save produced no archive"
-            exit 1
-          }
-          echo "archive: $(du -h /tmp/busybox.tar | cut -f1)"
-
-      - name: Import Image into k3s containerd
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          # `sudo` is mandatory, not stylistic. /run/k3s/containerd/containerd.sock
+          # `sudo` is mandatory, not stylistic: /run/k3s/containerd/containerd.sock
           # is root-only, so an unprivileged `k3s ctr` cannot reach the daemon the
-          # kubelet reads from and fails with a permission error that looks like a
-          # containerd problem. The previous step did not use sudo and would have
-          # failed here for that reason alone.
-          sudo k3s ctr images import /tmp/busybox.tar --namespace k8s.io
+          # kubelet reads from. This step exists so that failure is named here
+          # rather than surfacing as a confusing error two steps later.
+          sudo k3s ctr version
+          echo "containerd socket reachable as $(id -un) via sudo"
+
+      - name: Pull and Tag Busybox in k3s containerd
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          MIRROR="public.ecr.aws/docker/library/busybox:1.36.1"
+          # `--namespace k8s.io` is passed as a *global* ctr flag, before the
+          # subcommand, and it is required on every command here.
+          #
+          # ctr's default namespace is `default`, and `k3s ctr` only overrides the
+          # socket address - not the namespace. An image pulled or tagged without
+          # this flag lands in `default`, while the kubelet reads `k8s.io`, so the
+          # image would be present and invisible: every fixture pod would report
+          # ImagePullBackOff on a cluster that demonstrably has the image. That is
+          # the same class of failure as the namespace-scoping defect found in
+          # Milestone 3, and the verification step below asserts against the same
+          # namespace the pull wrote to so the two cannot drift apart.
+          #
+          # public.ecr.aws rather than Docker Hub: anonymous Docker Hub pulls are
+          # capped at 100/hour per source IP and GitHub runners share IPs, so it
+          # fails intermittently rather than reproducibly - the worst shape for a
+          # gate. The mirror path was verified to exist before being written here.
+          sudo k3s ctr --namespace k8s.io images pull "$MIRROR"
+
+          # Both names. The fixtures reference `busybox:1.36.1`, which containerd
+          # resolves to `docker.io/library/busybox:1.36.1`; tagging only the mirror
+          # name would leave the reference unresolvable.
+          sudo k3s ctr --namespace k8s.io images tag \
+            "$MIRROR" docker.io/library/busybox:1.36.1
+          sudo k3s ctr --namespace k8s.io images tag "$MIRROR" busybox:1.36.1
 
       - name: Verify k3s Image Registration
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          # The namespace matters more than it looks. k3s containerd's default
-          # namespace is not the `k8s.io` namespace the kubelet reads from, and an
-          # image imported anywhere else produces ImagePullBackOff on a cluster
-          # that has it. So this asserts the name AND the namespace.
-          sudo k3s ctr images list --namespace k8s.io | grep busybox || {
+          # Asserts the same namespace the pull wrote to. Namespace and reference
+          # name are both checked because either one wrong produces the identical
+          # symptom - ImagePullBackOff - from a different cause.
+          sudo k3s ctr --namespace k8s.io images list | grep -q busybox || {
             echo "::error::busybox is not present in the k8s.io namespace"
-            sudo k3s ctr images list --namespace k8s.io || true
+            sudo k3s ctr --namespace k8s.io images list || true
+            echo "--- is it in the default namespace instead? ---"
+            sudo k3s ctr images list | grep busybox || true
             exit 1
           }
-          # And the fully-qualified form, which is what the fixture's `busybox:1.36.1`
-          # actually resolves to.
-          sudo k3s ctr images list --namespace k8s.io \
+          sudo k3s ctr --namespace k8s.io images list \
             | grep -q 'docker.io/library/busybox:1.36.1' || {
             echo "::error::busybox did not register as docker.io/library/busybox:1.36.1; the fixtures will report ImagePullBackOff"
-            sudo k3s ctr images list --namespace k8s.io | grep -i busybox || true
+            sudo k3s ctr --namespace k8s.io images list | grep -i busybox || true
             exit 1
           }
           echo "busybox registered in k8s.io under the name the fixtures reference"
