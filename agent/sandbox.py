@@ -210,9 +210,17 @@ def _make_preexec(memory_bytes: int, cpu_seconds: int) -> Callable[[], None]:
         # leave a dump of incident data on disk.
         module.setrlimit(module.RLIMIT_CORE, (0, 0))
         # A fresh process group, so a timeout kill reaches the whole subtree
-        # rather than leaving orphans behind. POSIX-only, which is the only
-        # platform where this preexec_fn is installed at all.
-        os.setsid()  # type: ignore[attr-defined]
+        # rather than leaving orphans behind.
+        #
+        # Resolved through getattr rather than a bare `os.setsid()` with a
+        # `# type: ignore`. A conditional ignore is a trap here: `setsid` is
+        # absent from typeshed on Windows and present on Linux, and setup.cfg
+        # sets `warn_unused_ignores = True`. So the same line is *needed* on one
+        # platform and *reported as dead* on the other, which is how this passed
+        # locally and failed CI's G6. getattr type-checks identically everywhere.
+        setsid = getattr(os, "setsid", None)
+        if setsid is not None:
+            setsid()
 
     return _apply
 

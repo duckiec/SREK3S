@@ -553,8 +553,8 @@ assertion that the effective uid is `10001` and `main:app` imports.
 | G3 `go test -v -race -timeout 30s ./...` | ✅ green on CI |
 | G4 `black --check agent/` | ✅ exit 0 |
 | G5 `flake8 agent/` | ✅ exit 0 |
-| G6 `mypy --strict agent/` | ✅ no issues in 19 source files |
-| `pytest agent/tests/ -q` | ✅ **323 passed**, 0 failed |
+| G6 `mypy --strict agent/` | ✅ no issues in 20 source files |
+| `pytest agent/tests/ -q` | ✅ **327 passed**, 0 failed |
 | Container build | ✅ green on `ubuntu-latest` |
 | Container runtime smoke | ✅ `main:app` imports; effective uid `10001` |
 | Terminal validation test | ✅ **318 passed** |
@@ -593,6 +593,15 @@ layer that existed before it:
   under `remediation`; the strict model rejected the document. Only a real validation surfaced it.
 - The `llm` error message quoted the offending output, which put model-echoed incident content into
   logs verbatim — a disclosure bug in the safety path itself.
+
+**A third host/CI divergence, same signature as the two before it.** G6 passed on the
+windows/arm64 development host and failed on `ubuntu-latest`, with no other signal. Cause:
+`os.setsid()  # type: ignore[attr-defined]` in `sandbox.py`. `setsid` is absent from typeshed on
+Windows and present on Linux, so the ignore was **used** locally and **dead** on CI — and
+`setup.cfg` sets `warn_unused_ignores = True`. Fixed with `getattr(os, "setsid", None)`, which
+type-checks identically on both. `agent/tests/test_compat_platform.py` now fails the build if an
+ignore ever sits on a platform-sensitive line again, and it carries a negative control so the
+detector itself cannot silently stop working.
 
 **Measured, not assumed:** `git apply` *tolerates* a wrong start offset when the content matches, so
 the structural check catches what git forgives and git catches what a line diff would miss. Two of my
