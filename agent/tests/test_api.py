@@ -74,6 +74,29 @@ spec:
 """
 
 
+#: Response fields that legitimately differ between two requests to one handler.
+#:
+#: Exactly one, and the list is a set rather than an inline ``!=`` so that adding a
+#: second per-request field is a visible, reviewed act rather than an edit to a
+#: comprehension buried in a test.
+#:
+#: ``request_id`` is **not** here, which corrects a comment that was wrong. The
+#: original test excluded it with a comment saying "it is per-request by design",
+#: but the correlation id travels in the ``X-SREK3S-Request-Id`` header and never
+#: appears in the body at all - ``TriageResponse`` sets ``extra: forbid`` and would
+#: reject the key. So that exclusion was dead code protecting against a field that
+#: could not be present, and the field that genuinely varies was left in.
+#:
+#: Kept minimal on purpose: every entry is a field the equivalence test therefore
+#: cannot compare, so each one is a hole in the claim it makes.
+PER_REQUEST_FIELDS: Final[frozenset[str]] = frozenset({"analysis_latency_ms"})
+
+
+def strip_per_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Drop the fields that are per-request by design; keep everything else."""
+    return {k: v for k, v in body.items() if k not in PER_REQUEST_FIELDS}
+
+
 def sample_document() -> dict[str, Any]:
     """The canonical Contract A payload, with its documentation key removed."""
     document = json.loads(SAMPLE_INCIDENT.read_text(encoding="utf-8"))
@@ -272,10 +295,57 @@ class TestBothTriagePaths:
         alias = client.post(TRIAGE_PATH_ALIAS, json=sample_document())
 
         assert canonical.status_code == alias.status_code
-        # request_id is excluded: it is per-request by design.
-        left = {k: v for k, v in canonical.json().items() if k != "request_id"}
-        right = {k: v for k, v in alias.json().items() if k != "request_id"}
+        left = strip_per_request(canonical.json())
+        right = strip_per_request(alias.json())
         assert left == right
+
+    def test_the_exclusion_set_matches_the_served_envelope(
+        self, client: TestClient
+    ) -> None:
+        """``PER_REQUEST_FIELDS`` cannot silently fall behind the envelope.
+
+        The exclusion list is hand-maintained, and a hand-maintained list rots the
+        moment the response gains a field. This asserts every excluded name is a
+        key the service actually returns, so a rename leaves a stale exclusion
+        rather than a silently incomplete one.
+
+        Checked against a **real response body** rather than
+        ``TriageResponse.model_fields``. The two are not the same set, and the
+        first version of this test used the model and failed immediately:
+        ``request_id`` is added by the HTTP envelope, not declared on the model -
+        the model sets ``extra: forbid``, so it would reject the key outright.
+        Validating against the model would have asserted a structure the service
+        does not use.
+
+        It exists because the original test excluded ``request_id`` inline and
+        hard-coded, and missed ``analysis_latency_ms`` - a real ``perf_counter``
+        measurement. Two calls to one handler can legitimately return 0 and 1, so
+        the assertion raced a millisecond boundary: it passed five consecutive
+        full-suite runs and then failed with nothing changed in between.
+        """
+        served = client.post(TRIAGE_PATH, json=sample_document()).json()
+        stale = PER_REQUEST_FIELDS - set(served)
+        assert not stale, (
+            f"PER_REQUEST_FIELDS names keys the envelope does not carry: "
+            f"{sorted(stale)}; a stale exclusion hides a rename"
+        )
+        # The field that actually raced stays excluded, so removing it is a
+        # deliberate act rather than an accident.
+        assert "analysis_latency_ms" in PER_REQUEST_FIELDS
+        # `request_id` is a header, not a body key. Asserting its absence keeps a
+        # future change that moves it into the body from silently un-excluding it.
+        assert "request_id" not in served, (
+            "request_id is now in the response body; if it is per-request it "
+            "belongs in PER_REQUEST_FIELDS"
+        )
+        # And the exclusion set must not become a rug: everything it does *not*
+        # name is still compared, which is the property the equivalence test rests
+        # on. Asserting that the set is small keeps it from growing to "whatever
+        # differs".
+        assert len(PER_REQUEST_FIELDS) <= 3, (
+            f"PER_REQUEST_FIELDS has grown to {sorted(PER_REQUEST_FIELDS)}; each "
+            f"entry is a field the path-equivalence test can no longer compare"
+        )
 
     def test_both_paths_reject_a_bad_body_identically(self, client: TestClient) -> None:
         document = sample_document()

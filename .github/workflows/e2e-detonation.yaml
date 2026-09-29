@@ -1,0 +1,366 @@
+name: e2e-detonation
+
+# Milestone 4: the full pipeline against a real cluster.
+#
+# Why this exists and why it is separate from ci.yaml
+# --------------------------------------------------
+# `ci.yaml` proves the units are correct. This proves they are *connected*: that a
+# container which really OOMs produces a real incident, that its logs are really
+# fetched, that the credentials planted in those logs really are masked, that the
+# agent really triages it, and that the patch really applies with `git apply`.
+#
+# Every one of those claims was unproven until Milestone 4 pre-flight, and the
+# pre-flight found two things the unit tests could not:
+#
+#   * `-namespace` was decorative. The flag was read and logged over an informer
+#     that watched every namespace, so the startup log asserted a scoping that was
+#     not in effect. Nothing failed.
+#   * every Tier-1 patch was unapplyable, because `build_diff` omitted the trailing
+#     newline and `git_apply_check` appended it before verifying. The gate
+#     reported `patch_validated: True` for a patch no pipeline would accept.
+#
+# Neither was reachable from a unit test. Both are exactly the class of defect this
+# workflow exists to catch, which is the argument for it being a gate rather than a
+# convenience.
+#
+# What this workflow cannot prove is stated in the ROADMAP: it runs the `-race`
+# authority gate (3.7.3) and exercises the live path, but the offline image import
+# (3.6.6) needs a target with a populated containerd namespace and is verified
+# against a real k3s node rather than by this job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      observation_window:
+        description: "Seconds to sample the crashing pod (CrashLoopBackOff is unobservable before ~12s)"
+        required: false
+        default: "90"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.23"
+  PYTHON_VERSION: "3.11"
+  # Overridable per run because the honest floor is a property of the kubelet's
+  # backoff, not a taste: the first failure restarts immediately (no backoff entry
+  # exists yet) and CrashLoopBackOff is published only from the second, so nothing
+  # is observable before ~10s. 90s leaves room for the two backoff intervals the
+  # runner samples across.
+  OBSERVATION_WINDOW: ${{ github.event.inputs.observation_window || '90' }}
+  # The disposable fixture namespace (ROADMAP 4.1.1). Nothing in srek3s-system
+  # references it, so it is safe to create and safe to delete.
+  CHAOS_NAMESPACE: sentinel-chaos
+  # busybox is pinned and imported rather than pulled: the fixtures use
+  # `imagePullPolicy: Never`, so a missing image is a hard apply failure rather
+  # than a slow pull. Pinned so the fixture's behaviour is not a function of a
+  # floating tag.
+  BUSYBOX_IMAGE: busybox:1.36.1
+
+jobs:
+  detonation:
+    name: E2E detonation (k3s, real OOM, real patch)
+    runs-on: ubuntu-latest
+    # Generous, because the observation window alone is 90s and cluster startup on
+    # a shared runner is not fast. A timeout here is indistinguishable from a
+    # hang, so it is set well above the expected runtime rather than close to it.
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Full history. `git apply --check` and the agent's I-B2 verification both
+        # initialise throwaway repositories, and a shallow clone changes what
+        # `git init` can see about the parent - which is a difference between this
+        # job and the one the P0 was found on, and a difference is not something
+        # to discover mid-run.
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: agent/requirements.txt
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agent/requirements.txt
+
+      # ---------------------------------------------------------------
+      # 3. The pending M3 authority gate.
+      #
+      # This is ROADMAP 3.7.3, unticked for two milestones because the race
+      # detector has no ThreadSanitizer for windows/arm64, the development host.
+      # ubuntu-latest is the sole authority (ARCH AD-10), and this is that
+      # authority. It runs *before* the cluster is created so a compile or race
+      # failure costs seconds rather than a cluster teardown.
+      # ---------------------------------------------------------------
+      - name: M3 authority gate — go test -race
+        run: go test -v -race -timeout 30s ./...
+
+      - name: M3 terminal validation
+        run: |
+          go test -race -timeout 30s \
+            -run 'TestNilPointerSafety|TestNoGoroutineLeak|TestIncidentPayloadContract' \
+            -v ./...
+
+      - name: Build the sentinel binary
+        run: |
+          go build -o bin/sentinel ./cmd/sentinel
+          ./bin/sentinel -version
+
+      # ---------------------------------------------------------------
+      # 4. A lightweight local cluster.
+      #
+      # k3s rather than kind: kind needs a Docker daemon and this runner's is
+      # shared, while the k3s install script brings up an embedded etcd-backed
+      # apiserver with containerd already wired the way the fixtures assume. The
+      # fixtures also use `imagePullPolicy: Never`, which means the next step's
+      # import is not an optimisation but a requirement.
+      # ---------------------------------------------------------------
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.29.9+k3s1 sh -
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          k3s --version
+          kubectl version --short 2>/dev/null || kubectl version
+
+      - name: Wait for the API server
+        run: |
+          for i in $(seq 1 60); do
+            if kubectl get --raw /readyz >/dev/null 2>&1; then
+              echo "apiserver ready after ${i}s"
+              kubectl get nodes -o wide
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::apiserver did not become ready within 60s"
+          kubectl get pods -A || true
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 5. Import busybox so `imagePullPolicy: Never` can be satisfied.
+      #
+      # k3s's containerd namespace is NOT the `k8s.io` namespace the kubelet reads
+      # from. An image imported without `--namespace k8s.io` lands somewhere the
+      # kubelet never looks, and every fixture pod then reports ImagePullBackOff
+      # on a cluster that has the image. That is the single most common failure in
+      # this workflow and it looks like a network problem rather than a namespace
+      # mistake, so the verification step below is not optional.
+      # ---------------------------------------------------------------
+      - name: Import busybox into the k8s.io containerd namespace
+        run: |
+          set -euo pipefail
+          docker pull "$BUSYBOX_IMAGE"
+          docker save "$BUSYBOX_IMAGE" -o /tmp/busybox.tar
+          # `--namespace k8s.io`, not `--all-namespaces`: this is a running
+          # cluster, and an explicit namespace is idempotent and visible.
+          k3s ctr images import /tmp/busybox.tar --namespace k8s.io
+
+      - name: Verify the image is where the kubelet looks
+        run: |
+          set -euo pipefail
+          echo "--- images in k8s.io ---"
+          k3s ctr images ls --namespace k8s.io | grep -i busybox || {
+            echo "::error::busybox is not present in the k8s.io namespace"
+            exit 1
+          }
+          # A `docker.io/library/...` line here means the tag was not registered
+          # under the name the fixtures reference, and every apply will fail with
+          # ImagePullBackOff.
+          k3s ctr images ls --namespace k8s.io | grep -q 'docker.io/library/busybox:1.36.1' || {
+            echo "::error::busybox did not register as docker.io/library/busybox:1.36.1"
+            k3s ctr images ls --namespace k8s.io | grep -i busybox
+            exit 1
+          }
+          echo "busybox registered correctly"
+
+      # ---------------------------------------------------------------
+      # 6. The disposable namespace, and its PSA enforcement.
+      # ---------------------------------------------------------------
+      - name: Apply the chaos namespace (ROADMAP 4.1.1)
+        run: |
+          kubectl apply -f deploy/chaos/namespace.yaml
+          kubectl get namespace "$CHAOS_NAMESPACE" --show-labels
+
+      - name: Assert Pod Security Admission is enforcing restricted
+        run: |
+          set -euo pipefail
+          labels=$(kubectl get namespace "$CHAOS_NAMESPACE" \
+            -o jsonpath='{.metadata.labels}')
+          for want in \
+            "pod-security.kubernetes.io/enforce=restricted" \
+            "pod-security.kubernetes.io/enforce-version=latest" \
+            "pod-security.kubernetes.io/audit=restricted" \
+            "pod-security.kubernetes.io/warn=restricted"; do
+            case "$labels" in
+              *"$want"*) echo "  ok: $want" ;;
+              *) echo "::error::namespace is missing $want; a chaos pod could be admitted privileged"
+                 exit 1 ;;
+            esac
+          done
+
+      # ---------------------------------------------------------------
+      # 7. The triage agent, with the sandbox on.
+      #
+      # SREK3S_SANDBOX=1 is required, not optional. The I-B2 verification runs
+      # `git apply --check` in a throwaway repository, which is a subprocess; with
+      # the sandbox off that check may be skipped, and the whole point of this
+      # job is to prove the patch is verified.
+      #
+      # The agent logs "manifest_provider=unreadable" at startup and still returns
+      # Tier-1 when a provider is supplied in-process. Over HTTP it will escalate,
+      # because `create_app` takes no provider - a known gap recorded in the
+      # pre-flight report. The workflow therefore asserts the *patch* separately,
+      # in-process, where a provider can be injected. Both are checked; neither is
+      # assumed to cover the other.
+      # ---------------------------------------------------------------
+      - name: Start the triage agent
+        run: |
+          set -euo pipefail
+          SREK3S_SANDBOX=1 \
+          SREK3S_LOG_LEVEL=INFO \
+          PYTHONPATH="$PWD/agent" \
+            nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            > /tmp/agent.log 2>&1 &
+          echo $! > /tmp/agent.pid
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+              echo "agent healthy after ${i}s"
+              curl -fsS http://127.0.0.1:8000/healthz
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the agent never became healthy"
+          cat /tmp/agent.log
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 8. The Sentinel, scoped.
+      #
+      # The assertion is on the *log line the watcher reports back*, not on the
+      # flag value. Before the M4 fix these were the same string while the
+      # informer ignored the flag entirely, and the log was simply untrue - so
+      # checking the flag would have passed against a cluster-wide watch.
+      # ---------------------------------------------------------------
+      - name: Start the Sentinel, scoped to the chaos namespace
+        run: |
+          set -euo pipefail
+          ./bin/sentinel \
+            -namespace "$CHAOS_NAMESPACE" \
+            -agent-url http://127.0.0.1:8000/api/v1/triage \
+            -log-level info \
+            > /tmp/sentinel.log 2>&1 &
+          echo $! > /tmp/sentinel.pid
+          sleep 5
+          cat /tmp/sentinel.log
+          if ! grep -q "watching one namespace" /tmp/sentinel.log; then
+            echo "::error::the Sentinel did not report a namespace scope; it is watching every namespace"
+            exit 1
+          fi
+          grep -q "\"namespace\":\"$CHAOS_NAMESPACE\"" /tmp/sentinel.log || {
+            echo "::error::the reported scope is not $CHAOS_NAMESPACE"
+            exit 1
+          }
+
+      # ---------------------------------------------------------------
+      # 9. Detonate.
+      #
+      # The observation window is not arbitrary. The kubelet restarts a failed
+      # container *immediately* the first time - no backoff entry exists yet - and
+      # only enters backoff from the second failure, so CrashLoopBackOff is
+      # unobservable before ~10s. A 5s or 10s deadline fails against a fixture
+      # that is working perfectly.
+      # ---------------------------------------------------------------
+      - name: Apply the OOM chaos fixture (ROADMAP 4.1.2)
+        run: |
+          set -euo pipefail
+          kubectl apply -f deploy/chaos/oom-leak.yaml
+          kubectl -n "$CHAOS_NAMESPACE" get pods -l srek3s.io/chaos=oom -o wide
+
+      - name: Watch the pod reach its failure state
+        run: |
+          set -euo pipefail
+          window="${OBSERVATION_WINDOW:-90}"
+          deadline=$(( $(date +%s) + window ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            status=$(kubectl -n "$CHAOS_NAMESPACE" get pod \
+              -l srek3s.io/chaos=oom \
+              -o jsonpath='{.items[0].status.containerStatuses[0]}' 2>/dev/null || true)
+            echo "  t=$(( $(date +%s) - deadline + window ))s $status"
+            case "$status" in
+              *'"exitCode":137'*) echo "observed OOMKill (exit 137)"; exit 0 ;;
+              *CrashLoopBackOff*) echo "observed CrashLoopBackOff"; exit 0 ;;
+            esac
+            sleep 2
+          done
+          echo "::error::the fixture never reached a failure state within ${window}s"
+          kubectl -n "$CHAOS_NAMESPACE" describe pod -l srek3s.io/chaos=oom || true
+          kubectl -n "$CHAOS_NAMESPACE" logs -l srek3s.io/chaos=oom --tail=40 || true
+          exit 1
+
+      - name: Run the E2E invariant runner (ROADMAP 4.2.1)
+        run: |
+          set -euo pipefail
+          python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
+            --namespace "$CHAOS_NAMESPACE" \
+            --observe-seconds "${OBSERVATION_WINDOW:-90}"
+
+      # ---------------------------------------------------------------
+      # 10. The patch, verified against a real repository.
+      #
+      # Separate from the runner because the runner cannot reach this: over HTTP
+      # the agent escalates (no manifest provider), so the patch is generated
+      # in-process where one can be injected, and then handed to real git. That
+      # is the check whose absence let the P0 ship - the M2 suite verified
+      # generator output against a checker that silently repaired it, and never
+      # asked git about a diff the generator had actually produced.
+      # ---------------------------------------------------------------
+      - name: Generate a patch and verify it with real git
+        run: |
+          set -euo pipefail
+          python tests/e2e/verify_patch.py \
+            --manifest tests/fixtures/oom-restartloop.yaml \
+            --path deploy/payments/checkout-api.yaml \
+            --container checkout-api \
+            --from-limit 256Mi --to-limit 512Mi
+
+      - name: Agent log (for triage on failure)
+        if: failure()
+        run: |
+          echo "=== agent ==="; cat /tmp/agent.log || true
+          echo "=== sentinel ==="; cat /tmp/sentinel.log || true
+          echo "=== sentinel stats ==="
+          kubectl -n "$CHAOS_NAMESPACE" describe pod -l srek3s.io/chaos=oom || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          # The fixtures are disposable and the namespace is labelled for exactly
+          # this, but leaving a crash-looping pod on a shared runner wastes the
+          # minutes before the job's own timeout ends.
+          kubectl delete namespace "$CHAOS_NAMESPACE" --ignore-not-found --timeout=60s || true
+          for pidfile in /tmp/agent.pid /tmp/sentinel.pid; do
+            [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null || true
+          done
