@@ -661,6 +661,53 @@ within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/em
       `ValidatingAdmissionPolicyBindings` - accessor names that contain "Evict" and "Bind".
       A guard whose output is always "everything" is a guard nobody reads.
 
+#### 3.1 status: COMPLETE
+
+**CI run `36521373896`, commit `e6a40d1`, conclusion `success`** — all 13 Go steps green, including
+G3 `go test -v -race -timeout 30s ./...`.
+
+| Gate | Result |
+|---|---|
+| G1 `go vet ./...` | ✅ exit 0 |
+| G1 `go vet -tags race ./...` | ✅ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | ✅ clean |
+| `go test -timeout 30s ./internal/k8s/...` | ✅ **28 tests**, package time 3.1s |
+| G3 `go test -race -timeout 30s ./...` | ✅ green on CI |
+
+**Dependency audit.** Three direct requires, all official, all `v0.31.0`: `k8s.io/api`,
+`k8s.io/apimachinery`, `k8s.io/client-go`. The *linked* package set (what actually compiles into the
+binary, as distinct from what `go list -m all` shows in the module graph) contains no logging
+framework, no ORM, no web framework and no APM — it is the upstream client-go closure. `internal/scrubber`
+still imports only `context`, `fmt`, `regexp`, `sort`, `strings`; the stdlib-only property survived the
+new module requirements.
+
+**Three things the tests caught in my own code**, all fixed:
+
+1. **A deny-list of write verbs was the wrong instrument.** Reaching `Pods().Create()` needs four
+   levels of return-type recursion, and at the depth where `Create` becomes visible it also matches
+   `Evictions`, `RoleBindings` and `ValidatingAdmissionPolicyBindings` — accessor names containing
+   "Evict" and "Bind". Replaced with an exact **allow-list** of eight observational methods: it cannot
+   false-positive, and adding any unlisted method fails the build whatever it is called.
+2. **The negative control for that check was vacuous three times over** — an empty struct with no
+   methods, then a struct holding the clientset in a *field* rather than returning it from a method.
+   Neither exposes a method, so the walk correctly found nothing and the test passed for the wrong
+   reason. It is now a real leaky facade with a `Client()` method, plus a second control using an
+   innocuous name (`Exec`) that a deny-list would miss.
+3. **The healthy-pod test asserted an absence after a fixed 2s sleep.** Slow when it passes, still
+   racy when it does not — it cannot distinguish "the handler saw nothing" from "the handler has not
+   run yet". It now waits for the informer's own store to hold the updated object, then asserts the
+   channel is empty. 0.03s, and deterministic.
+
+**Deliberately not done, and why:**
+
+- `3.3.2` asks for `internal/k8s/classify.go`. Classification is implemented but lives in
+  `watcher.go` beside the filter that calls it, since the filter *is* the classifier and splitting them
+  would separate a rule from the evidence it reads. Left unticked rather than ticked for a file that
+  does not exist — worth ratifying either way.
+- `3.3.4` (event joining by `involvedObject.uid`) and `3.3.5` (SIGINT/SIGTERM wiring) are out of this
+  task's scope. `Run(stop)` already closes the egress channel so a consumer ranging over it
+  terminates; the signal wiring belongs with `cmd/sentinel`, which does not exist yet.
+
 ### 3.2 Defensive pointer handling
 
 - [x] `3.2.1` Create `internal/k8s/guard.go` with nil-safe accessors for the fields named in
@@ -679,7 +726,13 @@ within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/em
       The stakes are blast radius, not tidiness: a panic in an informer callback stalls the shared work
       queue and stops event delivery for *every* pod in the cluster.
       nil `State`, nil `Terminated`, nil `Waiting`, and nil `Limits`; assert **no panic**.
-- [ ] `3.2.5` Run the nil-safety tests under `-race`.
+- [x] `3.2.5` Run the nil-safety tests under `-race`.
+      **Confirmed on CI run `36521373896`, commit `e6a40d1`, conclusion `success`.** The G3 step
+      runs `go test -v -race -timeout 30s ./...`, so the nil-safety matrix
+      (`TestClassifyNilHeavyPodTreesDoNotPanic`, `TestGuardAccessorsAreNilSafe`) is now verified under
+      the race detector. That check is not possible on windows/arm64 - the development host - so it
+      was left unticked until CI proved it rather than being ticked on a local pass that could not have
+      exercised it.
 
 ### 3.3 Informers and classification
 
