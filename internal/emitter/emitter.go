@@ -1,0 +1,430 @@
+package emitter
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/srek3s/sentinel/internal/worker"
+)
+
+// DefaultTimeout is the per-request deadline for one POST.
+//
+// Strict, and set on the http.Client rather than derived from a context deadline,
+// so it holds even if a caller passes a context with no deadline. AGENTS.md §3.2
+// requires every blocking operation to be context-bounded; a timeout configured
+// only on the caller's context would be one `context.Background()` away from
+// unbounded.
+const DefaultTimeout = 5 * time.Second
+
+// IncidentsPath is the canonical wire endpoint (ARCH §4, agent/main.py
+// TRIAGE_PATH).
+const IncidentsPath = "/v1/incidents"
+
+// MaxResponseBody bounds how much of a response body is read before giving up.
+//
+// The agent's success path returns a small JSON verdict, but a misrouted proxy
+// returning an HTML error page would otherwise be read into memory in full. 64 KiB
+// is far more than any legitimate response and small enough to be a non-issue.
+const MaxResponseBody = 64 << 10
+
+// DefaultMaxAttempts bounds the total number of POSTs for one incident, including
+// the first.
+//
+// Two retries covers the realistic transient case - a 429 from the agent's load
+// shedding, and one apiserver-side blip - without letting a three-worker pool
+// spend its lifetime on a single incident while live ones queue behind it.
+const DefaultMaxAttempts = 3
+
+// Base backoff for the 429 retry. Jittered per attempt; see retryDelay.
+const baseRetryDelay = 250 * time.Millisecond
+
+// Config configures a [Client].
+type Config struct {
+	// BaseURL is the agent's root, e.g. "http://srek3s-agent:8080".
+	BaseURL string
+
+	// Timeout overrides [DefaultTimeout].
+	Timeout time.Duration
+
+	// MaxAttempts overrides [DefaultMaxAttempts].
+	MaxAttempts int
+
+	// HTTPClient overrides the constructed client. Tests use it; production
+	// leaves it nil so the timeout above is actually applied.
+	HTTPClient *http.Client
+
+	// Now supplies the detection instant used for `detection_latency_ms`.
+	Now func() time.Time
+
+	// Events converts a scrubbed incident's event messages into wire events. See
+	// BuildOptions.Events.
+	Events func(*worker.Incident) []ClusterEvent
+
+	// SentinelVersion is this binary's version.
+	SentinelVersion string
+}
+
+// Client is a worker.Sink that ships incidents to the agent.
+//
+// Implements [worker.Sink], so it drops into the existing pool with no change
+// above it: the pool already treats a Dispatch error as a failed incident and
+// counts it. That is the right place for the policy, because the pool's worker
+// goroutine is already bounded and already has a per-incident timeout - a retry
+// loop here cannot outlive the worker that called it.
+type Client struct {
+	baseURL       string
+	incidentsURL  string
+	http          *http.Client
+	maxAttempts   int
+	now           func() time.Time
+	events        func(*worker.Incident) []ClusterEvent
+	version       string
+	ownsTransport bool
+}
+
+// Compile-time proof that the emitter is a valid sink. A signature drift in
+// worker.Sink would otherwise surface at the New() call in main, which is a
+// runtime wiring mistake rather than a compile error at the definition.
+var _ worker.Sink = (*Client)(nil)
+
+// New builds a Client.
+//
+// Fails on an unusable base URL rather than deferring the failure to the first
+// incident: a misconfigured endpoint that is only discovered when a container dies
+// is a Sentinel that has been silently not working for however long.
+func New(cfg Config) (*Client, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if baseURL == "" {
+		return nil, errors.New("emitter: base URL is required")
+	}
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		return nil, fmt.Errorf("emitter: base URL must be http or https, got %q", cfg.BaseURL)
+	}
+
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	attempts := cfg.MaxAttempts
+	if attempts <= 0 {
+		attempts = DefaultMaxAttempts
+	}
+
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	client := &Client{
+		baseURL:      baseURL,
+		incidentsURL: baseURL + IncidentsPath,
+		maxAttempts:  attempts,
+		now:          now,
+		events:       cfg.Events,
+		version:      cfg.SentinelVersion,
+	}
+	if cfg.HTTPClient != nil {
+		client.http = cfg.HTTPClient
+	} else {
+		client.http = &http.Client{Timeout: timeout}
+		client.ownsTransport = true
+	}
+	return client, nil
+}
+
+// Close releases the transport's idle connections.
+//
+// Called from main on shutdown so a rolling update does not leave the process
+// waiting on keep-alive connections to the old agent. A no-op for an injected
+// client, because a test owns the lifetime of whatever it passed in.
+func (c *Client) Close() {
+	if c == nil || !c.ownsTransport {
+		return
+	}
+	c.http.CloseIdleConnections()
+}
+
+// Outcome classifies what the agent did with a payload.
+//
+// The three cases are the whole of ROADMAP 3.4.4, and the distinctions matter
+// because they imply different responses:
+//
+//   - Delivered: the agent accepted and triaged the incident. Done.
+//   - Rejected: the payload violated the contract. Never retried - the same bytes
+//     will fail identically, and retrying a deterministic failure is how a
+//     validation bug turns into a self-inflicted denial of service against the
+//     agent's job budget.
+//   - Escalate: the agent failed internally. Not the Sentinel's bug and not
+//     retryable on a short horizon, so the incident is handed to a human. ARCH's
+//     fail-closed rule is the same shape: when the automated path cannot be proven
+//     to work, escalate rather than proceed.
+type Outcome int
+
+const (
+	// OutcomeDelivered means the agent accepted the incident.
+	OutcomeDelivered Outcome = iota
+	// OutcomeRejected means the agent refused the payload as invalid. Fatal.
+	OutcomeRejected
+	// OutcomeEscalate means the agent failed in a way the Sentinel cannot resolve.
+	OutcomeEscalate
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeDelivered:
+		return "delivered"
+	case OutcomeRejected:
+		return "rejected"
+	case OutcomeEscalate:
+		return "escalate"
+	default:
+		return "unknown"
+	}
+}
+
+// EmitError is a classified delivery failure.
+type EmitError struct {
+	// Outcome is the classification, so the caller can branch on it without
+	// parsing a message.
+	Outcome Outcome
+	// StatusCode is the HTTP status, or 0 for a transport-level failure.
+	StatusCode int
+	// Detail is the agent's response body, truncated. Diagnostic only - it is the
+	// agent talking to the Sentinel, not cluster telemetry, so it is not scrubbed.
+	Detail string
+	// Attempts is how many POSTs were made.
+	Attempts int
+	// Err is the underlying cause, if any.
+	Err error
+}
+
+func (e *EmitError) Error() string {
+	status := e.StatusCode
+	if status == 0 {
+		status = -1
+	}
+	return fmt.Sprintf("emitter: %s after %d attempt(s), status %d: %v: %s",
+		e.Outcome, e.Attempts, status, e.Err, e.Detail)
+}
+
+func (e *EmitError) Unwrap() error { return e.Err }
+
+// Classified errors, so a caller can branch without inspecting the Outcome field
+// on a possibly-nil pointer.
+var (
+	// ErrRejected means the agent refused the payload. Fatal: do not retry.
+	ErrRejected = errors.New("emitter: payload rejected by the agent")
+	// ErrEscalate means the incident must go to a human.
+	ErrEscalate = errors.New("emitter: incident requires human escalation")
+)
+
+// ErrPayload is a contract violation discovered before the request left.
+var ErrPayload = ErrContractViolation
+
+// Dispatch implements [worker.Sink]: it builds the payload from a scrubbed
+// incident and emits it.
+//
+// This is the only path into [Client.Emit] that the pool uses, and it is
+// deliberately the only *public* one available to production code - Emit takes a
+// payload directly so the round-trip test can hand it a hand-built one.
+func (c *Client) Dispatch(ctx context.Context, incident *worker.Incident) error {
+	payload, err := Build(incident, BuildOptions{
+		SentinelVersion: c.version,
+		Now:             c.now,
+		Events:          c.events,
+	})
+	if err != nil {
+		// A build failure is the Sentinel's own bug, not the agent's. It is fatal
+		// and non-retryable: re-serialising identical input produces the identical
+		// error, and the pool is counting this incident as failed either way.
+		return &EmitError{Outcome: OutcomeRejected, Attempts: 0, Err: err}
+	}
+	return c.Emit(ctx, payload)
+}
+
+// Emit POSTs a payload to the agent, retrying only what is retryable.
+//
+// The retry policy is the substance of this function and it is deliberately
+// asymmetric:
+//
+//   - 429 is the agent shedding load (ARCH's bounded job budget, HTTP 429 with
+//     {"error": "sandbox_busy"}). It is the one status where retrying is correct,
+//     and it is retried with jittered backoff, honouring Retry-After when the
+//     agent sends one.
+//   - 422 is the contract. Retrying identical bytes is guaranteed to fail again,
+//     so the attempt is fatal and the incident is reported as rejected.
+//   - 5xx is the agent's own failure. Retrying it would mean the Sentinel holding
+//     a worker for a duration it cannot bound, so it is escalated instead.
+//   - 4xx other than 422/429 is a routing or authentication error. Also escalated:
+//     it will not fix itself, and guessing is not a diagnostic strategy.
+func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
+	if payload == nil {
+		return &EmitError{Outcome: OutcomeRejected, Err: ErrNoIncident}
+	}
+	if err := Validate(payload); err != nil {
+		// Re-validated even though Build already did it, because Emit is public
+		// and a caller can hand it anything. Cheap next to a round trip.
+		return &EmitError{Outcome: OutcomeRejected, Err: err}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return &EmitError{Outcome: OutcomeRejected, Err: fmt.Errorf("marshal: %w", err)}
+	}
+
+	var last *EmitError
+	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		// The per-attempt context is derived from the caller's, so a cancellation
+		// from the pool's per-incident timeout still propagates and the retry loop
+		// cannot outlive its worker.
+		attemptCtx, cancel := context.WithTimeout(ctx, c.http.Timeout)
+		status, detail, err := c.post(attemptCtx, body)
+		cancel()
+
+		switch {
+		case err != nil:
+			// A cancelled parent context is terminal, not retryable: the worker is
+			// being torn down and there is nothing left to deliver into.
+			if ctx.Err() != nil {
+				return &EmitError{Outcome: OutcomeEscalate, Attempts: attempt, Err: ctx.Err()}
+			}
+			last = &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: err}
+
+		case status >= 200 && status < 300:
+			return nil
+
+		case status == http.StatusTooManyRequests:
+			last = &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: ErrEscalate}
+			if attempt == c.maxAttempts {
+				return last
+			}
+			if !c.wait(ctx, attempt, detail) {
+				return &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: ctx.Err()}
+			}
+			continue
+
+		case status == http.StatusUnprocessableEntity:
+			// Fatal. No retry, no backoff.
+			return &EmitError{Outcome: OutcomeRejected, StatusCode: status, Detail: detail, Attempts: attempt, Err: ErrRejected}
+
+		case status >= 500:
+			return &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: ErrEscalate}
+
+		default:
+			return &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: ErrEscalate}
+		}
+	}
+
+	if last == nil {
+		last = &EmitError{Outcome: OutcomeEscalate, Err: ErrEscalate}
+	}
+	return last
+}
+
+// post performs one attempt and reports the status and a bounded body excerpt.
+func (c *Client) post(ctx context.Context, body []byte) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.incidentsURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, "", fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer func() {
+		// Drain a bounded amount so the connection can be reused, then close. A
+		// fully drained body is what lets keep-alive work; an unread one would
+		// force a new TCP connection per incident.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, MaxResponseBody))
+		_ = resp.Body.Close()
+	}()
+
+	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	return resp.StatusCode, truncate(string(excerpt), 512), nil
+}
+
+// wait sleeps for the retry backoff, honouring Retry-After when the agent sent it.
+//
+// Returns false if the wait was interrupted, so the caller can report the
+// cancellation rather than the status. The sleep is on a timer and selects on
+// ctx.Done(), never a bare time.Sleep - a bare sleep here would keep a pool worker
+// alive past the point its context was cancelled, which is the goroutine leak
+// ROADMAP 3.5.4 is written to catch.
+func (c *Client) wait(ctx context.Context, attempt int, detail string) bool {
+	delay := retryDelay(attempt, retryAfter(detail))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// retryDelay is exponential backoff with full jitter.
+//
+// Full jitter, not a fixed delay: three pool workers emitting into the same
+// agent will be told "busy" at the same moment, and a deterministic backoff would
+// have all three return at the same instant and re-collide. Jitter spreads them.
+func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	// Cap the exponent so a long MaxAttempts cannot overflow the shift.
+	exponent := attempt - 1
+	if exponent > 6 {
+		exponent = 6
+	}
+	ceiling := baseRetryDelay << exponent
+	return time.Duration(rand.Int64N(int64(ceiling) + 1))
+}
+
+// retryAfter extracts a Retry-After hint from a response body.
+//
+// The agent's 429 body is a JSON error envelope, not a bare header, so a header
+// parse is not sufficient. Kept deliberately simple: it looks for a
+// `retry_after_ms` integer and ignores anything else, because a body that
+// contains a number we failed to interpret is not a reason to guess at a delay.
+func retryAfter(detail string) time.Duration {
+	const key = `"retry_after_ms"`
+	index := strings.Index(detail, key)
+	if index < 0 {
+		return 0
+	}
+	rest := detail[index+len(key):]
+	colon := strings.Index(rest, ":")
+	if colon < 0 {
+		return 0
+	}
+	rest = rest[colon+1:]
+	end := strings.IndexAny(rest, ",}")
+	if end < 0 {
+		return 0
+	}
+	milliseconds, err := strconv.Atoi(strings.TrimSpace(rest[:end]))
+	if err != nil || milliseconds <= 0 {
+		return 0
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+// truncate shortens a string to at most n bytes, marking that it was cut.
+func truncate(value string, n int) string {
+	if len(value) <= n {
+		return value
+	}
+	return value[:n] + "... (truncated)"
+}

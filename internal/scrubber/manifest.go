@@ -94,6 +94,17 @@ var rulePatterns = map[RuleID]string{
 	// RCA depends on survives.
 	RuleBasicAuthURL: `(?i)([a-z][a-z0-9+.-]*:\/\/[^:\s\/]+:)([^@\s\/]+)(@[^\s\/]+)`,
 
+	// Rule 7, amended per §6.6 to fix the unquoted AWS secret access key.
+	//
+	// `secret(?:[_-]access)?[_-]?key` is listed *before* the bare `secret`
+	// alternative so the longest match wins without relying on backtracking, and so
+	// the alternation reads longest-first as the rest of the pattern already does.
+	//
+	// Before this, `secret_access_key` matched nothing: rule 3 is anchored on
+	// quotes around the 40-character value, and rule 7's alternation contained
+	// `secret[_-]?key`, which does not occur inside `secret_access_key`. So the
+	// unquoted form - which is how an env dump or a `key=value` log line carries
+	// it - passed the whole 11-rule pipeline unmasked.
 	// Rule 7, amended per §6.4 to fix D-1.
 	//
 	// Three changes, each fixing a distinct leak:
@@ -115,7 +126,7 @@ var rulePatterns = map[RuleID]string{
 	// pass to pem_private_key and restores both correctness and throughput.
 	// The cost is that a key=value secret split across a newline is not caught
 	// by M3; see the narrow M3 scope note in ARCHITECTURE.md §6.5.
-	RuleGenericSecretKV: `(?i)(\b[\w-]{0,20}(?:api[_-]?key|secret[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|authorization|auth)["']?\s*[:=]\s*["']?)(?P<value>[^"',;}\n]{4,})(["']?)`,
+	RuleGenericSecretKV: `(?i)(\b[\w-]{0,20}(?:api[_-]?key|secret(?:[_-]access)?[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|authorization|auth)["']?\s*[:=]\s*["']?)(?P<value>[^"',;}\n]{4,})(["']?)`,
 
 	RuleUUID: `\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`,
 

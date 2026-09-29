@@ -1,0 +1,196 @@
+# SREK3S Sentinel - Kubernetes deployment.
+#
+# The same hardening block as deploy/agent.yaml (ROADMAP 3.6.3, ARCHITECTURE.md §8):
+# UID/GID 10001, read-only root filesystem, all capabilities dropped, no privilege
+# escalation, RuntimeDefault seccomp, and a single writable emptyDir at /tmp.
+#
+# Duplicated rather than templated on purpose. A YAML templating layer would make
+# the *rendered* manifest differ from the *committed* one, and the test that asserts
+# these hardening fields (ROADMAP 3.6.4) reads the committed file. A field that only
+# exists after rendering is a field the test cannot see, and hardening that cannot
+# be asserted is hardening that decays.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-sentinel
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+spec:
+  # A single replica, deliberately. Two would double-emit every incident: the
+  # informer's dedup cache is per-process, so two watchers would each admit the
+  # same failure and the agent would triage it twice - two remediation PRs for one
+  # outage. Leader election would fix that at the cost of a dependency and a
+  # failover window; at one replica it is not needed.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-sentinel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srek3s-sentinel
+      annotations:
+        # Roll the pod when the Sentinel's own source changes.
+        checksum/sentinel: "replaced-by-pipeline"
+    spec:
+      serviceAccountName: srek3s-sentinel
+      # The Sentinel *does* need a token - it is the watcher - unlike the agent.
+      # Bound to get/list/watch only by deploy/rbac.yaml.
+      automountServiceAccountToken: true
+
+      # ARCH §8: UID/GID 10001. Matches the Dockerfile's USER, so the image's own
+      # declaration and the cluster's agree; a mismatch is a pod that starts as one
+      # user and writes files as another.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: sentinel
+          image: registry.internal/srek3s-sentinel:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -log-level=$(LOG_LEVEL)
+
+          env:
+            # Logs to stdout: a read-only root filesystem forbids a log file, and
+            # the runtime collects them.
+            - name: LOG_LEVEL
+              value: info
+            # Where to POST incidents. The agent's Service, in-namespace, over
+            # plaintext: the network is loopback within the cluster and the
+            # payload is already scrubbed in memory on the way out.
+            - name: SREK3S_AGENT_URL
+              value: http://srek3s-agent:8000
+            # Empty means all namespaces. Set to a single namespace to scope the
+            # watch and narrow the RBAC requirement at the same time.
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: TMPDIR
+              value: /tmp
+
+          # Identical to the agent's, for the same reasons: the Sentinel needs no
+          # capabilities, so all are dropped rather than selected.
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          # The only writable path. /tmp is required by the Go runtime's
+          # os.TempDir callers and by the TLS root-CA cache; a read-only root
+          # filesystem otherwise leaves the process unable to resolve a hostname.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              # No memory limit above the request, for the same reason as the
+              # agent: the Sentinel must not be OOMKilled while observing
+              # someone else's OOMKill. It is the process most likely to be holding
+              # a failure it has not yet shipped.
+              memory: "512Mi"
+              cpu: "1"
+              ephemeral-storage: "128Mi"
+
+          # The Sentinel has no HTTP surface of its own, so there is nothing to
+          # probe. Liveness is expressed as a process check instead: if the runtime
+          # can exec and the process is scheduled, it is alive. A synthetic HTTP
+          # probe would need an endpoint that did not exist, and the usual
+          # alternative - a liveness probe against the apiserver - would kill the
+          # pod during an apiserver blip, which is precisely when its job matters.
+          livenessProbe:
+            exec:
+              command: ["/bin/sentinel", "-version"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # No readiness probe. The Sentinel has no traffic to shed: it is not
+          # behind a Service, and there is no state to declare ready. A readiness
+          # probe here would only be a way to remove a working pod from a Service
+          # it is not part of.
+
+          # MUST exceed cmd/sentinel's ShutdownGrace (20s), or the kubelet SIGKILLs
+          # the process mid-drain and the graceful path is decorative. The
+          # invariant is asserted by TestTerminationGraceExceedsTheDrainBudget -
+          # a change to one without the other fails the build rather than turning
+          # every rolling update into a slow-loss event.
+          terminationGracePeriodSeconds: 45
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+---
+# NetworkPolicy for the Sentinel.
+#
+# Egress is restricted to the apiserver, the agent, and DNS. The Sentinel has no
+# other reason to send a packet, and "no other reason" is enforceable here in a way
+# it is not in the code - a compromised process with an unexpected egress would be
+# stopped by this rather than trusted not to have one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srek3s-sentinel
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-sentinel
+  policyTypes:
+    - Egress
+    - Ingress
+  # No ingress rules: the Sentinel serves nothing. With no ingress section under
+  # Ingress policy type, the default deny applies and nothing can reach it.
+  ingress: []
+  egress:
+    # The Kubernetes API. The Sentinel cannot watch pods without this, and it is
+    # the only cluster-internal dependency.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              component: kube-apiserver
+      ports:
+        - protocol: TCP
+          port: 6443
+    # The agent, for POST /v1/incidents.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: srek3s-agent
+      ports:
+        - protocol: TCP
+          port: 8000
+    # DNS, to resolve both of the above by name.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

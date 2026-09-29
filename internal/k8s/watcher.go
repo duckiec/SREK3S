@@ -73,6 +73,27 @@ type IncidentRecord struct {
 	Restarts  int32
 	PodPhase  corev1.PodPhase
 	FirstSeen time.Time
+
+	// PreviousReason is the termination reason of the instance *before* this one,
+	// or "" when the container has never been restarted.
+	//
+	// From `LastTerminationState`, not from the current state. The kubelet
+	// overwrites `State` when a container restarts, so by the time the Sentinel
+	// sees a CrashLoopBackOff the only surviving evidence of the crash that caused
+	// it is `LastTerminationState`. Reading `State` here would report the
+	// CrashLoopBackOff itself, which is the condition and not the cause.
+	PreviousReason string
+
+	// Resources is the container's declared limits and requests, captured at
+	// classification time from the pod spec, which is the only moment the object
+	// is guaranteed to be in hand.
+	//
+	// Captured here rather than fetched by the worker because the worker talks to
+	// a log and event API and would have to add a pod read to get a value the
+	// informer already had - and a pod read at dispatch time can return a
+	// *different* pod, after an edit, which would attribute a remediation to
+	// limits that were never in force when the container died.
+	Resources ContainerResources
 }
 
 // DedupKeyFor builds the deduplication signature.
@@ -194,18 +215,20 @@ func classify(pod *corev1.Pod, now time.Time) []IncidentRecord {
 		// reportable - the classifier downstream decides, not the watcher.
 		if term := TerminationOf(status); term.Found && term.ExitCode != 0 {
 			records = append(records, IncidentRecord{
-				DedupKey:      key,
-				Namespace:     pod.Namespace,
-				PodName:       pod.Name,
-				PodUID:        string(pod.UID),
-				ContainerName: container.Name,
-				Kind:          classifyExit(term),
-				ExitCode:      term.ExitCode,
-				Reason:        term.Reason,
-				Message:       term.Message,
-				Restarts:      restarts,
-				PodPhase:      pod.Status.Phase,
-				FirstSeen:     now,
+				DedupKey:       key,
+				Namespace:      pod.Namespace,
+				PodName:        pod.Name,
+				PodUID:         string(pod.UID),
+				ContainerName:  container.Name,
+				Kind:           classifyExit(term),
+				ExitCode:       term.ExitCode,
+				Reason:         term.Reason,
+				Message:        term.Message,
+				Restarts:       restarts,
+				PodPhase:       pod.Status.Phase,
+				FirstSeen:      now,
+				PreviousReason: LastTerminationOf(status).Reason,
+				Resources:      ResourcesFor(pod, container.Name),
 			})
 			continue
 		}
@@ -215,18 +238,20 @@ func classify(pod *corev1.Pod, now time.Time) []IncidentRecord {
 		// duplicate of the branch above.
 		if waiting := WaitingOf(status); waiting.Found && waiting.Reason == string(FailureCrashLoopBackOff) {
 			records = append(records, IncidentRecord{
-				DedupKey:      key,
-				Namespace:     pod.Namespace,
-				PodName:       pod.Name,
-				PodUID:        string(pod.UID),
-				ContainerName: container.Name,
-				Kind:          FailureCrashLoopBackOff,
-				ExitCode:      0,
-				Reason:        waiting.Reason,
-				Message:       waiting.Message,
-				Restarts:      restarts,
-				PodPhase:      pod.Status.Phase,
-				FirstSeen:     now,
+				DedupKey:       key,
+				Namespace:      pod.Namespace,
+				PodName:        pod.Name,
+				PodUID:         string(pod.UID),
+				ContainerName:  container.Name,
+				Kind:           FailureCrashLoopBackOff,
+				ExitCode:       0,
+				Reason:         waiting.Reason,
+				Message:        waiting.Message,
+				Restarts:       restarts,
+				PodPhase:       pod.Status.Phase,
+				FirstSeen:      now,
+				PreviousReason: LastTerminationOf(status).Reason,
+				Resources:      ResourcesFor(pod, container.Name),
 			})
 		}
 	}

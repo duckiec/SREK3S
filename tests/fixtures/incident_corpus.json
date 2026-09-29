@@ -8,7 +8,7 @@
     "BenchmarkScrubThroughput. `expect_masked: false` marks a negative control",
     "that must survive untouched, so over-masking is caught alongside leaks."
   ],
-  "version": "1.0.0",
+  "version": "1.4.2",
   "groups": [
     {
       "name": "basic_auth_uris",
@@ -20,41 +20,59 @@
           "line": "dialing postgres://payments:hunter2@10.4.2.9:5432/payments",
           "secret": "hunter2",
           "expect_masked": true,
-          "must_survive": ["postgres://payments:", ":5432", "/payments"]
+          "must_survive": [
+            "postgres://payments:",
+            ":5432",
+            "/payments"
+          ]
         },
         {
           "id": "uri-mysql-hostname",
           "line": "connecting mysql://root:s3cr3tP4ss@db.internal:3306/checkout",
           "secret": "s3cr3tP4ss",
           "expect_masked": true,
-          "must_survive": ["mysql://root:", "@db.internal:3306", "/checkout"]
+          "must_survive": [
+            "mysql://root:",
+            "@db.internal:3306",
+            "/checkout"
+          ]
         },
         {
           "id": "uri-redis-db",
           "line": "cache connect redis://cache-user:authToken99@redis.internal:6379/0",
           "secret": "authToken99",
           "expect_masked": true,
-          "must_survive": ["redis://cache-user:", "@redis.internal:6379", "/0"]
+          "must_survive": [
+            "redis://cache-user:",
+            "@redis.internal:6379",
+            "/0"
+          ]
         },
         {
           "id": "uri-amqp-vhost",
           "line": "broker amqp://svc:pa55word@broker.internal/vhost",
           "secret": "pa55word",
           "expect_masked": true,
-          "must_survive": ["amqp://svc:", "@broker.internal", "/vhost"]
+          "must_survive": [
+            "amqp://svc:",
+            "@broker.internal",
+            "/vhost"
+          ]
         },
         {
           "id": "uri-no-credentials",
           "line": "registry https://registry.internal:8443/v2/checkout",
           "expect_masked": false,
-          "must_survive": ["https://registry.internal:8443/v2/checkout"]
+          "must_survive": [
+            "https://registry.internal:8443/v2/checkout"
+          ]
         }
       ]
     },
     {
       "name": "generic_secret_kv",
       "rule": "generic_secret_kv",
-      "note": "ARCH 6.4 (D-1): JSON form, quote-separated keys and multi-word keys all match.",
+      "note": "ARCH 6.4 (D-1): JSON form, quote-separated keys and multi-word keys all match. ARCH 6.6: key alternation gained an optional access segment so `secret_access_key` matches; listed before the bare `secret` alternative.",
       "cases": [
         {
           "id": "kv-equals",
@@ -73,14 +91,18 @@
           "line": "{\"password\":\"hunter2\",\"user\":\"svc-checkout\"}",
           "secret": "hunter2",
           "expect_masked": true,
-          "must_survive": ["svc-checkout"]
+          "must_survive": [
+            "svc-checkout"
+          ]
         },
         {
           "id": "kv-json-nested",
           "line": "{\"db\":{\"api_key\":\"sk-live-abcdef123456\"},\"replicas\":3}",
           "secret": "sk-live-abcdef123456",
           "expect_masked": true,
-          "must_survive": ["replicas"]
+          "must_survive": [
+            "replicas"
+          ]
         },
         {
           "id": "kv-auth-token",
@@ -128,25 +150,51 @@
           "id": "kv-negative-token-count",
           "line": "token_count=12345",
           "expect_masked": false,
-          "must_survive": ["token_count=12345"]
+          "must_survive": [
+            "token_count=12345"
+          ]
         },
         {
           "id": "kv-negative-secret-version",
           "line": "secret_version=v3",
           "expect_masked": false,
-          "must_survive": ["secret_version=v3"]
+          "must_survive": [
+            "secret_version=v3"
+          ]
         },
         {
           "id": "kv-negative-substring-key",
           "line": "mytokenizer=abcdefgh",
           "expect_masked": false,
-          "must_survive": ["mytokenizer=abcdefgh"]
+          "must_survive": [
+            "mytokenizer=abcdefgh"
+          ]
         },
         {
           "id": "kv-negative-password-policy",
           "line": "password_policy=strict-mode-value",
           "expect_masked": false,
-          "must_survive": ["password_policy=strict-mode-value"]
+          "must_survive": [
+            "password_policy=strict-mode-value"
+          ]
+        },
+        {
+          "id": "aws-secret-access-key-unquoted",
+          "line": "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          "secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          "expect_masked": true
+        },
+        {
+          "id": "aws-secret-access-key-hyphen",
+          "line": "aws-secret-access-key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          "secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          "expect_masked": true
+        },
+        {
+          "id": "secret-key-unquoted-regression",
+          "line": "secret_key=topsecretvalue123",
+          "secret": "topsecretvalue123",
+          "expect_masked": true
         }
       ]
     },
@@ -165,7 +213,10 @@
           "line": "assume-role AROAI44QH8DHBEXAMPLE proceeding",
           "secret": "AROAI44QH8DHBEXAMPLE",
           "expect_masked": true,
-          "must_survive": ["assume-role", "proceeding"]
+          "must_survive": [
+            "assume-role",
+            "proceeding"
+          ]
         },
         {
           "id": "aws-secret-key",
@@ -202,26 +253,35 @@
           "line": "trace 7f3a1b2c-4d5e-4f60-8a9b-0c1d2e3f4a5b done",
           "secret": "7f3a1b2c-4d5e-4f60-8a9b-0c1d2e3f4a5b",
           "expect_masked": true,
-          "must_survive": ["trace", "done"]
+          "must_survive": [
+            "trace",
+            "done"
+          ]
         },
         {
           "id": "ipv4",
           "line": "dialing 10.4.2.9:5432",
           "secret": "10.4.2.9",
           "expect_masked": true,
-          "must_survive": [":5432"]
+          "must_survive": [
+            ":5432"
+          ]
         },
         {
           "id": "ipv4-negative-invalid-octet",
           "line": "version 999.1.1.1 is not a valid address",
           "expect_masked": false,
-          "must_survive": ["999.1.1.1"]
+          "must_survive": [
+            "999.1.1.1"
+          ]
         },
         {
           "id": "ipv4-negative-three-octets",
           "line": "client 10.4.2",
           "expect_masked": false,
-          "must_survive": ["10.4.2"]
+          "must_survive": [
+            "10.4.2"
+          ]
         }
       ]
     },
@@ -252,7 +312,9 @@
           "id": "k8s-negative-tokenizer",
           "line": "tokenizer latency 4ms",
           "expect_masked": false,
-          "must_survive": ["tokenizer latency 4ms"]
+          "must_survive": [
+            "tokenizer latency 4ms"
+          ]
         }
       ]
     },
@@ -273,7 +335,10 @@
           ],
           "secret": "MIIEowIBAAKCAQEAy8Dbv8prpJ0kKhlGeJYozo2t60EG8L0561g13R29LvMR5hy",
           "expect_masked": true,
-          "must_survive": ["loading key material", "key material loaded"]
+          "must_survive": [
+            "loading key material",
+            "key material loaded"
+          ]
         },
         {
           "id": "pem-pkcs8",
@@ -300,7 +365,10 @@
           "line": "truncated log: -----BEGIN RSA PRIVATE KEY----- <eof>",
           "secret": "-----BEGIN RSA PRIVATE KEY-----",
           "expect_masked": true,
-          "must_survive": ["truncated log:", "<eof>"]
+          "must_survive": [
+            "truncated log:",
+            "<eof>"
+          ]
         }
       ]
     },
@@ -313,7 +381,9 @@
           "id": "clean-session",
           "line": "2026-09-28T14:03:11.001Z INFO checkout started tenant=acme-corp latency_ms=42",
           "expect_masked": false,
-          "must_survive": ["2026-09-28T14:03:11.001Z INFO checkout started tenant=acme-corp latency_ms=42"]
+          "must_survive": [
+            "2026-09-28T14:03:11.001Z INFO checkout started tenant=acme-corp latency_ms=42"
+          ]
         },
         {
           "id": "clean-pool",
@@ -339,7 +409,9 @@
           "id": "clean-akia-prose",
           "line": "the AKIA prefix is used by AWS",
           "expect_masked": false,
-          "must_survive": ["the AKIA prefix is used by AWS"]
+          "must_survive": [
+            "the AKIA prefix is used by AWS"
+          ]
         }
       ]
     }

@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
 	"time"
@@ -160,6 +161,24 @@ func DisallowedFacadeMethods() []string {
 	}
 	sort.Strings(offenders)
 	return offenders
+}
+
+// DescribeReadOnlyClientset renders the facade's scope for a startup log.
+//
+// Exists so main can report *what it will observe* without holding a
+// kubernetes.Interface, which is the point of the facade. A startup line that says
+// "namespace=payments" is a claim; this returns the reader that would be used, so
+// the log and the capability are the same value.
+func DescribeReadOnlyClientset(r *ReadOnlyClientset, namespace string) string {
+	if r == nil {
+		return "(none)"
+	}
+	scope := namespace
+	if scope == AllNamespaces {
+		scope = "(all)"
+	}
+	return fmt.Sprintf("pods=%s events=%s verbs=%v",
+		scope, scope, AllowedFacadeMethods)
 }
 
 // BoundTimeout returns a context carrying the default deadline.

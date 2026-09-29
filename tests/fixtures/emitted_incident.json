@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0.0",
+  "incident_id": "inc_01M3M6W9ENH28NJS8C5T1665PA",
+  "timestamp": "2026-09-28T14:32:07.481Z",
+  "namespace": "payments",
+  "pod_name": "checkout-api-7d9f4b6c8d-x2k9p",
+  "container_name": "checkout-api",
+  "exit_code": 137,
+  "reason": "OOMKilled",
+  "resource_limits": {
+    "cpu_limit": "500m",
+    "cpu_request": "250m",
+    "memory_limit": "256Mi",
+    "memory_request": "128Mi",
+    "memory_working_set_bytes": null
+  },
+  "restart_count": 4,
+  "previous_reason": "Completed",
+  "scrubbed_logs": [
+    "ts=2026-09-28T14:32:07.412Z level=error msg=\"alloc failure\" pod=[REDACTED] conn=[REDACTED]:5432",
+    "ts=2026-09-28T14:32:07.419Z level=warn msg=\"retrying upstream\" request_id=[REDACTED] auth=[REDACTED]",
+    "ts=2026-09-28T14:32:07.455Z level=error msg=\"upstream rejected\" dial=postgres://checkout:[REDACTED]@[REDACTED]:5432/orders"
+  ],
+  "cluster_events": [
+    {
+      "type": "Warning",
+      "reason": "OOMKilled",
+      "message": "Container checkout-api was OOMKilled (exit code 137).",
+      "count": 4,
+      "first_timestamp": null,
+      "last_timestamp": null,
+      "involved_object": "pod/checkout-api-7d9f4b6c8d-x2k9p"
+    }
+  ],
+  "redaction_report": {
+    "total_redactions": 7,
+    "rules_triggered": [
+      "jwt",
+      "basic_auth_url",
+      "generic_secret_kv",
+      "uuid",
+      "ipv4_address"
+    ]
+  },
+  "detection_latency_ms": 412,
+  "sentinel_version": "0.1.0"
+}

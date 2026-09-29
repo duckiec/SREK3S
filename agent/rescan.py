@@ -105,11 +105,17 @@ RESCAN_RULES: Final[tuple[Rule, ...]] = (
         r"(?i)([a-z][a-z0-9+.-]*:\/\/[^:\s\/]+:)([^@\s\/]+)(@[^\s\/]+)",
         group_preserving=True,
     ),
+    # ARCH §6.6: `secret(?:[_-]access)?[_-]?key` must be listed before the bare
+    # `secret` so the longest match wins without relying on backtracking. This
+    # mirrors internal/scrubber/manifest.go exactly - the two implementations are
+    # required to stay rule-for-rule identical (ARCH §6 M6), and a divergence here
+    # means the backstop disagrees with the control.
+    #
     # ARCH §6.4: the key name and the closing quote survive, so JSON structure
     # does not collapse when a password is masked.
     _rule(
         "generic_secret_kv",
-        r"(?i)(\b[\w-]{0,20}(?:api[_-]?key|secret[_-]?key|secret|token"
+        r"(?i)(\b[\w-]{0,20}(?:api[_-]?key|secret(?:[_-]access)?[_-]?key|secret|token"
         r"|access[_-]?token|refresh[_-]?token|password|passwd|pwd|passphrase"
         r"|client[_-]?secret|private[_-]?key|authorization|auth)"
         r"[\"']?\s*[:=]\s*[\"']?)(?P<value>[^\"',;}\n]{4,})([\"']?)",

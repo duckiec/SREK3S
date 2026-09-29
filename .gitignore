@@ -10,6 +10,10 @@
 
 # Go
 coverage.*
+/bin/
+# Dev-host only: GOTMPDIR for scripts/gotest.ps1, which works around the Windows
+# Application Control rule that blocks freshly linked test binaries.
+/.gotmp/
 
 # Python
 __pycache__/

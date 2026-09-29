@@ -1,0 +1,101 @@
+# SREK3S Sentinel - Kubernetes RBAC.
+#
+# This Role is the load-bearing control for ARCHITECTURE.md §1's "zero direct
+# cluster mutation". Everything else in the system is written to never write; this
+# is what makes "never write" true rather than intended.
+#
+# Two independent layers enforce it, and they are deliberately not redundant:
+#
+#   1. This Role. The apiserver rejects a write verb regardless of what the
+#      process intends. It holds even if a bug reaches a client-go mutating
+#      method, or if the binary is replaced with something else entirely.
+#   2. TestSentinelHasNoMutatingVerbs parses this file and fails the build if a
+#      verb other than get/list/watch appears. It holds even if the Role is
+#      correct today and someone adds an escalation path next quarter.
+#
+# Neither layer subsumes the other: the Role is the control, the test is the
+# guarantee that the control is still in place. A Role that is correct but
+# unasserted rots silently, and a test that passes while the Role is wrong proves
+# nothing about the cluster.
+#
+# Note what is *absent* and why that matters. There is no ClusterRoleBinding here.
+# A namespaced Role bound cluster-wide, or a ClusterRole, would each widen the
+# blast radius beyond what a watcher needs. The Sentinel observes pods and events
+# and nothing else; if it ever needed to read Deployments, this file would change
+# and the change would be visible in review.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: srek3s-sentinel
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+rules:
+  # Pods: the informer's list and watch, and the log and status reads the worker
+  # performs per incident.
+  #
+  # `pods/log` is a separate subresource and is required - a rule on `pods` alone
+  # does not grant it. Omitting it would make every incident arrive with no logs,
+  # which is a silent failure rather than an error: the RCA would be generated from
+  # resource limits alone and look entirely plausible.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+
+  # Events: joined to the incident by involvedObject.uid (ROADMAP 3.3.4).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  # Deployments and ReplicaSets: read-only, for attributing an incident to a
+  # workload rather than to a bare pod name.
+  #
+  # Deliberately read-only and deliberately present. A namespace-scoped Role
+  # cannot be given a wildcard that would cover future write verbs by accident,
+  # because the verbs are enumerated - which is the other half of why the
+  # allow-list form is used here rather than a deny-list of writes.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+
+---
+# The Sentinel's ServiceAccount.
+#
+# Separate from the agent's, and the agent's is not bound to anything at all. The
+# Sentinel needs a token to watch; the agent needs none, and giving it one would
+# hand the LLM-facing process a cluster credential it has no use for.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: srek3s-sentinel
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+# The token is projected rather than a permanent secret, so it rotates with the
+# pod and appears in no etcd entry that outlives it.
+automountServiceAccountToken: true
+
+---
+# The binding. Namespaced, and the only one.
+#
+# `roleRef` is immutable in Kubernetes, which is a feature here: a
+# privilege-escalation attempt has to edit this file, and a file is reviewable. A
+# live API patch to the binding would be rejected outright.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: srek3s-sentinel
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+subjects:
+  - kind: ServiceAccount
+    name: srek3s-sentinel
+    namespace: srek3s-system
+roleRef:
+  kind: Role
+  name: srek3s-sentinel
+  apiGroup: rbac.authorization.k8s.io

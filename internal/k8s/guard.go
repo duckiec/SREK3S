@@ -228,6 +228,67 @@ func QuantityOrZero(quantity *resource.Quantity) int64 {
 	return value
 }
 
+// ContainerResources is a container's declared limits and requests, as the
+// *strings* Kubernetes itself reports.
+//
+// Strings, not parsed quantities, because ARCH §4.1 requires the Sentinel to
+// forward the declared value verbatim: `MemoryLimitBytes` would return 0 for a
+// limit expressed in a unit it cannot convert, and the agent's `Quantity`
+// pattern is written against the Kubernetes spelling. Re-parsing here would
+// make the Go node the place where a limit gets silently rewritten.
+//
+// Every field is empty when the spec does not declare it. Empty is distinct from
+// "0Gi": the wire type maps empty to JSON `null`, and the agent treats null as
+// "unknown", which is the honest answer for an undeclared limit.
+type ContainerResources struct {
+	CPULimit      string
+	CPURequest    string
+	MemoryLimit   string
+	MemoryRequest string
+}
+
+// ResourcesFor resolves a container's declared resources from the pod spec.
+//
+// Nil-safe at every level, like every accessor in this file: nil pod, missing
+// container, nil Resources, and a missing or unparsable quantity all yield the
+// zero value rather than a panic. `resource.Quantity` is a struct, so a
+// zero-valued one is the "absent" case; [resource.Quantity.IsZero] distinguishes
+// an explicitly declared zero from an absent entry.
+func ResourcesFor(pod *corev1.Pod, containerName string) ContainerResources {
+	if pod == nil {
+		return ContainerResources{}
+	}
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name != containerName {
+			continue
+		}
+		resources := pod.Spec.Containers[i].Resources
+		return ContainerResources{
+			CPULimit:      quantityString(resources.Limits, corev1.ResourceCPU),
+			CPURequest:    quantityString(resources.Requests, corev1.ResourceCPU),
+			MemoryLimit:   quantityString(resources.Limits, corev1.ResourceMemory),
+			MemoryRequest: quantityString(resources.Requests, corev1.ResourceMemory),
+		}
+	}
+	return ContainerResources{}
+}
+
+// quantityString renders one entry of a ResourceList, or "" when it is absent.
+//
+// `IsZero` is the absent test, not `String() == "0"`: a cluster that declares
+// `memory: "0"` is a misconfiguration worth reporting faithfully, whereas an
+// undeclared limit must not be invented.
+func quantityString(list corev1.ResourceList, name corev1.ResourceName) string {
+	if list == nil {
+		return ""
+	}
+	quantity, ok := list[name]
+	if !ok || quantity.IsZero() {
+		return ""
+	}
+	return quantity.String()
+}
+
 // MemoryLimitForContainer resolves a container's memory limit from the pod spec,
 // nil-safe at every level: nil pod, nil spec, missing container, nil Resources,
 // missing or non-integral memory.

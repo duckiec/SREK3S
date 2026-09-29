@@ -68,6 +68,17 @@ type Incident struct {
 	ExitCode  int32
 	Restarts  int32
 
+	// PreviousReason is the prior instance's termination reason, "" when the
+	// container has never restarted. Passed through rather than re-read: the
+	// kubelet overwrites it once the container comes back, so by dispatch time it
+	// is gone from the API.
+	PreviousReason string
+
+	// Resources is the container's declared limits and requests as they were when
+	// the failure was observed. See IncidentRecord.Resources for why they are
+	// captured at classification rather than fetched at dispatch.
+	Resources k8s.ContainerResources
+
 	// ScrubbedLogs is the evidence, scrubbed in memory. Nothing unscrubbed leaves
 	// this struct, which is what makes "no raw secret can reach the request body"
 	// checkable rather than aspirational.
@@ -177,6 +188,20 @@ func (p *Pool) Run(ctx context.Context) {
 	p.wg.Wait()
 }
 
+// Wait blocks until every started worker has exited.
+//
+// Split out from [Pool.Run] so a caller that needs to do something *while* the
+// pool drains - bound the wait, report what was in flight, log a final snapshot -
+// can do it without a second pool. ROADMAP 3.3.5 is the reason: a SIGTERM handler
+// that calls Run and then exits has no point at which it can observe whether the
+// drain completed.
+//
+// Safe to call on a pool that was never started: the WaitGroup counter is zero, so
+// Wait returns immediately. That is what makes it usable from a defer or a test.
+func (p *Pool) Wait() {
+	p.wg.Wait()
+}
+
 // loop is one worker's read/dispatch cycle.
 //
 // The channel receive is select-ed against ctx.Done(): an unconditional receive
@@ -218,6 +243,9 @@ func (p *Pool) handle(parent context.Context, record *k8s.IncidentRecord) {
 		Kind:      string(record.Kind),
 		ExitCode:  record.ExitCode,
 		Restarts:  record.Restarts,
+
+		PreviousReason: record.PreviousReason,
+		Resources:      record.Resources,
 	}
 
 	p.collectTelemetry(ctx, incident)

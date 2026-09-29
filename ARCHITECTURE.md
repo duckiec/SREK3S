@@ -602,3 +602,49 @@ Per AGENTS.md §5, `ARCHITECTURE.md` governs schemas and layout. Therefore:
 - Adding a directory outside §3 requires an explicit decision recorded here first.
 - `TIER_1_TOIL` / `TIER_2_ARCHITECTURAL` are **closed enums**. Adding a tier is a design
   change, not an implementation detail.
+
+### 6.6 Amendment — Rule 7 `secret_access_key` (ratified, P0 credential leak)
+
+**Problem.** An **unquoted** AWS secret access key passed the entire 11-rule pipeline unmasked.
+
+```
+aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  ->  masked (rule 3)
+aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY    ->  NOT MASKED
+```
+
+Two rules should have caught it, and both missed:
+
+- **Rule 3** (`aws_secret_access_key`) is anchored on quotes around the 40-character value,
+  which is the shape the AWS CLI emits. That is correct for its own input, and useless for an env
+  dump or a `key=value` log line.
+- **Rule 7** (`generic_secret_kv`) could not cover it either. Its key alternation contained
+  `secret[_-]?key`, and that substring does not occur inside `secret_access_key`, so the `[:=]`
+  never lined up and the alternative never matched.
+
+The result was a live credential in telemetry, which §6 M5 ranks as the one unacceptable outcome:
+over-masking is recoverable, a leaked credential is not.
+
+**Amendment.** Rule 7's key alternation gains an optional access segment:
+
+```
+(?:secret(?:[_-]access)?[_-]?key|secret)
+```
+
+This covers `secret_key`, `secret-key`, `secretkey`, `secret_access_key` and `secret-access-key`, and
+is listed **before** the bare `secret` alternative so the longest match wins without depending on
+backtracking.
+
+**Scope.** P0, minimal, and confined to rule 7's key name. No other rule is touched, no replacement
+changes, and the group structure is untouched — so rule 7's existing behaviour on `password`, `token`,
+`api_key` and the JSON form is bit-for-bit unchanged.
+
+**Parity.** `agent/rescan.py` carries the identical amendment, because ARCH §6 M6 requires the agent's
+backstop to apply the same rule IDs as the Go node. A change to one without the other would leave the
+two implementations disagreeing about the same credential.
+
+**Idempotency.** Unaffected. The replacement remains `${1}[REDACTED]${3}`, and re-scrubbing
+`aws_secret_access_key=[REDACTED]` produces the identical bytes, so invariant I-A5 holds.
+
+**Verified by.** `TestSecretAccessKeyVariantsAreMasked` (Go, rule-by-rule and idempotence),
+`TestUnquotedAWSSecretKeyIsScrubbed` (worker, end-to-end through the pool), and
+`TestRule7CoversSecretAccessKeyVariants` (Python, parity against the Go manifest).

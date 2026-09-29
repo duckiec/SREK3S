@@ -69,6 +69,32 @@ jobs:
       - name: G3 — go test -race
         run: go test -v -race -timeout 30s ./...
 
+      # ROADMAP's Milestone 3 terminal validation command, run here because it is
+      # the gate that proves the milestone closed. Its own step rather than folded
+      # into G3, so a failure names which pass condition broke.
+      #
+      # The comment on the -run filter is not decoration. A -run pattern that
+      # matches nothing exits 0, and that is exactly how this command reported
+      # success while asserting nothing: no test was named TestNilPointerSafety,
+      # so item 1 of its five pass conditions had no test behind it.
+      # TestTerminalCommandFiltersMatchRealTests is the guard, and it lives in the
+      # Go suite so it runs whether or not this step does.
+      - name: M3 terminal validation
+        run: |
+          go test -race -timeout 30s \
+            -run 'TestNilPointerSafety|TestNoGoroutineLeak|TestIncidentPayloadContract' \
+            -v ./...
+
+      # A separate assertion from "the tests compiled". G3 typechecks and links
+      # test binaries; it never proves cmd/sentinel links for a real target, and a
+      # main package that only compiles under `go test` is a plausible shape for a
+      # missing symbol behind a build tag.
+      - name: Build the sentinel binary
+        run: |
+          go build -o bin/sentinel ./cmd/sentinel
+          ls -l bin/sentinel
+          ./bin/sentinel -version
+
       - name: Benchmarks (informational)
         # Not a gate: benchmarks report, they do not fail. The throughput
         # *assertion* lives in the test suite; these runs are the human-readable

@@ -12,6 +12,7 @@ recorded in the test that depends on it - a check that cannot fail is not a chec
 from __future__ import annotations
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -290,6 +291,92 @@ class TestRescan:
         assert cleaned[0] == "postgres://payments:[REDACTED]@db.internal:5432/payments"
         assert "db.internal" in cleaned[0]
         assert "5432" in cleaned[0]
+
+    def test_rule7_covers_secret_access_key_variants(self) -> None:
+        """ARCH §6.6 (P0): the unquoted AWS secret access key must be masked.
+
+        Rule 3 is anchored on quotes around the 40-character value, and rule 7's
+        key alternation previously contained ``secret[_-]?key`` - a substring that
+        does not occur inside ``secret_access_key``. Neither rule matched, so a live
+        credential passed the whole pipeline.
+        """
+        secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        # Unquoted forms are rule 7's responsibility, and the amendment is what
+        # gives it those.
+        for line in (
+            f"aws_secret_access_key = {secret}",
+            f"aws-secret-access-key={secret}",
+            f"AWS_SECRET_ACCESS_KEY={secret}",
+        ):
+            cleaned, report = rescan.redact(line)
+            assert secret not in cleaned[0], f"leaked: {line!r} -> {cleaned[0]!r}"
+            assert "generic_secret_kv" in report.rules_triggered, report.summary()
+            # Rule 7 is group-preserving: the key name survives so an operator can
+            # still see what leaked. `or`, not two assertions - the hyphen variant
+            # keeps its hyphens and the underscore variant keeps its underscores.
+            lowered = cleaned[0].lower()
+            assert (
+                "secret_access_key" in lowered or "secret-access-key" in lowered
+            ), cleaned[0]
+
+        # The quoted form is rule 3's, which replaces the whole matched span and so
+        # does not preserve the key name. Asserted separately so the distinction is
+        # recorded rather than assumed.
+        cleaned, report = rescan.redact(f'aws_secret_access_key="{secret}"')
+        assert secret not in cleaned[0]
+        assert "aws_secret_access_key" in report.rules_triggered, report.summary()
+
+    def test_rule7_pattern_matches_the_go_manifest(self) -> None:
+        """The backstop and the control must agree, rule for rule (ARCH §6 M6).
+
+        Transcribed rather than imported from Go, so parity is asserted rather
+        than assumed - a divergence here means the two implementations disagree
+        about the same credential, which is the failure the backstop exists to
+        prevent.
+        """
+        go_source = (_REPO_ROOT / "internal" / "scrubber" / "manifest.go").read_text(
+            encoding="utf-8"
+        )
+        go_pattern = re.search(r"RuleGenericSecretKV:\s*`([^`]*)`", go_source)
+        assert go_pattern is not None, "could not read the Go rule 7 pattern"
+
+        python_pattern = next(
+            rule.pattern.pattern
+            for rule in rescan.RESCAN_RULES
+            if rule.rule_id == "generic_secret_kv"
+        )
+        # The alternation is the part that must match; the surrounding capture
+        # structure is allowed to be transcribed.
+        go_alternation = re.search(r"\(\?:api\[_-\]\?key\|[^)]*\)", go_pattern.group(1))
+        assert go_alternation is not None
+        for alternative in ("secret(?:[_-]access)?[_-]?key",):
+            assert alternative in go_pattern.group(1), (
+                f"{alternative} missing from the Go pattern; the amendment and its "
+                "mirror have diverged"
+            )
+            assert (
+                alternative in python_pattern
+            ), f"{alternative} missing from the Python mirror"
+
+    def test_redaction_is_idempotent_for_the_amended_key(self) -> None:
+        """ARCH §6.6 asserts I-A5 still holds.
+
+        Idempotence is **byte-identity**, which is what the charter's I-A5 means and
+        what the Go corpus asserts. It is deliberately *not* asserted here as "the
+        masked form triggers no rule": rule 7's value class is ``[^"'',;}\\n]{4,}``
+        and ``[REDACTED]`` is ten characters of it, so a re-scan legitimately fires
+        again and reports a redaction.
+
+        The output is unchanged either way, which is the property that matters - and
+        an earlier version of this test asserted ``report.clean`` and failed on
+        correct behaviour. It is safe in practice because the worker scrubs each log
+        exactly once; scrubbing twice would double-count ``RedactionReport.Total``.
+        """
+        secret_line = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG"
+        once, _ = rescan.redact(secret_line)
+        twice, _ = rescan.redact(once[0])
+        assert twice[0] == once[0], "re-scrubbing changed the bytes"
+        assert secret_line not in twice[0]
 
     def test_multi_line_rules_run_before_single_line_fallbacks(self) -> None:
         """AGENTS.md §3.6 / ARCH §6.5: the PEM block must be removed whole."""

@@ -3,6 +3,15 @@ module github.com/srek3s/sentinel
 go 1.23
 
 require (
+
+	// Test-only: the deploy manifest assertions parse YAML structurally rather than
+	// by grep, because a grep is satisfied by a comment. Already an indirect
+	// dependency of k8s.io/apimachinery, so promoting it to a direct requirement
+	// costs no new module and no new download - and it was already linked into the
+	// sentinel binary by that transitive edge, which is why the guard here is
+	// "no non-test file imports it" rather than "it is not linked":
+	// TestYamlIsOnlyImportedFromTests.
+	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.31.0
 	k8s.io/apimachinery v0.31.0
 	k8s.io/client-go v0.31.0
@@ -42,7 +51,6 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8 // indirect

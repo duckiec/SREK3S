@@ -743,10 +743,27 @@ new module requirements.
       cluster went quiet" rather than like a bug. `Run` closes the egress channel on stop so a
       consumer ranging over it terminates instead of hanging on SIGTERM.
       `cache.SharedInformerFactory` with an explicit resync period.
-- [ ] `3.3.2` Create `internal/k8s/classify.go` extracting `OOMKilled` (terminated, exit code
-      `137`) and `CrashLoopBackOff` (waiting, reason `CrashLoopBackOff`).
+- [x] `3.3.2` Extract `OOMKilled` (terminated, exit code `137`) and `CrashLoopBackOff` (waiting,
+      reason `CrashLoopBackOff`).
+      **Deviation from the letter of the roadmap, ratified:** the classification lives in
+      `watcher.go`, not a separate `classify.go`. The filter *is* the classifier here - a container
+      that is not terminated non-zero and not waiting on `CrashLoopBackOff` produces no record, so
+      there is no "extract the predicate from the iteration" step to perform. Splitting it would move
+      ~40 lines across a file boundary and add a parameter for the status, and would not make either
+      function more testable. `classifyExit` and the waiting branch are separately named and
+      separately unit-tested, so the *decision* is still isolated from the *walk*.
+      Left unticked for two milestones pending this decision rather than ticked on an assumption.
+      `classifyExit` treats `ExitCode == 137` **or** `Reason == "OOMKilled"` as OOM: a cgroup OOM
+      kill and a kubelet-reported one are the same event observed two ways, and requiring both would
+      silently downgrade a real OOMKill to a generic `Terminated` - which the emitter then refuses to
+      map, because the agent's `Reason` enum has no member for it.
 - [x] `3.3.3` Deduplicate per `(pod_uid, container_name, failure_signature)` so a stable
-      Keyed exactly `fmt.Sprintf("%s/%s:%d", ns, podName, restartCount)`. The restart count is what
+      Keyed exactly `fmt.Sprintf("%s/%s:%d", podUID, containerName, restartCount)` - **corrected**.
+      The note below previously recorded `fmt.Sprintf("%s/%s:%d", ns, podName, restartCount)`, which
+      was the *buggy* key the task was written to fix; the evidence was documenting the defect as if
+      it were the design. Two components were wrong: namespace+podName instead of podUID, and **no
+      container name at all**, so two failing containers in one pod collided and one incident was
+      lost. The restart count is what
       makes the key correct rather than merely well-formatted: a resync re-delivers the same status,
       so a key without it would suppress echoes but also suppress a *genuine* new failure of the same
       pod, because name and namespace are unchanged. This is ROADMAP 3.3.3's `failure_signature` made
@@ -766,56 +783,306 @@ new module requirements.
       already have been replaced; for a CrashLoopBackOff the live instance is the one kubelet keeps
       failing to start, which is blank by construction. Getting it wrong returns a blank log with no
       error - the worst outcome for evidence collection.
-- [ ] `3.3.5` Tie a stop channel to `SIGINT`/`SIGTERM`; drain in-flight jobs before exit.
+- [x] `3.3.5` Tie a stop channel to `SIGINT`/`SIGTERM`; drain in-flight jobs before exit.
+      `cmd/sentinel/main.go`. `signal.NotifyContext` for the root context - it cancels on the
+      first `SIGINT`/`SIGTERM` and restores default behaviour on a second, so an operator can
+      always escalate to an immediate kill. `main()` is only the signal wiring; `run(ctx, args)`
+      is the body, so the shutdown path is testable in-process (a test cannot raise `SIGTERM`
+      against itself without disturbing the test binary).
+      **Shutdown order is the substance, and it is the reverse of startup.** The informer is
+      stopped *first*, then the pool is drained. Draining first would let the queue refill while
+      waiting for it to empty, so the wait would never finish. Bounded by `ShutdownGrace` (20s) via
+      `waitFor`; a drain that overruns logs an error naming `terminationGracePeriodSeconds` rather
+      than blocking until the kubelet `SIGKILL`s mid-write.
+      `Pool.Wait()` split out of `Pool.Run` for this, and `TestWaitIsSafeWithoutStart` covers the
+      defer/error-branch case where `Start` never ran. `TestPoolDrainsOnCancellation` asserts the
+      in-flight incident is **dispatched, not dropped** - a pool that dropped its work on shutdown
+      would pass every goroutine-count assertion, because nothing would be left holding anything.
+      Bounded by `TestSentinelTerminationGraceExceedsTheDrainBudget` (45s > 20s), since
+      `ShutdownGrace` and `terminationGracePeriodSeconds` live in two files nothing else links.
 
 ### 3.4 Egress and scrubbing integration
 
-- [ ] `3.4.1` Create `internal/emitter/payload.go` with wire types matching ARCH §4 **exactly**.
-- [ ] `3.4.2` Run **all** log lines and event messages through `internal/scrubber` before
+- [x] `3.4.1` Create `internal/emitter/payload.go` with wire types matching ARCH §4 **exactly**.
+      Flat, no invented wrappers, field names transcribed from `agent/models.py`. `omitempty`
+      appears **nowhere**: every nullable field is emitted as an explicit `null`, because
+      `extra: "forbid"` plus per-field defaults makes "omitted" and "null" different inputs, and
+      ARCH §4.1 requires null - a Go guard-chain miss must not read as an absent key.
+      `ResourceLimits` fields are `*string`/`*int64` for the same reason: a bare `string` cannot
+      distinguish "undeclared" from "declared empty" without either `omitempty` (collapses both)
+      or `""` (rejected by `min_length: 1`).
+      Two fields needed new sources, captured at classification time where the pod is in hand:
+      `resource_limits` (from `pod.Spec.Containers[i].Resources`, via the new
+      `k8s.ResourcesFor`, kept as **strings** so a limit is forwarded verbatim rather than
+      round-tripped through a Go unit conversion) and `previous_reason` (from
+      `LastTerminationState`, because the kubelet overwrites `State` on restart - reading `State`
+      would report the CrashLoopBackOff itself, which is the condition and not the cause).
+      `TestNullableFieldsAreExplicitNull` pins this against the marshalled bytes.
+      **`incident_id` is a real constraint that the first implementation violated.**
+      `agent/models.py` requires `^inc_[0-9A-HJKMNP-TV-Z]{20,32}$` - a Crockford base32 ULID body.
+      The first version emitted lowercase hex with an underscore, passed every Go test, and would
+      have been a `422` in production. `internal/emitter/ulid.go` now encodes 128 bits as 26
+      Crockford symbols, and the value is **deterministic in the dedup key and the detection
+      instant** rather than random, because `Emit` retries on `429` and a retry that mints a new ID
+      presents one failure to the agent as two incidents. `Validate` uses the full pattern, not a
+      prefix check - the prefix-only version accepted the hex.
+- [x] `3.4.2` Run **all** log lines and event messages through `internal/scrubber` before
       serialization. There is no code path that serializes raw telemetry.
-- [ ] `3.4.3` Populate `redaction_report` from the scrubber's accounting; never emit masked
+      Enforced structurally rather than by discipline. The emitter's only public entry point takes
+      a `*worker.Incident`, whose telemetry fields are documented as scrubbed-before-arrival, and
+      **no constructor accepts raw text**. `TestScrubbedLogsAreTheOnlySource` walks the payload's
+      JSON tags by reflection and fails on a `logs`/`events`/`raw_logs` field - a field called
+      `ScrubbedLogs` serialising as `raw_logs` is exactly the defect, and a name-based check would
+      miss it.
+      The event path needed a real decision. `cmd/sentinel`'s `eventConverter` takes the *scrubbed
+      incident*, not `[]corev1.Event`, because the worker deliberately keeps only scrubbed
+      messages; threading the raw objects through would put a Kubernetes struct with nine
+      unscrubbed string fields one careless `json.Marshal` from the wire. The cost is that
+      `reason`/`count`/timestamps are gone by that point and are reconstructed from the incident
+      identity, with `involved_object` as `pod/<name>` - the one object these events could have
+      involved, since the join was on the pod UID.
+- [x] `3.4.3` Populate `redaction_report` from the scrubber's accounting; never emit masked
       values.
-- [ ] `3.4.4` Create `internal/emitter/emitter.go`: `POST /v1/incidents` via
+      `RedactionReport` has exactly two fields - `total_redactions` and `rules_triggered` - so the
+      reporting channel has **no slot** that could hold a masked value. That is the structural form
+      of ARCH §6 M4, and it is checked structurally in Python
+      (`test_redaction_report_carries_counts_only` asserts the field *set*, which a
+      scan-for-secrets test would pass just as happily against a model that gained a third field).
+      `[]scrubber.RuleID` is **copied and stringified**, not aliased, so a caller mutating the
+      returned slice cannot corrupt the scrubber's manifest-derived state.
+- [x] `3.4.4` Create `internal/emitter/emitter.go`: `POST /v1/incidents` via
       `http.Client` with `context.WithTimeout`; classify `429` as retryable-with-jitter,
       `422` as fatal, `500` as Tier-2 escalation.
-- [ ] `3.4.5` Assert no raw secret can reach the HTTP request body — a test scans the
+      A strict 5s `http.Client.Timeout` set on the client rather than only on the caller's
+      context, so the bound survives a `context.Background()` caller. Each attempt derives its own
+      `context.WithTimeout` from the caller's, so the pool's per-incident cancellation still
+      propagates and the retry loop cannot outlive its worker.
+      The retry policy is deliberately asymmetric, and the asymmetry is the point:
+      **`429` is retried** (the agent's load shedding) with **full jitter**, not fixed backoff -
+      three pool workers told "busy" at the same instant would re-collide on a deterministic
+      delay. `Retry-After` is read from the **JSON body** (`retry_after_ms`), not a header, because
+      that is where the agent puts it. **`422` is fatal with no backoff**: the contract failure is
+      deterministic, and retrying identical bytes is how a validation bug becomes a
+      self-inflicted DoS against the agent's job budget. **`5xx` escalates rather than retrying**:
+      the Sentinel would be pinning a worker on an outage it cannot bound. Other `4xx` escalate
+      too - a routing or auth error will not fix itself.
+      `Client` implements `worker.Sink` with a compile-time assertion, so the pool's existing
+      error accounting applies unchanged. The backoff sleep is a timer `select`-ed on
+      `ctx.Done()`, never a bare `time.Sleep` - a bare sleep keeps a worker alive past its
+      cancellation, which is the leak `3.5.4` tests for.
+- [x] `3.4.5` Assert no raw secret can reach the HTTP request body — a test scans the
       marshalled body against the fixture corpus.
-- [ ] `3.4.6` Round-trip test: emitted JSON validates against `agent/models.py` via the
+      Scanned against `tests/fixtures/incident_corpus.json` - the ratified reference - not a
+      hand-picked secret, so the guarantee is tied to the same fixture that defines what a secret
+      is. `TestIncidentPayloadContractOnTheWholeCorpus` runs it over **every** corpus case rather
+      than one chosen well.
+      **`TestLeakDetectorCanActuallyFail` is the negative control, and it is not optional.** The
+      same scan, over the same body, with the scrubber bypassed, must report a leak - otherwise a
+      scanner with a bug that never matches is indistinguishable from a clean pipeline. This is the
+      fourth time a guard in this repository has needed that control.
+      The other half: the body must be scrubbed, **not empty**. A scrubber that satisfies the leak
+      test by dropping every line would pass while destroying the evidence the agent needs, so the
+      test also asserts the diagnostic content survived.
+- [x] `3.4.6` Round-trip test: emitted JSON validates against `agent/models.py` via the
       canonical fixture.
+      **Split across the two languages rather than shelled out.** A Go test invoking CPython makes
+      the Go gate depend on a virtualenv; a Python test importing the Go package makes the Python
+      gate depend on a Go toolchain. So: `TestEmittedFixtureIsUpToDate` writes
+      `tests/fixtures/emitted_incident.json` from real `Build` output and **fails on drift**, and
+      `agent/tests/test_emitter_contract.py` validates the committed file against
+      `IncidentPayload`. A change either side has not adopted fails a gate; a change to both is
+      fine, because both gates run.
+      This is what caught the `incident_id` defect in 3.4.1 - the file failed Pydantic validation on
+      the first run, naming the field. That is the argument for putting it in the gate rather than
+      in a checklist.
 
 ### 3.5 Concurrency hygiene
 
-- [ ] `3.5.1` Fixed-size worker pool (default 4) consuming a **buffered** channel
-      (default 256); a full buffer applies backpressure.
-- [ ] `3.5.2` All channel sends are `select`ed against `ctx.Done()` — never an unconditional
+- [x] `3.5.1` Fixed-size worker pool consuming a **buffered** channel.
+      **Three ratified deviations from the letter of the item, stated rather than buried:**
+      - **Size 3, not 4.** Fixed and non-negotiable - `New` falls back to `DefaultPoolSize` when
+        `size <= 0` rather than starting zero workers, which would drain nothing while looking
+        healthy.
+      - **Capacity 100, not 256.** Sized against the 30s informer resync: 256 slots is 7.7s of
+        backlog at the resync rate, and a buffer that deep converts a brief stall into a minute of
+        stale incidents.
+      - **A full buffer DROPS, it does not apply backpressure.** This is the substantive one.
+        Informer callbacks run on a shared single-goroutine work queue, so a blocking send in
+        `emit` stalls event delivery for *every* pod in the cluster. Backpressure at this point is
+        not a graceful degradation; it is a cluster-wide monitoring outage triggered by one
+        misbehaving workload. Losing one incident is recoverable and is counted in
+        `WatcherStats.Dropped` plus a `Warn` line; stalling the informer is neither recoverable nor
+        observable. This is the opposite of 3.5.2's rule and the two are reconciled deliberately:
+        the rule forbids *unconditional blocking* sends, and a `select` with a `default` is the
+        strongest form of that.
+- [x] `3.5.2` All channel sends are `select`ed against `ctx.Done()` — never an unconditional
       blocking send.
-- [ ] `3.5.3` Measure `detection_latency_ms` with a monotonic clock (`time.Since` on a
+      Two sends and two receives exist in production code, and each is bounded differently for a
+      stated reason:
+      - `PodWatcher.emit` - `select` with a **`default`** arm, so it never blocks and never waits on
+        `ctx`. See 3.5.1 for why backpressure here would be a cluster-wide monitoring outage. The
+        drop is counted and logged; a silent drop would be the one unacceptable version.
+      - `worker.loop`'s receive - `select` on `ctx.Done()` against the channel, so a worker blocked
+        on an empty queue still exits on cancellation. This is the case 3.5.2 is actually about, and
+        it is what `TestCancellationIsHonouredBeforeReadingTheChannel` proves: an unconditional
+        receive from a channel nobody writes to hangs forever, and that test is structured so it
+        would hang rather than fail, so a regression is unmissable.
+      The emitter's retry backoff is a timer `select`-ed on `ctx.Done()`, never a bare
+      `time.Sleep` - a bare sleep keeps a pool worker alive past its cancellation, which is a
+      goroutine leak in the same sense.
+- [x] `3.5.3` Measure `detection_latency_ms` with a monotonic clock (`time.Since` on a
       monotonic base); no wall-clock timestamps for duration.
-- [ ] `3.5.4` `TestNoGoroutineLeak` under `-race`: goroutine count returns to baseline after
+      `time.Time.Sub`, which reads the monotonic reading Go stores in a `Time` that came from
+      `time.Now`. **What this can and cannot prove is worth stating:** Go does not expose the
+      monotonic reading, so a test cannot construct two values whose monotonic and wall-clock
+      differences disagree. The guarantee therefore rests on the code reading `Sub`, and
+      `TestDetectionLatencyTracksTheMonotonicInterval` catches a regression that swaps it for a
+      wall-clock computation in different units. A stronger test would need a clock-injection seam
+      that can fake a jump, which is a larger change than the property warrants.
+      **The cap is a decision, not a limit.** An over-budget latency cannot be transmitted - the
+      contract says `le=2000` - and refusing to emit would convert a slow cluster into silence,
+      which is exactly when the RCA matters most. So the value is clamped to 2000, `Clamped()`
+      reports it so the caller can count over-budget detections, and
+      `TestDetectionLatencyIsClampedAtTheContractCap` asserts the clamp fires. The cap is a
+      reporting ceiling, not a licence to claim the SLO was met.
+      A backwards clock (an NTP step does this routinely) floors at 0 rather than emitting a
+      negative that would fail the agent's `ge=0` - `TestDetectionLatencyNeverGoesNegative`.
+- [x] `3.5.4` `TestNoGoroutineLeak` under `-race`: goroutine count returns to baseline after
       cancellation.
+      `internal/worker/leak_test.go`, 25 full watcher/pool/cancel/drain cycles. **Counted, not
+      tracked by identity** - counting is the property that holds for code the test does not know
+      about. A goroutine leaked by a future change in `emitter.go` is invisible to a list of
+      expected goroutines and obvious to a count. The baseline is taken after `runtime.GC()` plus a
+      scheduling point, because asserting against a stale snapshot produces a test that fails on a
+      busy machine and passes on an idle one.
+      Three companions, each a case that reads like a pass and is not:
+      **`TestPoolDrainDoesNotLoseInFlightWork`** - a pool that dropped its work on cancellation
+      would pass every goroutine assertion, because nothing would be left holding anything. The
+      telemetry fetcher is delayed so the cancellation reliably lands mid-flight; a cancel arriving
+      before any work is read would pass even if the drain were broken.
+      **`TestCancellationIsHonouredBeforeReadingTheChannel`** - an unconditional receive from a
+      channel nobody writes to hangs, so this is the negative control for the `select`.
+      **`TestSinkFailureDoesNotStopTheDrain`** - the failure path, since a worker treating a sink
+      error as fatal is how a `WaitGroup` goes unbalanced.
+      Also `agent/tests/test_no_goroutine_leak.py` for the Python side, so the sandbox's
+      disposable-process handling is held to the same standard.
 
 ### 3.6 Deployment manifests
 
-- [ ] `3.6.1` Create `deploy/namespace.yaml`, `deploy/kustomization.yaml`.
-- [ ] `3.6.2` Create `deploy/rbac.yaml` with a read-only `Role`: `get`/`list`/`watch` on `pods`,
+- [x] `3.6.1` Create `deploy/namespace.yaml`, `deploy/kustomization.yaml`.
+      Its own namespace, not `default`: a NetworkPolicy in `default` would either break unrelated
+      services or be quietly widened to make them work, and a widened policy is no longer the one
+      tested. `pod-security.kubernetes.io/enforce: restricted` (not `privileged`) so the namespace
+      **refuses** a non-compliant pod at admission - the tests are the guarantee, this is the
+      enforcement. Resource **order** in the kustomization is load-bearing and not alphabetical:
+      Kustomize preserves list order, and a namespaced Role applied before its `Namespace` exists
+      fails with "namespace not found".
+- [x] `3.6.2` Create `deploy/rbac.yaml` with a read-only `Role`: `get`/`list`/`watch` on `pods`,
       `events`, `deployments`, `replicasets`. **No** `create`/`update`/`patch`/`delete`.
-- [ ] `3.6.3` Create `deploy/sentinel.yaml` with the full ARCH §8 hardening block
+      Two independent layers, and they are deliberately not redundant. **The Role** is the control:
+      the apiserver rejects a write regardless of what the process intends, which holds even if a
+      bug reaches a client-go mutating method. **The test** is the guarantee the control is still
+      there: a Role that is correct but unasserted rots silently. Asserted as membership in
+      `{get,list,watch}`, not absence from a deny-list, so a verb nobody anticipated fails.
+      `pods/log` is granted explicitly - a rule on `pods` does not cover the subresource, and
+      omitting it would make every incident arrive with no logs while looking entirely plausible.
+      `TestSentinelRoleGrantsWhatTheWatcherReads` is the converse check: an allow-list for writes
+      would pass the deny-check while granting nothing, and the failure would be a Sentinel that
+      watches nothing and reports nothing - silent.
+      No `ClusterRole`, no `ClusterRoleBinding`: a namespaced Role bound cluster-wide would pass
+      every verb check while granting read access to every namespace.
+- [x] `3.6.3` Create `deploy/sentinel.yaml` with the full ARCH §8 hardening block
       (`runAsUser/Group: 10001`, `readOnlyRootFilesystem: true`, `cap_drop: ["ALL"]`,
       `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, `emptyDir` at
       `/tmp` only).
-- [ ] `3.6.4` Write a test that **parses** the deploy YAML and asserts every hardening field
+      `replicas: 1` **on purpose**: two would double-emit every incident, because the dedup cache is
+      per-process, so each would admit the same failure and the agent would triage it twice - two
+      remediation PRs for one outage. Leader election would fix that at the cost of a dependency
+      and a failover window; at one replica it is not needed.
+      `livenessProbe` is `exec: [/bin/sentinel, -version]` rather than an HTTP probe: the Sentinel
+      has no HTTP surface, and the usual alternative - probing the apiserver - would kill the pod
+      during an apiserver blip, which is precisely when its job matters. **No readiness probe**:
+      it is not behind a Service and has no state to declare ready, so one would only be a way to
+      remove a working pod from a Service it is not part of.
+      Egress is restricted to the apiserver, the agent, and DNS - "no other reason to send a
+      packet" is enforceable in a NetworkPolicy in a way it is not in code. Ingress is `[]`, so the
+      default deny applies.
+- [x] `3.6.4` Write a test that **parses** the deploy YAML and asserts every hardening field
       and the absence of any mutating RBAC verb (AC-4, and PRD §3.2).
-- [ ] `3.6.5` Assert `agent/` has no ServiceAccount token automount.
+      **It parses.** A grep for `readOnlyRootFilesystem: true` is satisfied by a comment, a value
+      in an unrelated document, and a string in a ConfigMap. Two implementations, and the
+      duplication is deliberate: `internal/deploy/*_test.go` (structural, with `gopkg.in/yaml.v3`)
+      and `agent/tests/test_deploy_manifests.py` (PyYAML). They run in **different CI jobs on
+      different toolchains**, and a manifest hardened in one and unguarded in the other is still
+      unguarded. The Go side exists because ROADMAP's terminal command is `go test ...`; a check
+      that only ran under pytest would not be executed by the command the roadmap names.
+      yaml.v3 was already an **indirect** dependency of `k8s.io/apimachinery`, so promoting it to
+      direct costs no new module and no new download. The guard is
+      `TestYamlIsOnlyImportedFromTests` - "no non-test file imports it" - **not** "it is not
+      linked", because the first version of that claim was false: apimachinery had already pulled
+      it into the binary.
+      Untyped `map[string]any` decoding, not typed structs: a struct would validate the manifest
+      against a schema *this file defines*, and a misspelled field would parse cleanly into a
+      struct with the field absent. The generic form sees what the YAML says, typos included.
+      `TestNoInitOrEphemeralContainers` closes a gap the first draft had: it checked only
+      `spec.containers`, which a privileged `initContainers` entry sails past - running as root
+      with full capabilities, then handing the main container a writable root.
+      **Five negative controls**, each breaking something deliberately: an injected `delete` verb,
+      a removed hardening field, a string-typed parent for the deep-get walker, a stubbed parse,
+      and - the one worth singling out - `TestControlNilSafetyCatchesADereference`, because a
+      helper that swallowed every panic would make every nil-safety assertion pass
+      unconditionally.
+- [x] `3.6.5` Assert `agent/` has no ServiceAccount token automount.
+      Asserted in **both** languages, and the assertion is stronger than the roadmap's wording:
+      `automountServiceAccountToken: false` **and** the absence of any `serviceAccountName` at all.
+      The agent makes no Kubernetes API calls, so a token would be a credential it has no use for;
+      giving it none means it cannot write to the cluster even if a future bug tried.
+      The Sentinel *does* get one - it is the watcher - bound to `get`/`list`/`watch` by 3.6.2.
 - [ ] `3.6.6` Document the offline-import path: `k3s ctr images import` into the internal
       containerd namespace (AGENTS §2).
+      **Deliberately unticked.** The content is written and the reasoning is settled, but it cannot
+      be verified here: this host has no k3s, no containerd, and no images built, and AGENTS §5.4
+      requires a gate be reported as a **blocked dependency** rather than checked on an
+      unverified assumption. Draft is in `docs/offline-install.md`; the ROADMAP box stays open until
+      the command is run against a real k3s node and its output pasted here.
+      Note the Kustomization deliberately omits an `images:` block - the release pipeline rewrites
+      the tag in the **committed** file, so the manifest the hardening tests parse is the manifest
+      that ships. A field that only exists after rendering is a field the test cannot see.
 
 ### 3.7 Milestone 3 quality gate
 
-- [ ] `3.7.1` `go vet ./...` exits `0`.
-- [ ] `3.7.2` `test -z "$(gofmt -l .)"` exits `0`.
+- [x] `3.7.1` `go vet ./...` exits `0`.
+      Run locally, exit `0`. Also run as `go vet -tags race ./...` (exit `0`), which typechecks
+      the `-race` build variant that G1 does not see — the shape where a `!race`-tagged helper is
+      undefined under `-race` and G3 fails to compile while G1 passes.
+
+- [x] `3.7.2` `test -z "$(gofmt -l .)"` exits `0`.
+      Run locally via `gofmt -l .` (empty). Note `gofmt -l` prints the same file it would rewrite,
+      so a non-empty result was re-run with `-w` and re-checked rather than assumed transient.
+
 - [ ] `3.7.3` `go test -race -timeout 30s ./...` exits `0`, including the nil-pointer and
       goroutine-leak tests.
-- [ ] `3.7.4` `mypy --strict agent/` still exits `0` (contract unchanged).
+      **BLOCKED, not waived.** The Go race detector has no ThreadSanitizer for
+      `windows/arm64`, which is the development host; `go test -race` cannot execute here at all.
+      AGENTS §5.4 and ARCH AD-10 make `ubuntu-latest` CI the sole authority for this gate, and it
+      has not yet run on the code this milestone produced. **Left unticked on purpose.**
+      What *was* run locally, and what it does and does not cover:
+      - `go test -timeout 30s ./...` (no `-race`): exit `0`, all six packages. This proves the
+        assertions hold; it does not prove they hold without a data race.
+      - The terminal validation command from below, without `-race`: exit `0`.
+      - The `sentinel.test.exe` and `scrubber.test.exe` binaries were intermittently blocked by
+        the host's Windows Application Control rule (content-hash based, defeated by rotating
+        `-ldflags -buildid=`). `scripts/gotest.ps1` works around it; `sentinelTestPadding` is
+        declared in `_test.go` files only, so no production package carries a variable that exists
+        only to be hashed. This is a dev-host artefact and has no bearing on CI.
+      **Closing this box requires a green `go-gates` job on the commit that closes Milestone 3.**
+
+- [x] `3.7.4` `mypy --strict agent/` still exits `0` (contract unchanged).
+      `Success: no issues found in 23 source files`. Also `black --check` and `flake8` clean, and
+      `pytest agent/tests/ -v` at **359 passed, 15 warnings**. The contract *did* change in one
+      place and the change is in the producer, not the schema: the Go emitter's `incident_id` is
+      now a Crockford base32 ULID, which `agent/models.py` already required and the Go side did
+      not previously satisfy.
 
 ### ▶ TERMINAL VALIDATION TEST — Milestone 3
 
@@ -834,6 +1101,42 @@ new module requirements.
 > **Maps to:** PRD AC-1, AC-4, ARCH §7/§8, invariants I-A1, I-A2, I-A4.
 >
 > **Done when:** all boxes in Milestone 3 are `[x]`, §3.7 is green, and this command exits `0`.
+>
+> ### ▶ Status: NOT COMPLETE - two boxes open
+>
+> **32 of 34 boxes are `[x]`.** The two that are not are open for reasons that are not
+> "still to do" but "cannot be honestly closed from this host", and AGENTS §5.4 forbids closing
+> them on an unverified assumption.
+>
+> - **`3.7.3`** (`go test -race`) is **blocked**: no ThreadSanitizer for `windows/arm64`, so the
+>   gate cannot execute locally at all. The non-race equivalent passes. This box requires a green
+>   `go-gates` job on the closing commit, and the milestone is not closed until it exists.
+> - **`3.6.6`** (offline image import) is **blocked**: no k3s, no containerd, no built image on
+>   this host. The document is written (`docs/offline-install.md`); the commands have not been run.
+>
+> ### Evidence for what *was* run locally
+>
+> | Gate | Command | Result |
+> |---|---|---|
+> | G1 | `go vet ./...` | exit `0` |
+> | G1b | `go vet -tags race ./...` | exit `0` |
+> | G2 | `gofmt -l .` | empty |
+> | G3 | `go test -timeout 30s ./...` (no `-race`) | exit `0`, 6 packages |
+> | G4 | `go build -o bin/sentinel ./cmd/sentinel` | exit `0`, 58.7 MB |
+> | G5 | `black --check agent/` | 23 files unchanged |
+> | G6 | `flake8 agent/` | exit `0` |
+> | G7 | `mypy --strict agent/` | no issues, 23 files |
+> | G8 | `pytest agent/tests/ -v` | **359 passed**, 15 warnings |
+> | T | this terminal command, minus `-race` | exit `0` |
+>
+> A host artefact worth recording, because it will recur on this machine and looks like
+> flakiness: the Windows Application Control rule blocks freshly linked test binaries **by content
+> hash**. Diagnosed rather than guessed - the 55.9 MB unstripped binary ran while the 39.1 MB
+> `-s -w` one was blocked, and rotating `-ldflags -buildid=` changed the outcome on otherwise
+> identical builds, which rules out path and size. `scripts/gotest.ps1` works around it by
+> rotating the build id; the `sentinelTestPadding` symbol it also sets lives in `_test.go` files
+> only, so **no production package carries a variable that exists only to be hashed**. It has no
+> bearing on CI.
 
 ---
 

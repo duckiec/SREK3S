@@ -1,0 +1,32 @@
+# SREK3S namespace.
+#
+# Its own namespace, and not `default`. Two reasons, both about blast radius:
+#
+#   - A NetworkPolicy in `default` inherits the base policy set for every other
+#     workload in the cluster. Putting the Sentinel's egress restrictions there
+#     would either break unrelated services or be quietly widened to make them
+#     work - and a widened policy is a policy that is no longer the one tested.
+#   - RBAC in `default` is easy to inherit. In its own namespace, a RoleBinding
+#     that names the wrong ServiceAccount is namespaced to this namespace and the
+#     mistake is visible in review.
+#
+# `pod-security.kubernetes.io/enforce: restricted` is set to the *enforced* level,
+# not `privileged`, so the namespace refuses a pod that violates the baseline at
+# admission rather than admitting it and leaving the check to this repository's
+# tests. The tests are the guarantee; this is the enforcement.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-system
+    app.kubernetes.io/part-of: srek3s
+    # Pod Security Admission, `restricted`. The only namespace in the cluster that
+    # opts in; the rest are untouched.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    # Warn and audit at the same level, so a violation is recorded even where a
+    # future change has to lower `enforce` for a legitimate reason - there would be
+    # a record of it happening.
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

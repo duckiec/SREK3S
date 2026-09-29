@@ -1,0 +1,27 @@
+# SREK3S deployment set.
+#
+# The resource *order* matters and is not alphabetical. Kustomize does not order
+# resources, and `kubectl apply -k` sends them in the order the API receives them,
+# so a namespace that does not exist yet makes every namespaced resource in the set
+# fail with "namespace not found". namespace.yaml first, then rbac (the Role and
+# ServiceAccount the Deployment references), then the workloads.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: srek3s-system
+
+commonLabels:
+  app.kubernetes.io/part-of: srek3s
+
+resources:
+  # Order: namespace, then credentials, then workloads. See the note above.
+  - namespace.yaml
+  - rbac.yaml
+  - sentinel.yaml
+  - agent.yaml
+
+# No `images:` block on purpose. The image tags in the manifests are the
+# placeholders `registry.internal/...:0.1.0`, and a kustomize `images:` override
+# would hide the tag that is actually deployed from the manifest that gets parsed
+# by the hardening tests. The release pipeline rewrites the tag in the committed
+# file, so what is tested is what ships.

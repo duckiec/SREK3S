@@ -372,62 +372,69 @@ func TestDispatchFailureIsCountedNotPanicked(t *testing.T) {
 	}
 }
 
-// TestUnquotedAWSSecretKeyIsNotScrubbed documents a real gap in the frozen M1
-// manifest. It is deliberately a test that asserts the *current*, insufficient
-// behaviour, so the gap is tracked rather than forgotten.
+// TestUnquotedAWSSecretKeyIsScrubbed is the regression for a P0 credential leak.
 //
-// What was found: an unquoted AWS secret key survives scrubbing.
+// An unquoted AWS secret access key used to pass the whole 11-rule pipeline
+// unmasked: rule 3 is anchored on quotes around the 40-character value, and rule
+// 7's key alternation contained `secret[_-]?key`, which does not occur inside
+// `secret_access_key`, so neither rule could match it. An env dump or a
+// `key=value` log line carries exactly that shape.
 //
-//	aws_secret_access_key = "wJalr...KEY"   -> scrubbed (rule 3 matches, and
-//	                                           rule 7 catches the key name)
-//	aws_secret_access_key = wJalr...KEY     -> NOT scrubbed
-//
-// Two rules miss it, for two different reasons:
-//
-//   - rule 3 (`aws_secret_access_key`) is anchored on quotes around the 40-char
-//     value, because that is the shape AWS actually emits;
-//   - rule 7 (`generic_secret_kv`) cannot cover it either, because its key
-//     alternation contains `secret[_-]?key` and this name is
-//     `secret_access_key` - no alternative matches, so the `[:=]` never lines up.
-//
-// ARCH §6 M5 prefers over-masking to under-masking, so this is a defect in the
-// mask, not a design choice. It is NOT fixed here on purpose: the manifest is
-// ratified (ARCH §6.1), CI-verified against a corpus, and mirrored rule-for-rule
-// by the Python re-scan (agent/rescan.py). Changing a rule here would desynchronise
-// the two implementations and invalidate the M1 corpus. It needs a manifest
-// amendment, a corpus case, and a matching change in agent/rescan.py.
-func TestUnquotedAWSSecretKeyIsNotScrubbed(t *testing.T) {
-	telemetry := &fakeTelemetry{
-		logs: "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+// Fixed by ARCH §6.6, which gave rule 7 an optional access segment. This test
+// previously documented the gap instead of asserting the fix, and inverted its own
+// assertion while doing so - it errored precisely because the secret survived,
+// which made a correct-behaviour run look like flakiness.
+func TestUnquotedAWSSecretKeyIsScrubbed(t *testing.T) {
+	// Unquoted forms are rule 7's job, and rule 7 is group-preserving: it keeps
+	// the key name and the separator and replaces only the value.
+	unquoted := []string{
+		"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		"aws-secret-access-key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 	}
+	for _, line := range unquoted {
+		telemetry := &fakeTelemetry{logs: line}
+		sink := &recordingSink{}
+		runPool([]*k8s.IncidentRecord{record("p", "c", k8s.FailureOOMKilled)}, telemetry, sink, 1)
+
+		dispatched := sink.all()
+		if len(dispatched) != 1 {
+			t.Fatalf("no dispatch for %q", line)
+		}
+		got := strings.Join(dispatched[0].ScrubbedLogs, "\n")
+		if strings.Contains(got, "wJalrXUtnFEMI") {
+			t.Errorf("unquoted AWS secret key leaked after ARCH 6.6: %s", got)
+		}
+		if !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("no redaction marker for %q: %s", line, got)
+		}
+		// The key name must survive. The value is the secret; the name is the
+		// diagnostic. A mask that destroyed both would satisfy the two assertions
+		// above while telling an operator nothing about what leaked.
+		//
+		// Compared case-insensitively, because the rule is `(?i)` and an uppercase
+		// key is masked just as thoroughly. An earlier version compared
+		// case-sensitively and failed on AWS_SECRET_ACCESS_KEY.
+		lower := strings.ToLower(got)
+		if !strings.Contains(lower, "secret_access_key") &&
+			!strings.Contains(lower, "secret-access-key") {
+			t.Errorf("the key name was destroyed along with the value: %s", got)
+		}
+	}
+
+	// The quoted form is rule 3's job, and rule 3 replaces the whole matched span,
+	// so the key name is intentionally *not* preserved. Asserted separately so the
+	// distinction is recorded rather than papered over - the earlier version
+	// asserted key-name survival for this case too and failed on correct
+	// behaviour, which is how a case-sensitive bug here went unnoticed.
+	quoted := `aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"`
+	telemetry := &fakeTelemetry{logs: quoted}
 	sink := &recordingSink{}
 	runPool([]*k8s.IncidentRecord{record("p", "c", k8s.FailureOOMKilled)}, telemetry, sink, 1)
-
-	dispatched := sink.all()
-	if len(dispatched) != 1 {
-		t.Fatalf("no dispatch")
-	}
-	got := strings.Join(dispatched[0].ScrubbedLogs, "\n")
-
+	got := strings.Join(sink.all()[0].ScrubbedLogs, "\n")
 	if strings.Contains(got, "wJalrXUtnFEMI") {
-		// The gap is present, which is what this test exists to record.
-		//
-		// Deliberately *not* an error. Failing here would block CI on a *good*
-		// change - an ARCH §6 manifest amendment that closes the gap - which is
-		// exactly backwards. An earlier version of this test had the assertion
-		// inverted and errored precisely because the secret survived, so the suite
-		// went red on correct behaviour and I misread that as flakiness.
-		t.Log(
-			"KNOWN GAP (expected): an unquoted AWS secret key is not masked. " +
-				"Rules 3 and 7 both miss it. Closing it needs an ARCH 6 manifest " +
-				"amendment, a corpus case, and a matching agent/rescan.py change.",
-		)
-		return
+		t.Errorf("the quoted form leaked: %s", got)
 	}
-	t.Log(
-		"the unquoted-AWS-secret gap appears CLOSED. The Go manifest, its corpus and " +
-			"agent/rescan.py should all have been amended - update this test's docstring.",
-	)
 }
 
 // TestSplitLines handles the blob-to-slice boundary correctly.
