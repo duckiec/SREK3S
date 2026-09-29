@@ -309,22 +309,85 @@ jobs:
           kubectl apply -f deploy/chaos/namespace.yaml
           kubectl get namespace "$CHAOS_NAMESPACE" --show-labels
 
-      - name: Assert Pod Security Admission is enforcing restricted
+      # ---------------------------------------------------------------
+      # 6. Assert Pod Security Admission is enforcing restricted.
+      #
+      # One step per label, and this is not tidiness. The previous version read
+      # `.metadata.labels` through jsonpath and matched it with a shell `case`
+      # glob; it failed, and with CI logs returning 403 there was no way to see
+      # whether the label was absent or merely formatted differently from what the
+      # glob expected. One step per label makes the failing step's *name* the
+      # diagnosis, which is the finest signal a reviewer has without logs.
+      #
+      # The previous assertion also could not distinguish a `kubectl get` that
+      # returned nothing from a `kubectl get` that returned something unexpected,
+      # because both produced an empty match set. The dump step below exists to
+      # separate those two cases in the log on the next run.
+      # ---------------------------------------------------------------
+      - name: Dump Namespace Labels
+        timeout-minutes: 5
+        # No `set -e`: this is a diagnostic, and a diagnostic that can fail the
+        # job is not a diagnostic. Its output is what makes the next failure
+        # readable.
+        run: |
+          set -uo pipefail
+          echo "=== namespace labels as the apiserver serves them ==="
+          kubectl get ns "$CHAOS_NAMESPACE" -o yaml | grep -A 8 'labels:' || {
+            echo "::warning::no labels block matched the grep; the namespace may "\
+                  "not exist under the name $CHAOS_NAMESPACE"
+            kubectl get ns -o wide || true
+          }
+
+      - name: "Assert PSA enforce=restricted"
+        timeout-minutes: 5
         run: |
           set -euo pipefail
-          labels=$(kubectl get namespace "$CHAOS_NAMESPACE" \
-            -o jsonpath='{.metadata.labels}')
-          for want in \
-            "pod-security.kubernetes.io/enforce=restricted" \
-            "pod-security.kubernetes.io/enforce-version=latest" \
-            "pod-security.kubernetes.io/audit=restricted" \
-            "pod-security.kubernetes.io/warn=restricted"; do
-            case "$labels" in
-              *"$want"*) echo "  ok: $want" ;;
-              *) echo "::error::namespace is missing $want; a chaos pod could be admitted privileged"
-                 exit 1 ;;
-            esac
-          done
+          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
+            | grep -q 'pod-security\.kubernetes\.io/enforce: restricted' || {
+            echo "::error::pod-security.kubernetes.io/enforce is not restricted; a chaos pod could be admitted privileged"
+            kubectl get ns "$CHAOS_NAMESPACE" -o yaml | grep -A 8 'labels:' || true
+            exit 1
+          }
+          echo "  ok: enforce=restricted"
+
+      - name: "Assert PSA enforce-version=latest"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # Deliberately a distinct key from `enforce`. grep is a substring match,
+          # so an assertion written as `enforce` alone would also be satisfied by
+          # `enforce-version` appearing with any value - the check would pass on a
+          # namespace that had not opted into a version at all. The backslash in the
+          # pattern anchors the `.` characters as literals.
+          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
+            | grep -q 'pod-security\.kubernetes\.io/enforce-version: latest' || {
+            echo "::error::pod-security.kubernetes.io/enforce-version is not latest; PSA would evaluate against an unpinned version"
+            kubectl get ns "$CHAOS_NAMESPACE" -o yaml | grep -A 8 'labels:' || true
+            exit 1
+          }
+          echo "  ok: enforce-version=latest"
+
+      - name: "Assert PSA audit=restricted"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
+            | grep -q 'pod-security\.kubernetes\.io/audit: restricted' || {
+            echo "::error::pod-security.kubernetes.io/audit is not restricted; a violation would leave no record"
+            exit 1
+          }
+          echo "  ok: audit=restricted"
+
+      - name: "Assert PSA warn=restricted"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
+            | grep -q 'pod-security\.kubernetes\.io/warn: restricted' || {
+            echo "::error::pod-security.kubernetes.io/warn is not restricted; a violation would pass unannounced"
+            exit 1
+          }
+          echo "  ok: warn=restricted"
 
       # ---------------------------------------------------------------
       # 7. The triage agent, with the sandbox on.

@@ -13,32 +13,56 @@ its domain will produce confident analysis of the wrong thing.
 
 ## Routing table
 
-| # | Domain | Owner | Why this one |
-|---|---|---|---|
-| 1 | `go test -race` data races; channel and mutex synchronisation; goroutine accounting | **Primary** | The failure *is* the synchronisation model. Delegating it would mean relaying a detector's report through an agent that did not run the detector, and the interesting part is which of two apparently-symmetric orders was actually wrong. |
-| 2 | Container bootstrap: k3s/kind install, kubeconfig permissions, apiserver readiness, image import into containerd, PSA admission, pod scheduling, cgroup limits and OOM victim selection, backoff timing | **Primary** for bootstrap (steps 8–10); `@chaos-engineer` for admission, scheduling and cgroup behaviour (steps 12–16) | The two halves need different things. "Will the installer start, and can this user read the kubeconfig" is an environment question with a short answer. "Will a 64Mi limit OOM-kill this container, and which process does the cgroup killer pick" is a fixture question, and the fixture is the agent's artefact. |
-| 3 | Sentinel event extraction, telemetry bounds, redaction, ULID generation, wire serialisation, `git apply --check`, payload invariants | `@e2e-verifier` | The question is what the bytes actually say. A verifier that can diff the captured payload against the corpus and against the expected wire form answers it directly; anyone else has to reconstruct the payload from a description of it. |
-| 4 | Runner CPU starvation, egress buffer drops, load-shedding, liveness/readiness timeouts, latency budgets | `@sre-profiler` | These are questions about time and capacity, and the agent's method is to generate load and measure. A saturated runner and an over-strict timeout are indistinguishable from a bug in either without that measurement. |
+Routing is by **assertion target** - what the failing step is checking - and never
+by step number. Step indices are fragile in a way that is easy to miss: the
+detonation workflow grew from 21 to 27 steps over four CI iterations, and an
+earlier version of this document cited "steps 12-16" for admission. By the time
+that citation was written, step 16 was a namespace-label assertion in *my* harness
+file, and routing it to the chaos engineer would have sent an agent to a file it
+does not own. Indices rot silently and read as authoritative while doing it.
 
-## Why bootstrap sits with the Primary and not `@chaos-engineer`
+If a step is added, moved, or reordered, this table needs no edit. That is the
+whole point of keying on the assertion rather than the position.
 
-This is the boundary that was not obvious and is now written down.
+| Assertion target | Owner | Why this one |
+|---|---|---|
+| **Harness**: workflow steps, cluster bootstrap, kubeconfig permissions, apiserver readiness, image acquisition and registration, timeouts, and assertions over harness-owned files such as `deploy/chaos/namespace.yaml` | **Primary** | The failing artefact is one the Primary wrote. Nothing here is a question about the system's behaviour; it is a question about whether the thing that exercises the system works. |
+| **Fixture behaviour**: whether a chaos manifest produces the failure it claims, cgroup limits and OOM victim selection, backoff timing, kubelet status transitions, pod scheduling | `@chaos-engineer` | The fixture is that agent's artefact, and the questions are about kernel and kubelet behaviour rather than about this repository's code. |
+| **Wire and payload**: Sentinel event extraction, telemetry bounds, redaction, ULID generation, serialisation, `git apply --check`, payload invariants, anything requiring a byte-level diff of a captured payload | `@e2e-verifier` | The question is what the bytes say. A verifier that can diff a payload against the corpus and against the expected wire form answers it directly; anyone else reconstructs the payload from a description of it. |
+| **Capacity and time**: runner CPU starvation, egress buffer drops, load shedding, liveness and readiness timeouts, latency budgets, saturation thresholds | `@sre-profiler` | These are questions about time and capacity, and that agent's method is to generate load and measure. A saturated runner and an over-strict timeout are indistinguishable without that measurement. |
+| **Concurrency**: `go test -race` data races, channel and mutex synchronisation, goroutine accounting, deadlock or livelock | **Primary** | The failure *is* the synchronisation model. Delegating it would mean relaying a detector's report through an agent that did not run the detector, and the interesting part is which of two apparently-symmetric orders was actually wrong. |
 
-A first draft of this table had no entry for cluster bootstrap at all, so
-`Install k3s` failing routed to the Primary **by absence rather than by design**.
-The first remote detonation run failed there, and the cause was a defect in a
-workflow step the Primary had written: `kubectl version` contacts the apiserver,
-it ran in the install step, and the cluster did not exist yet. The step reported
-failure for a reason that had nothing to do with installing k3s.
+### The dividing question
+
+> **If the failing step is part of the harness, it belongs to whoever wrote the
+> harness. If it is part of a fixture, it belongs to whoever wrote the fixture.**
+
+Applied to the four detonation failures so far, this routed all of them to the
+Primary, and each was a defect in a workflow step: a server-contacting `kubectl`
+ahead of the readiness wait, a root-only containerd socket used without `sudo`,
+an image pulled into the wrong containerd namespace, and a `docker` daemon
+dependency on a runner where it was not reliably present. None was a question
+about chaos fixtures - the fixtures were never reached, because every step after
+a failure is skipped.
+
+## Why the harness/fixture line is where it is
+
+An earlier draft of this table had no entry for cluster bootstrap, so a failing
+`Install k3s` routed to the Primary **by absence rather than by design**. The first
+remote detonation run failed there, and the cause was a defect in a workflow step
+the Primary had written: `kubectl version` contacts the apiserver, it ran in the
+install step, and the cluster did not exist yet. The step reported failure for a
+reason that had nothing to do with installing k3s.
 
 Had that been routed to `@chaos-engineer` under a broad "container problems" rule,
-the agent would have been asked to inspect a k3s install it has no stake in, and
-would have returned an analysis of the fixtures — which were never reached,
-because every step after the failure was skipped.
+the agent would have been asked to inspect a k3s install it has no stake in and
+would have returned an analysis of the fixtures - which were never reached,
+because every step after the failure is skipped.
 
-The rule this produces: **if the failing step is part of the harness, it belongs
-to whoever wrote the harness.** Steps 8–10 build the environment; steps 12–16 use
-it to exercise a fixture; the fixture is the subagent's, the harness is not.
+A second instance made the same point: a later step numbered 16 was a namespace
+label assertion over `deploy/chaos/namespace.yaml`, a file the Primary authored.
+A table keyed on "admission lives in steps 12-16" would have routed it to the
+chaos engineer; a table keyed on what the step asserts routes it correctly.
 
 ## When a failure spans domains
 
