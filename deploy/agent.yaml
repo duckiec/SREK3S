@@ -1,0 +1,182 @@
+# SREK3S Triage Agent - Kubernetes deployment.
+#
+# ROADMAP 2.7.3. AGENTS.md §2 and ARCHITECTURE.md §8 require a hardened runtime:
+# non-root UID/GID 10001, a read-only root filesystem, all Linux capabilities
+# dropped, and no privilege escalation. The image itself is hardened in
+# agent/Dockerfile; this manifest is where the *cluster* half of that is
+# enforced, because a Dockerfile cannot express seccomp or a read-only mount.
+#
+# The container build gate in CI asserts the effective uid is 10001 at runtime, so
+# a Dockerfile edit that dropped USER would fail the build rather than deploy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-agent
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-agent
+    app.kubernetes.io/part-of: srek3s
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srek3s-agent
+      annotations:
+        # Roll the pods when the agent's own source changes.
+        checksum/agent: "replaced-by-pipeline"
+    spec:
+      # AGENTS.md §2: UID/GID 10001, matching agent/Dockerfile.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # The agent holds no cluster credential and needs no Kubernetes API access.
+      # I-B5 is that no artefact can express a write verb; giving the agent no
+      # token at all is the stronger version of the same property - it cannot
+      # write to the cluster even if a future bug tried to.
+      automountServiceAccountToken: false
+
+      containers:
+        - name: agent
+          image: registry.internal/srek3s-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+
+          env:
+            # ARCH §8: logs to stdout because a read-only root filesystem forbids
+            # a log file. The runtime collects them.
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            # A read-only root filesystem cannot write __pycache__, and without
+            # this the interpreter fails at import time rather than degrading.
+            - name: TMPDIR
+              value: /tmp
+            # ROADMAP 2.2.5: the active-job budget. Sized for the deterministic
+            # Milestone 2 analysis, which is CPU-trivial, so this bounds blast
+            # radius rather than CPU saturation. Deliberately small: a large value
+            # would let one noisy namespace consume the agent while the budget was
+            # nominally "not reached".
+            - name: SREK3S_MAX_ACTIVE_JOBS
+              value: "4"
+            - name: SREK3S_LOG_LEVEL
+              value: INFO
+
+          # ARCH §8: read-only root, no privilege escalation, every capability
+          # dropped. The agent needs none of them, so all are dropped rather than
+          # selected - an allow-list here would be a list to forget an entry on.
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          # The only writable path. /tmp is required because a read-only root
+          # filesystem leaves the interpreter nowhere to put a temporary file,
+          # and the sandbox and the I-B2 git check both create one.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              # No memory limit above the request: this agent must not be OOMKilled
+              # while triaging someone else's OOMKill. A CPU limit is set, because
+              # an unbounded CPU spin is a real failure mode here.
+              cpu: "1"
+              ephemeral-storage: "128Mi"
+
+          # A deliberately generous probe budget. The triage path is
+          # sub-millisecond, so a probe that failed would mean the *process* is
+          # unhealthy, not busy - and probes are exempt from the job budget, so
+          # load never causes this to trip.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # Long enough for an in-flight triage to finish and be reaped. Shorter
+          # than this and a legitimate request would be killed mid-analysis.
+          terminationGracePeriodSeconds: 30
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+---
+# NetworkPolicy: the agent's only permitted egress is the Sentinel's model call.
+#
+# Egress is restricted rather than open because the agent is the exit path for
+# scrubbed incident data. ROADMAP 2.4.5 requires the investigation sandbox hold no
+# egress beyond the one authorised model call; this is where that is enforced at
+# the network layer rather than trusted to the code.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srek3s-agent-egress
+  namespace: srek3s-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-agent
+  policyTypes:
+    - Egress
+    - Ingress
+  ingress:
+    # Only the Sentinel may reach the triage endpoint.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: srek3s-sentinel
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # DNS, for the authorised model endpoint. Nothing else is reachable.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

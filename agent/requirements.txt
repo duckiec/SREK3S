@@ -9,6 +9,10 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 pydantic>=2.6.0
+# Structural YAML AST verification of generated patches (AGENTS.md §1
+# Dual-Layer Patch Verification). A parser is required to prove the
+# patched manifest still parses and that the change is semantic.
+pyyaml>=6.0.1
 httpx>=0.27.0
 
 # --- quality gates (AGENTS.md §4: G4, G5, G6) ---------------------------
@@ -18,3 +22,5 @@ pytest>=8.0.0
 black>=24.1.0
 flake8>=7.0.0
 mypy>=1.8.0
+# Stubs so `mypy --strict` can type the YAML AST verification (AGENTS.md 4, G6).
+types-PyYAML>=6.0.12

@@ -45,7 +45,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 __all__ = [
     "CONTEXT_LINES",
@@ -58,6 +58,7 @@ __all__ = [
     "git_apply_check",
     "memory_values",
     "verify_patch",
+    "verify_yaml_ast",
     "verify_patch_structure",
 ]
 #: Lines of context either side, matching git's default of 3.
@@ -423,15 +424,31 @@ GIT_APPLY_TIMEOUT_SECONDS: Final[float] = 10.0
 
 @dataclass(frozen=True)
 class VerificationResult:
-    """The combined I-B2 verdict, with the reasons it failed.
+    """The combined patch-verification verdict, with the reasons it failed.
 
-    A bare boolean would be enough to gate on, but the caller has to record *why*
-    a patch was discarded in its escalation audit trail, so the failures travel
-    with the result rather than being dropped or recomputed.
+    Three layers, all required (AGENTS.md §1 "Dual-Layer Patch Verification",
+    §3.3):
+
+    ``structural_ok``
+        The positional round-trip: the diff, applied to the manifest text, changes
+        exactly the resolved line and nothing else. Proves *position*.
+    ``yaml_ast_ok``
+        The patched and original manifests both parse, and differ at exactly one
+        semantic field - ``resources.limits.memory`` of the named container, found
+        structurally. Proves *meaning*, and is what catches a textually perfect
+        patch that is semantically wrong.
+    ``git_apply_ok``
+        ``git apply --check --whitespace=nowarn`` accepts the diff against those
+        same bytes. Proves *format*, via an independent implementation.
+
+    A bare boolean would be enough to gate on, but the caller records *why* a patch
+    was discarded in its escalation audit trail, so the failures travel with the
+    result rather than being dropped or recomputed.
     """
 
     ok: bool
     structural_ok: bool
+    yaml_ast_ok: bool
     git_apply_ok: bool
     failures: tuple[str, ...] = ()
 
@@ -533,6 +550,8 @@ def verify_patch(
     target: MemoryLine,
     new_limit: str,
     path: str,
+    container_name: str,
+    expected_old: str,
     git_checker: bool = True,
 ) -> VerificationResult:
     """Full I-B2 verification: structural round-trip **and** ``git apply --check``.
@@ -556,6 +575,17 @@ def verify_patch(
             "not change exactly the resolved line and nothing else"
         )
 
+    patched = apply_unified_diff(original, diff)
+    yaml_ok = False
+    if patched is None:
+        failures.append("YAML AST check skipped: the diff does not apply at all")
+    else:
+        yaml_ok, yaml_reason = verify_yaml_ast(
+            original, patched, container_name, expected_old, new_limit
+        )
+        if not yaml_ok:
+            failures.append(yaml_reason)
+
     git_ok = False
     if git_checker:
         git_ok, git_reason = git_apply_check(original, diff, path)
@@ -565,8 +595,173 @@ def verify_patch(
         failures.append("`git apply --check` was disabled for this call")
 
     return VerificationResult(
-        ok=structural_ok and git_ok,
+        ok=structural_ok and yaml_ok and git_ok,
         structural_ok=structural_ok,
+        yaml_ast_ok=yaml_ok,
         git_apply_ok=git_ok,
         failures=tuple(failures),
     )
+
+
+# ---------------------------------------------------------------------------
+# YAML AST verification
+# ---------------------------------------------------------------------------
+#
+# AGENTS.md §1 "Dual-Layer Patch Verification" and §3.3 require structural YAML
+# validation as one of the two layers. The positional round-trip above proves the
+# *text* changed in exactly one place; it cannot tell whether the result is still
+# a valid Kubernetes object, nor whether the changed text meant what we thought it
+# meant. This layer parses both documents and proves the change is *semantically*
+# exactly one field: `resources.limits.memory` of one named container.
+#
+# That is the check that would catch a patch which is textually perfect and
+# semantically wrong - a diff that reparses but moves the limit onto the wrong
+# container, drops a key, or turns an integer into a string where the schema wants
+# a quantity. None of those are visible in a line diff.
+
+#: Keys that are compared case-sensitively; Kubernetes keys are lowercase.
+_MEMORY_KEY: Final[str] = "memory"
+
+
+def _container_limits_path(
+    document: object, container_name: str
+) -> tuple[object, ...] | None:
+    """Locate the ``resources.limits`` mapping for ``container_name``.
+
+    Returns the path to the mapping itself, so its ``memory`` child is one step
+    deeper. Uses the parsed structure rather than indentation, which is the whole
+    point: this layer is independent of how the file happens to be laid out.
+    """
+    if not isinstance(document, dict):
+        return None
+    spec = document.get("spec")
+    if not isinstance(spec, dict):
+        return None
+    template = spec.get("template")
+    if not isinstance(template, dict):
+        return None
+    pod_spec = template.get("spec")
+    if not isinstance(pod_spec, dict):
+        return None
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list):
+        return None
+    for index, container in enumerate(containers):
+        if not isinstance(container, dict) or container.get("name") != container_name:
+            continue
+        resources = container.get("resources")
+        if not isinstance(resources, dict):
+            return None
+        limits = resources.get("limits")
+        if not isinstance(limits, dict):
+            return None
+        return ("spec", "template", "spec", "containers", index, "resources", "limits")
+    return None
+
+
+def _diff_paths(
+    left: Any, right: Any, prefix: tuple[Any, ...] = ()
+) -> list[tuple[Any, ...]]:
+    """Every path at which two parsed documents differ.
+
+    Lists are compared element-wise by index rather than as opaque values, so a
+    reorder or an insertion is reported as a difference instead of being absorbed
+    into "the list changed". Type changes are always a difference: ``256`` and
+    ``"256"`` are not the same document, and a Kubernetes quantity must not
+    silently change type.
+    """
+    if type(left) is not type(right):
+        return [prefix or ("<root>",)]
+    if isinstance(left, dict):
+        paths: list[tuple[Any, ...]] = []
+        for key in sorted(set(left) | set(right), key=str):
+            if key not in left or key not in right:
+                paths.append(prefix + (key,))
+            else:
+                paths.extend(_diff_paths(left[key], right[key], prefix + (key,)))
+        return paths
+    if isinstance(left, list):
+        paths = []
+        if len(left) != len(right):
+            paths.append(prefix + ("<length>",))
+        for index in range(min(len(left), len(right))):
+            paths.extend(_diff_paths(left[index], right[index], prefix + (index,)))
+        return paths
+    if left != right:
+        return [prefix or ("<root>",)]
+    return []
+
+
+def verify_yaml_ast(
+    original: str,
+    patched: str,
+    container_name: str,
+    expected_old: str,
+    expected_new: str,
+) -> tuple[bool, str]:
+    """Prove the patch changes exactly one semantic field, correctly.
+
+    Four conditions, all required:
+
+    1. both documents parse as YAML;
+    2. they differ at exactly one path;
+    3. that path is ``resources.limits.memory`` of the named container, found
+       structurally rather than by index;
+    4. the value moved from ``expected_old`` to ``expected_new``.
+
+    Fails closed on anything else, including a document this layer cannot model.
+    """
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - PyYAML is a declared dependency
+        return False, "PyYAML is unavailable, so the YAML AST check cannot run"
+
+    try:
+        before = yaml.safe_load(original)
+        after = yaml.safe_load(patched)
+    except yaml.YAMLError as exc:
+        which = "patched" if "patched" in str(exc) else "original"
+        return (
+            False,
+            f"YAML AST check failed: the {which} document does not parse ({exc})",
+        )
+
+    limits_path = _container_limits_path(before, container_name)
+    if limits_path is None:
+        return (
+            False,
+            f"YAML AST check failed: no resources.limits for container "
+            f"{container_name!r} in the parsed document",
+        )
+
+    differences = _diff_paths(before, after)
+    if len(differences) != 1:
+        return (
+            False,
+            "YAML AST check failed: the patch changes "
+            f"{len(differences)} semantic field(s) {differences[:6]}, "
+            "expected exactly 1",
+        )
+
+    changed = differences[0]
+    if tuple(changed[:-1]) != limits_path or changed[-1] != _MEMORY_KEY:
+        return (
+            False,
+            f"YAML AST check failed: the patch changes {changed}, expected only "
+            f"{limits_path + (_MEMORY_KEY,)}",
+        )
+
+    before_value = before["spec"]["template"]["spec"]["containers"][limits_path[4]][
+        "resources"
+    ]["limits"][_MEMORY_KEY]
+    after_value = after["spec"]["template"]["spec"]["containers"][limits_path[4]][
+        "resources"
+    ]["limits"][_MEMORY_KEY]
+    if str(before_value) != expected_old or str(after_value) != expected_new:
+        return (
+            False,
+            f"YAML AST check failed: memory moved from {before_value!r} to "
+            f"{after_value!r}, expected {expected_old!r} to {expected_new!r}",
+        )
+
+    return True, "YAML AST check passed"

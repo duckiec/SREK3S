@@ -52,6 +52,8 @@ from models import (
 
 __all__ = [
     "TARGET_MANIFEST",
+    "affected_scope",
+    "classify",
     "ManifestProvider",
     "RemedyShape",
     "TierEvidence",
@@ -60,7 +62,6 @@ __all__ = [
     "RoutingDecision",
     "StaticManifestProvider",
     "unreadable_manifest_provider",
-    "classify",
     "route",
     "PRECONDITIONS",
 ]

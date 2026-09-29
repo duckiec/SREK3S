@@ -39,6 +39,7 @@ from typing import Final
 import classifier
 import patch as patch_engine
 import prompt
+import rescan
 from classifier import (
     ManifestProvider,
     StaticManifestProvider,
@@ -204,6 +205,25 @@ def _verification_policy(tier: BlastRadiusTier) -> VerificationPolicy:
     )
 
 
+def _rescanned_rca(
+    payload: IncidentPayload,
+    classification: Classification,
+    tier: BlastRadiusTier,
+    rationale: str,
+    evidence: list[str],
+) -> str:
+    """Render the RCA, then pass the whole document through the ARCH §6 re-scan.
+
+    I-B6. The Go node is the authoritative masking control and this is the
+    backstop. It runs over the *rendered* document rather than over individual
+    fields, because a secret can be assembled from two fields that are each
+    individually innocent.
+    """
+    rendered = prompt.rca_markdown(payload, classification, tier, rationale, evidence)
+    cleaned, _report = rescan.redact(rendered)
+    return cleaned[0]
+
+
 def _tier2_response(
     payload: IncidentPayload,
     result: classifier.ClassificationResult,
@@ -252,7 +272,7 @@ def _tier2_response(
             patch_validated=False,
         ),
         verification_policy=_verification_policy(BlastRadiusTier.TIER_2_ARCHITECTURAL),
-        rca_markdown=prompt.rca_markdown(
+        rca_markdown=_rescanned_rca(
             payload,
             result.classification,
             BlastRadiusTier.TIER_2_ARCHITECTURAL,
@@ -355,10 +375,34 @@ def _build_remediation_diff(
     )
 
     diff = patch_engine.build_diff(manifest_text, target, new_limit, TARGET_MANIFEST)
+
+    # I-B6 / ARCH §6: a diff is refused, never redacted. Rewriting a line inside a
+    # diff would break the artifact - the hunk header's counts would no longer
+    # describe its body - and a credential inside a GitOps PR would be copied into
+    # every clone of the repository. A leak here is a Tier-2 outcome.
+    try:
+        rescan.assert_clean(diff)
+    except rescan.SecretLeakError as leak:
+        return (
+            None,
+            None,
+            [
+                f"the generated diff matched masking rule(s) "
+                f"{', '.join(leak.rule_ids_found)}; a patch carrying a secret is "
+                "refused rather than redacted, so no patch is emitted (ROADMAP 2.5.8)"
+            ],
+        )
+
     # I-B2, in full: a structural round-trip *and* `git apply --check`. Both must
     # pass before the patch may be emitted, and neither substitutes for the other.
     verification = patch_engine.verify_patch(
-        manifest_text, diff, target, new_limit, TARGET_MANIFEST
+        manifest_text,
+        diff,
+        target,
+        new_limit,
+        TARGET_MANIFEST,
+        container_name=payload.container_name,
+        expected_old=memory_limit,
     )
     if not verification.ok:
         return (
@@ -375,7 +419,8 @@ def _build_remediation_diff(
         f"{target.indent.count(' ')} spaces of indentation"
     )
     reasons.append(
-        "I-B2 satisfied: structural round-trip and `git apply --check` both passed"
+        "I-B2 satisfied: positional round-trip, YAML AST check and "
+        "`git apply --check` all passed"
     )
     return diff, new_limit, reasons
 
@@ -478,7 +523,7 @@ def triage_payload(
             patch_validated=True,
         ),
         verification_policy=_verification_policy(BlastRadiusTier.TIER_1_TOIL),
-        rca_markdown=prompt.rca_markdown(
+        rca_markdown=_rescanned_rca(
             payload,
             Classification.RESOURCE_EXHAUSTION,
             BlastRadiusTier.TIER_1_TOIL,

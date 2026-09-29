@@ -278,10 +278,17 @@ class TestCombinedVerification:
             manifest, target, "512Mi", triage.TARGET_MANIFEST
         )
         result = patch_engine.verify_patch(
-            manifest, diff, target, "512Mi", triage.TARGET_MANIFEST
+            manifest,
+            diff,
+            target,
+            "512Mi",
+            triage.TARGET_MANIFEST,
+            container_name="checkout-api",
+            expected_old="256Mi",
         )
         assert result.ok, result.failures
         assert result.structural_ok
+        assert result.yaml_ast_ok, result.failures
         assert result.git_apply_ok
         assert result.failures == ()
 
@@ -294,7 +301,14 @@ class TestCombinedVerification:
             manifest, target, "512Mi", triage.TARGET_MANIFEST
         )
         result = patch_engine.verify_patch(
-            manifest, diff, target, "512Mi", triage.TARGET_MANIFEST, git_checker=False
+            manifest,
+            diff,
+            target,
+            "512Mi",
+            triage.TARGET_MANIFEST,
+            container_name="checkout-api",
+            expected_old="256Mi",
+            git_checker=False,
         )
         assert not result.ok
         assert not result.git_apply_ok
@@ -315,6 +329,8 @@ class TestCombinedVerification:
             target,
             "1024Mi",  # claim a different new limit than the diff installs
             triage.TARGET_MANIFEST,
+            container_name="checkout-api",
+            expected_old="256Mi",
         )
         assert not result.structural_ok
         assert not result.ok
@@ -328,7 +344,14 @@ class TestCombinedVerification:
             manifest, target, "512Mi", triage.TARGET_MANIFEST
         )
         result = patch_engine.verify_patch(
-            manifest, diff, target, "512Mi", triage.TARGET_MANIFEST, git_checker=False
+            manifest,
+            diff,
+            target,
+            "512Mi",
+            triage.TARGET_MANIFEST,
+            container_name="checkout-api",
+            expected_old="256Mi",
+            git_checker=False,
         )
         assert result.reason_text()
         assert "git apply --check" in result.reason_text()

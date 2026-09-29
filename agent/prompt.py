@@ -25,6 +25,7 @@ from models import BlastRadiusTier, Classification, IncidentPayload, Reason
 
 __all__ = [
     "RATIONALE_UNKNOWN",
+    "clip",
     "memory_recalibration_rationale",
     "configuration_rationale",
     "dependency_rationale",
@@ -75,8 +76,13 @@ _CONFIG_MARKERS: Final[re.Pattern[str]] = re.compile(
 )
 
 
-def _clip(text: str) -> str:
-    """Bound a rationale to :data:`MAX_RATIONALE_CHARS`."""
+def clip(text: str) -> str:
+    """Bound any generated prose to :data:`MAX_RATIONALE_CHARS`.
+
+    Public because several modules produce human-facing prose and reaching into a
+    private helper for it would be a smell: the bound belongs to the output
+    contract, not to one function.
+    """
     if len(text) <= MAX_RATIONALE_CHARS:
         return text
     return text[: MAX_RATIONALE_CHARS - 3].rstrip() + "..."
@@ -156,12 +162,12 @@ def memory_recalibration_rationale(payload: IncidentPayload) -> str:
         "The remedy is confined to recalibrating the memory limit, which is an "
         "enumerated Tier-1 shape in ARCH §5.3."
     )
-    return _clip(" ".join(parts))
+    return clip(" ".join(parts))
 
 
 def configuration_rationale(payload: IncidentPayload) -> str:
     """Explain a startup or configuration fault. Always Tier-2."""
-    return _clip(
+    return clip(
         f"Container {payload.container_name!r} is failing to start or crash-looping "
         f"(reason={payload.reason.value}, exit_code={payload.exit_code!r}, "
         f"restart_count={payload.restart_count}). The scrubbed logs indicate a "
@@ -173,7 +179,7 @@ def configuration_rationale(payload: IncidentPayload) -> str:
 
 def dependency_rationale(payload: IncidentPayload) -> str:
     """Explain an upstream or network fault. Always Tier-2."""
-    return _clip(
+    return clip(
         f"Container {payload.container_name!r} is failing with dependency or network "
         f"errors in its scrubbed logs (reason={payload.reason.value}, "
         f"exit_code={payload.exit_code!r}). The proximate symptom is local but the "
@@ -188,7 +194,7 @@ def escalation_rationale(
     """Explain a fail-closed escalation."""
     if classification is Classification.UNKNOWN:
         return RATIONALE_UNKNOWN
-    return _clip(
+    return clip(
         f"Classified as {classification.value} from the scrubbed evidence, but the "
         "conditions for an automatic Tier-1 change are not all satisfied. Under the "
         "deny-by-default routing in ARCH §5.3 this escalates to a human rather than "
@@ -238,7 +244,7 @@ def rca_markdown(
             "",
         ]
     )
-    return _clip("\n".join(lines))
+    return clip("\n".join(lines))
 
 
 def _remediation_section(tier: BlastRadiusTier) -> str:

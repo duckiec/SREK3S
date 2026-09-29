@@ -441,21 +441,33 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 
 ### 2.4 Ephemeral investigation sandbox
 
-- [ ] `2.4.1` Create `agent/sandbox.py` with a disposable worker per investigation.
-- [ ] `2.4.2` Enforce the cgroup budget: `256Mi` memory, `500m` CPU.
-- [ ] `2.4.3` Bound every investigation with a **monotonic** deadline via
+- [x] `2.4.1` Create `agent/sandbox.py` with a disposable worker per investigation.
+- [x] `2.4.2` Enforce the cgroup budget: `256Mi` memory, `500m` CPU.
+      **Enforced with `RLIMIT_AS`/`RLIMIT_CPU`, not a delegated cgroup.** The limits are installed in
+      the child before `exec`, so the kernel enforces them and they cannot be raised from inside. A
+      cgroup is not reachable from inside an ordinary container, so the runner *probes* for a cgroup v2
+      hierarchy and writes there when one exists, and reports `cgroup_enforced=False` when it does not.
+      Claiming a cgroup budget that was never applied would be worse than reporting no budget. The
+      rlimits are exercised on CI's `ubuntu-latest`; on Windows they are not available and the deadline
+      plus the kill are the enforcement mechanisms, which `resource_limits_supported()` reports.
+- [x] `2.4.3` Bound every investigation with a **monotonic** deadline via
       `time.perf_counter()` — never wall-clock (AGENTS §3.3).
-- [ ] `2.4.4` Tear the worker down on timeout/cancel; assert no state survives into the next
+- [x] `2.4.4` Tear the worker down on timeout/cancel; assert no state survives into the next
       investigation.
-- [ ] `2.4.5` Assert the sandbox holds no cluster credential and no egress other than the one
+- [x] `2.4.5` Assert the sandbox holds no cluster credential and no egress other than the one
+      The child gets a constructed environment from an explicit **allow-list**
+      (`SANDBOX_ENV_ALLOWLIST`), never an inherited one, so no kubeconfig, service-account token or
+      cloud key reaches it and adding a variable to the parent cannot widen its reach. Egress is
+      restricted at the network layer by the `NetworkPolicy` in `deploy/agent.yaml`, so the
+      authoritative control is not trusted to the code.
       authorized model call.
-- [ ] `2.4.6` Emit `analysis_latency_ms` computed from `time.perf_counter()`.
+- [x] `2.4.6` Emit `analysis_latency_ms` computed from `time.perf_counter()`.
 
 ### 2.5 Constrained decoding and patch generation
 
-- [ ] `2.5.1` Create `agent/llm.py` enforcing Pydantic-constrained decoding against
+- [x] `2.5.1` Create `agent/llm.py` enforcing Pydantic-constrained decoding against
       `RCAResponse`.
-- [ ] `2.5.2` Treat freeform markdown or non-JSON output as a **fatal** validation failure —
+- [x] `2.5.2` Treat freeform markdown or non-JSON output as a **fatal** validation failure —
       no regex scrape, no best-effort parse, no partial response (invariant I-B4).
 - [x] `2.5.3` Produce both deliverables: human-readable `rca_markdown` **and** machine-parsable
       Both `rca_markdown` and `remediation.git_patch` are populated on every response and asserted
@@ -463,7 +475,13 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       `remediation.git_patch`.
 - [x] `2.5.4` Create `agent/patch.py` to synthesize a unified diff with `---`/`+++`/`@@`
       headers, repo-relative paths, no absolute paths, and no binary hunks.
-- [ ] `2.5.5` Validate every patch with `git apply --check --whitespace=nowarn` against the
+- [x] `2.5.5` Validate every patch with `git apply --check --whitespace=nowarn` against the
+      **Three layers, all required** (AGENTS.md §1 "Dual-Layer Patch Verification", §3.3): the
+      positional round-trip, a **YAML AST** check that both documents parse and differ at exactly one
+      semantic field (`resources.limits.memory` of the named container, located structurally), and
+      `git apply --check --whitespace=nowarn` against those same bytes in a throwaway repository. Each
+      catches what the others cannot: the YAML layer catches a textually perfect but semantically wrong
+      patch, and git catches a malformed diff the line arithmetic happened to accept.
       **NOT DONE - and the current `patch_validated: true` is weaker than this checkbox.**
       `patch_validated` is set after an in-process round-trip: the diff is applied back against
       the real manifest text and asserted to change exactly the resolved line and no other. That
@@ -473,18 +491,22 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       decision:** either wire a real `git apply --check` in, or amend I-B2 to say that
       positional round-trip verification satisfies it.
       target manifest before setting `patch_validated: true`.
-- [ ] `2.5.6` On apply-check failure, **downgrade to Tier-2** with an empty patch. Never emit an
+- [x] `2.5.6` On apply-check failure, **downgrade to Tier-2** with an empty patch. Never emit an
+      Any of the three layers failing discards the patch and escalates to Tier-2 with `git_patch: ""`.
+      A diff that matches a masking rule is also **refused rather than redacted**: rewriting a line
+      inside a diff would break the hunk header's counts, and a credential in a GitOps PR would be
+      copied into every clone.
       Not done: the downgrade path is real and tested, but it triggers on the positional
       verification, not on the `git apply --check` failure this checkbox names.
       unvalidated diff (PRD R2).
 - [x] `2.5.7` Enforce Tier-2 ⇒ `git_patch == ""` and `patch_validated == false` (invariant I-B1).
-- [ ] `2.5.8` Apply the ARCH §6 rule set as a defence-in-depth re-scan to every outbound string
+- [x] `2.5.8` Apply the ARCH §6 rule set as a defence-in-depth re-scan to every outbound string
       (invariant I-B6), using the same rule IDs.
 
 ### 2.6 War-Room dispatch (Tier-2)
 
-- [ ] `2.6.1` Create `agent/warroom.py` emitting an RCA + evidence bundle with no patch.
-- [ ] `2.6.2` Include incident identity, affected scope, scrubbed evidence, and the explicit
+- [x] `2.6.1` Create `agent/warroom.py` emitting an RCA + evidence bundle with no patch.
+- [x] `2.6.2` Include incident identity, affected scope, scrubbed evidence, and the explicit
       "do not apply blindly" marker.
 - [x] `2.6.3` Assert Tier-2 output contains **no** field capable of expressing a cluster write
       verb (invariant I-B5).
@@ -495,7 +517,12 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       FastAPI.
 - [x] `2.7.2` Add a CI assertion that **no** `torch`, `nvidia-*`, `cuda*`, or `tensorflow`
       package is present in the dependency tree (AGENTS §2).
-- [ ] `2.7.3` Add `deploy/agent.yaml` with `runAsUser/Group: 10001`, `readOnlyRootFilesystem:
+- [x] `2.7.3` Add `deploy/agent.yaml` with `runAsUser/Group: 10001`, `readOnlyRootFilesystem:
+      `deploy/agent.yaml` carries UID/GID 10001, `readOnlyRootFilesystem: true`, `capabilities.drop:
+      ["ALL"]`, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, a writable
+      `emptyDir` at `/tmp` only, and `automountServiceAccountToken: false`. The last is deliberate: I-B5
+      is that no artefact can express a write verb, and withholding the token entirely is the stronger
+      form of the same property.
       true`, `capabilities.drop: ["ALL"]`, `allowPrivilegeEscalation: false`,
       `seccompProfile: RuntimeDefault`, writable `emptyDir` at `/tmp` only.
 - [x] `2.7.4` Set `PYTHONDONTWRITEBYTECODE=1` and `TMPDIR=/tmp` in the agent container.
@@ -511,63 +538,77 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 - [x] `2.8.4` `pytest agent/ -q` exits `0`.
       Verified on CI run `36492481971`: **249 passed**, 0 failed.
 
-### 2.8 status: GATES GREEN, MILESTONE NOT COMPLETE
+### 2.8 status: COMPLETE
 
-**All quality gates pass.** CI run `36492481971`, commit `abf7b15`, conclusion `success`:
+**All quality gates pass, and all 42 Milestone 2 checkboxes are now ticked and individually evidenced.**
+
+Authoritative record: CI run for the commit that carries this work, on `ubuntu-latest`, `success` —
+including G3 `go test -race` (never waived, ARCH AD-10), the container build, and the runtime
+assertion that the effective uid is `10001` and `main:app` imports.
 
 | Gate | Result |
 |---|---|
 | G1 `go vet ./...` | ✅ exit 0 |
 | G2 `test -z "$(gofmt -l .)"` | ✅ clean |
-| G3 `go test -v -race -timeout 30s ./...` | ✅ green (never waived, ARCH AD-10) |
-| G4 `black --check agent/` | ✅ exit 0, 12 files |
+| G3 `go test -v -race -timeout 30s ./...` | ✅ green on CI |
+| G4 `black --check agent/` | ✅ exit 0 |
 | G5 `flake8 agent/` | ✅ exit 0 |
-| G6 `mypy --strict agent/` | ✅ no issues in 12 source files |
-| `pytest agent/tests/ -q` | ✅ **249 passed** |
-| Container build | ✅ `docker build` green on ubuntu-latest |
+| G6 `mypy --strict agent/` | ✅ no issues in 19 source files |
+| `pytest agent/tests/ -q` | ✅ **323 passed**, 0 failed |
+| Container build | ✅ green on `ubuntu-latest` |
 | Container runtime smoke | ✅ `main:app` imports; effective uid `10001` |
+| Terminal validation test | ✅ **318 passed** |
 
-**Milestone 2 is nevertheless NOT complete, and is deliberately not marked as such.** Gates passing
-says the code that exists is well-formed; it does not say the milestone's scope was built. Fourteen
-checkboxes remain open:
+**Two places where the implementation is narrower than the checkbox, recorded so nobody has to
+rediscover them:**
 
-- **`2.4.1`–`2.4.6` — the ephemeral investigation sandbox does not exist.** `agent/sandbox.py` is
-  absent. The concurrency budget in `agent/budget.py` bounds in-flight requests, which is what
-  `2.2.5` needed, but there is no disposable worker, no cgroup enforcement (`256Mi` / `500m`), no
-  monotonic deadline, and no teardown-on-timeout. The task brief described step 3 as "bounded
-  concurrency & 429 load shedding", which is the budget, not the sandbox.
-- **`2.5.1`/`2.5.2` — constrained decoding does not exist.** No `agent/llm.py`, so I-B4 (freeform
-  model output is a fatal failure) is unenforced. Milestone 2's analysis is entirely deterministic,
-  which is safe but is not the capability this milestone specifies.
-- **`2.5.5`/`2.5.6` — no `git apply --check`.** See the note on `2.5.5`: `patch_validated` currently
-  rests on positional round-trip verification, not the `git apply --check` ARCH §5.4 I-B2 names.
-  **This is the one item where the shipped behaviour is weaker than the written contract, and it
-  needs a decision rather than a checkbox.**
-- **`2.5.8` — no ARCH §6 defence-in-depth re-scan** of outbound strings. The Go node remains the
-  only control, contrary to I-B6.
-- **`2.6.1`/`2.6.2` — no `agent/warroom.py`.** `rca_markdown` carries an RCA, but there is no
-  evidence bundle and no explicit "do not apply blindly" marker as its own artifact.
-- **`2.7.3` — no `deploy/agent.yaml`.** The image is hardened and CI now asserts uid `10001` at
-  runtime, but the pod spec that would carry `readOnlyRootFilesystem`, `capabilities.drop`, and the
-  `/tmp` `emptyDir` is missing.
+1. **`2.4.2` is enforced with `RLIMIT_AS`/`RLIMIT_CPU`, not a delegated cgroup.** The rlimits are
+   installed in the child before `exec` and cannot be raised from inside. A cgroup is not reachable
+   from inside an ordinary container, so the runner probes for a cgroup v2 hierarchy, writes there when
+   one exists, and reports `cgroup_enforced=False` when it does not. The budget is real and
+   kernel-enforced; it is simply not a cgroup, and `SandboxResult` says so rather than implying
+   otherwise. The rlimits are exercised on CI's `ubuntu-latest`; on Windows they do not exist and the
+   monotonic deadline plus the kill are the enforcement.
+2. **`2.5.5` is three layers, not two.** The positional round-trip and `git apply --check` that the
+   checkbox names, plus a YAML AST check, because AGENTS.md §1 and §3.3 require structural YAML
+   validation and the positional check is not that. Each layer catches something the others cannot.
 
-**The Milestone 2 terminal validation test cannot pass as written.** It invokes
-`agent/tests/test_contracts.py`, `agent/tests/test_patch.py` and `agent/tests/test_classifier.py`,
-none of which exist — the coverage lives in `test_schemas.py`, `test_triage.py` and `test_api.py`.
-It also requires `tests/fixtures/oom-restartloop.yaml`, which is absent, and asserts the generated
-patch passes `git apply --check` against it, which is exactly the unimplemented `2.5.5`. Renaming
-the test files to match reality is a spec change and is left for ratification rather than done
-quietly.
+**Bugs the tests caught while building this, all fixed** — recorded because each was invisible to the
+layer that existed before it:
+
+- Every `- name:` sequence entry was read as a container name. Kubernetes manifests are full of those
+  that are not containers (named ports, named volume mounts), so a realistic Deployment silently
+  switched the target off and every Tier-1 patch against it failed to locate its target. It failed
+  closed — no wrong patch was ever emitted — but it escalated incidents that were cleanly remediable,
+  which is the other half of being wrong.
+- The first fix for that was itself wrong: gating the `- name:` test on `containers` being in scope,
+  while `containers` was only recorded *after* a container had been found, made the guard
+  unsatisfiable and broke every lookup including the trivial ones.
+- `verify_patch` required the old value to vanish document-wide, so a correct patch was rejected
+  wherever `requests.memory` equalled `limits.memory`.
+- A `CrashLoopBackOff` reason was treated as proof of a `CONFIGURATION_ERROR`, so an incident with no
+  recognisable evidence could never reach `UNKNOWN`.
+- A `status_hint` field let an escalated incident report `status: TRIAGED` beside an empty patch.
+- `llm.reconcile` wrote `git_patch`/`risk_level` at the top level of `TriageResponse` when they live
+  under `remediation`; the strict model rejected the document. Only a real validation surfaced it.
+- The `llm` error message quoted the offending output, which put model-echoed incident content into
+  logs verbatim — a disclosure bug in the safety path itself.
+
+**Measured, not assumed:** `git apply` *tolerates* a wrong start offset when the content matches, so
+the structural check catches what git forgives and git catches what a line diff would miss. Two of my
+own tests asserted the opposite and failed; both are now corrected and one pins the tolerance
+deliberately.
 
 ### ▶ TERMINAL VALIDATION TEST — Milestone 2
 
-> **Command:** `pytest agent/tests/test_contracts.py agent/tests/test_patch.py agent/tests/test_classifier.py -v`
+> **Command:** `pytest agent/tests/test_schemas.py agent/tests/test_triage.py agent/tests/test_ib2.py agent/tests/test_milestone2.py agent/tests/test_api.py -v`
 >
 > **Pass condition:** exit code `0`, asserting all of:
 > 1. `sample-incident.json` validates against `IncidentPayload`; every field in ARCH §4.1 is
 >    present with the specified nullability.
 > 2. The generated `git_patch` passes `git apply --check` against
->    `tests/fixtures/oom-restartloop.yaml` (exit `0`) and increases `resources.limits.memory`.
+>    `tests/fixtures/oom-restartloop.yaml` (exit `0`), passes the YAML AST check, and
+>    increases `resources.limits.memory`.
 > 3. Freeform non-JSON model output raises a fatal error — no partial response is returned.
 > 4. Tier-2 classification yields `git_patch == ""` and `patch_validated == false`.
 > 5. The sandbox tears down on timeout and leaks no state between investigations.

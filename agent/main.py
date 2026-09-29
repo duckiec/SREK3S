@@ -46,9 +46,11 @@ from pydantic import ValidationError
 
 import triage
 from budget import JobBudget, budget_from_env
+from sandbox import SandboxError, SandboxPolicy, SandboxRunner
 from models import IncidentPayload, TriageResponse
 
 __all__ = [
+    "SANDBOX_ENV",
     "TRIAGE_PATH",
     "TRIAGE_PATH_ALIAS",
     "JobBudget",
@@ -87,6 +89,21 @@ _TRIAGE_RESPONSES: Final[dict[int | str, dict[str, str]]] = {
     429: {"description": "active-job budget reached; retry with jitter"},
     500: {"description": "analysis failed; incident escalated to Tier-2"},
 }
+
+
+#: Set to ``1`` to run each admitted analysis in a disposable child process.
+SANDBOX_ENV: Final[str] = "SREK3S_SANDBOX"
+
+
+def _sandbox_enabled(env: dict[str, str] | None = None) -> bool:
+    """Whether sandboxed execution is on. Off unless explicitly enabled.
+
+    The deterministic Milestone 2 analysis needs no isolation, and forking a
+    process per incident costs ~400 ms, which is the wrong trade on the hot path.
+    It exists for the model-directed path, where untrusted output shapes the work.
+    """
+    source = os.environ if env is None else env
+    return source.get(SANDBOX_ENV, "").strip() == "1"
 
 
 @asynccontextmanager
@@ -188,6 +205,20 @@ def create_app(job_budget: JobBudget | None = None) -> FastAPI:
     # inspect counters, and so it is replaced wholesale per instance rather than
     # shared between tests through a module global.
     application.state.job_budget = job_budget or budget_from_env()
+
+    # Constructed eagerly, not lazily: tests inspect the runner's peak-concurrency
+    # counter, and an absent sandbox should be a configuration fact rather than a
+    # late AttributeError on the first request.
+    sandbox_on = _sandbox_enabled()
+    application.state.sandbox_runner = (
+        SandboxRunner(policy=SandboxPolicy()) if sandbox_on else None
+    )
+    if sandbox_on:
+        logger.info(
+            "sandbox execution enabled: one disposable worker per admitted request, "
+            "bounded by max_active_jobs=%d",
+            application.state.job_budget.max_active,
+        )
 
     # -- Health probes -----------------------------------------------------
     # Deliberately unauthenticated and deliberately trivial: a probe that
@@ -334,6 +365,47 @@ def create_app(job_budget: JobBudget | None = None) -> FastAPI:
         #
         # The slot is still acquired and released on the event loop, so the
         # counter's check-and-increment atomicity is unchanged.
+        # Optional disposable-worker execution (ROADMAP §2.4, §2.4.5).
+        #
+        # Bounded by the job budget structurally: the budget admits the request
+        # before the sandbox starts, and the sandbox is released only once its
+        # child has been reaped, so live workers can never exceed max_active. The
+        # runner's peak counter makes that assertable rather than assumed.
+        #
+        # The subprocess runs in the threadpool, never on the event loop
+        # (AGENTS.md §3.1). A blocking child would stall /healthz and /readyz, and
+        # a stalled probe is exactly what gets a healthy pod restarted.
+        sandbox_runner = getattr(request.app.state, "sandbox_runner", None)
+        if sandbox_runner is not None:
+            try:
+                sandbox_result = await run_in_threadpool(
+                    sandbox_runner.run, payload.model_dump(mode="json")
+                )
+            except SandboxError as exc:
+                # A failed investigation is an unrecoverable analysis failure, so
+                # the incident escalates to Tier-2 rather than being retried: a
+                # sandbox that cannot run has nothing to offer a second attempt.
+                logger.error(
+                    "sandbox failed incident_id=%s request_id=%s: %s",
+                    payload.incident_id,
+                    request_id,
+                    exc,
+                )
+                return _error(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    _ERROR_ANALYSIS_FAILED,
+                    request_id,
+                )
+            logger.info(
+                "sandbox analysis incident_id=%s request_id=%s latency_ms=%d "
+                "rlimits_applied=%s cgroup_enforced=%s",
+                payload.incident_id,
+                request_id,
+                sandbox_result.latency_ms,
+                sandbox_result.rlimits_applied,
+                sandbox_result.cgroup_enforced,
+            )
+
         try:
             outcome = await run_in_threadpool(triage.triage_payload, payload)
         except Exception:  # noqa: BLE001 - catch-all, see module docstring
