@@ -283,6 +283,17 @@ type PodWatcher struct {
 	factory  informers.SharedInformerFactory
 	informer cache.SharedInformer
 
+	// resync and namespace are held as fields rather than being applied
+	// immediately by their options. The first version had `WithResyncPeriod`
+	// rebuild the factory, which meant option *order* silently decided whether
+	// a namespace scope survived: applying `WithResyncPeriod` after
+	// `WithNamespace` would rebuild the factory without the namespace and the
+	// Sentinel would quietly widen back to watching everything. Building the
+	// factory once, after every option has run, removes the hazard by making it
+	// unrepresentable.
+	resync    time.Duration
+	namespace string
+
 	dedup *dedupCache
 	now   func() time.Time
 	log   *slog.Logger
@@ -307,7 +318,38 @@ func WithLogger(log *slog.Logger) WatcherOption {
 
 // WithResyncPeriod overrides the informer resync period.
 func WithResyncPeriod(d time.Duration) WatcherOption {
-	return func(w *PodWatcher) { w.factory = informers.NewSharedInformerFactory(w.client, d) }
+	return func(w *PodWatcher) { w.resync = d }
+}
+
+// WithNamespace restricts the watch to a single namespace.
+//
+// Empty means all namespaces, which is client-go's own convention for a namespaced
+// resource and is why the zero value is the permissive one.
+//
+// This is a blast-radius control, not a performance knob. An all-namespaces
+// Sentinel will emit an incident for every failing container in the cluster,
+// including in namespaces it has no business observing, and the agent will spend
+// its job budget triaging them. ROADMAP 4.1.5 makes it a guardrail: a chaos
+// fixture in `sentinel-chaos` must be visible, and a production namespace must
+// not be, when the Sentinel is pointed at chaos.
+//
+// The scope is enforced by the informer's own List/Watch, not by filtering
+// afterwards. Filtering post-hoc would still pay the full cost of watching the
+// whole cluster and would make the exclusion depend on a code path that a bug
+// could bypass.
+func WithNamespace(namespace string) WatcherOption {
+	return func(w *PodWatcher) { w.namespace = namespace }
+}
+
+// Namespace reports the scope the watcher was built with, and whether it is
+// cluster-wide.
+//
+// Exposed so main can log the value that was actually applied rather than the
+// value it intended. An earlier version logged the `-namespace` flag while the
+// informer ignored it entirely, so the log asserted a scoping that was not in
+// effect.
+func (w *PodWatcher) Namespace() (string, bool) {
+	return w.namespace, w.namespace == AllNamespaces
 }
 
 // NewPodWatcher builds a watcher over a pod informer.
@@ -318,11 +360,11 @@ func WithResyncPeriod(d time.Duration) WatcherOption {
 // like "the cluster went quiet" rather than like a bug.
 func NewPodWatcher(client kubernetes.Interface, opts ...WatcherOption) *PodWatcher {
 	w := &PodWatcher{
-		client:  client,
-		events:  make(chan *IncidentRecord, EgressChannelCapacity),
-		factory: informers.NewSharedInformerFactory(client, DefaultResyncPeriod),
-		now:     time.Now,
-		log:     slog.Default(),
+		client: client,
+		events: make(chan *IncidentRecord, EgressChannelCapacity),
+		resync: DefaultResyncPeriod,
+		now:    time.Now,
+		log:    slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -330,6 +372,17 @@ func NewPodWatcher(client kubernetes.Interface, opts ...WatcherOption) *PodWatch
 	if w.dedup == nil {
 		w.dedup = newDedupCache(DedupTTL, w.now)
 	}
+
+	// Built once, after every option, so no option can be silently discarded by
+	// a later one rebuilding the factory. See the resync field's comment.
+	factoryOptions := make([]informers.SharedInformerOption, 0, 1)
+	if w.namespace != AllNamespaces {
+		factoryOptions = append(factoryOptions, informers.WithNamespace(w.namespace))
+	}
+	w.factory = informers.NewSharedInformerFactoryWithOptions(
+		w.client, w.resync, factoryOptions...,
+	)
+
 	w.informer = w.factory.Core().V1().Pods().Informer()
 	if _, err := w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {

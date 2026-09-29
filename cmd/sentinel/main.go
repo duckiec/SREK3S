@@ -162,15 +162,30 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	// code should use, and its absence here is dictated by client-go's signature
 	// rather than chosen.
 	readOnly := k8s.NewReadOnlyClientset(client)
-	if namespace := *namespace; namespace != "" {
-		log.Info("scoping the watch", "namespace", namespace,
-			"reader", k8s.DescribeReadOnlyClientset(readOnly, namespace))
-	} else {
-		log.Info("watching all namespaces",
-			"reader", k8s.DescribeReadOnlyClientset(readOnly, k8s.AllNamespaces))
-	}
 
-	watcher := k8s.NewPodWatcher(client, k8s.WithLogger(log))
+	// Scoped to the namespace the flag names, and the log reports the scope the
+	// watcher reports back rather than the flag's value. Those were the same
+	// string and the same object until `WithNamespace` existed; before that, main
+	// logged "scoping the watch: sentinel-chaos" over an informer that was
+	// watching every namespace in the cluster.
+	watcher := k8s.NewPodWatcher(client,
+		k8s.WithLogger(log),
+		k8s.WithNamespace(*namespace),
+	)
+
+	scope, clusterWide := watcher.Namespace()
+	if clusterWide {
+		log.Info("watching ALL namespaces; every failing container in the cluster "+
+			"will be emitted, and the agent's job budget will be spent on namespaces "+
+			"this Sentinel was not pointed at",
+			"reader", k8s.DescribeReadOnlyClientset(readOnly, scope),
+		)
+	} else {
+		log.Info("watching one namespace",
+			"namespace", scope,
+			"reader", k8s.DescribeReadOnlyClientset(readOnly, scope),
+		)
+	}
 
 	telemetry := k8s.NewTelemetry(client)
 

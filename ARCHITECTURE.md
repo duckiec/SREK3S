@@ -124,7 +124,7 @@ SREK3S/
 │   ├── agent.yaml                # FastAPI: same hardening
 │   ├── kustomization.yaml
 │   └── chaos/                    # Milestone 4 synthetic chaos fixtures
-│       ├── oom-badpod.yaml
+│       ├── oom-leak.yaml
 │       └── crashloop-badpod.yaml
 │
 └── tests/

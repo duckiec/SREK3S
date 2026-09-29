@@ -1,0 +1,414 @@
+# SREK3S chaos fixture — deterministic CrashLoopBackOff (ROADMAP 4.1.3 / 4.1.4)
+#
+# INPUT ONLY. Same standing as oom-leak.yaml: never applied by the Sentinel,
+# never applied by CI without an explicit human GO. The Sentinel's RBAC in
+# deploy/rbac.yaml is get/list/watch only, so it structurally cannot apply this.
+# Applying it is the e2e runner's job, by hand.
+#
+# Blast radius: `sentinel-chaos`, a disposable namespace owned by ROADMAP 4.1.1,
+# referenced here and never defined here. See namespace.yaml.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT MUST PRODUCE, precisely (internal/k8s/watcher.go classify())
+# ---------------------------------------------------------------------------
+#   containers[].status.state.waiting.reason == "CrashLoopBackOff"
+#
+# and, at the same moment, because the kubelet has already cleared State:
+#   containers[].status.lastState.terminated.exitCode == 1
+#   containers[].status.lastState.terminated.reason    == "Error"
+#   containers[].status.restartCount                   >= 2
+# The last two are load-bearing, not decoration:
+#
+#   * `LastTerminationState` is the *only* surviving evidence of the crash. By the
+#     time the Sentinel observes Waiting{CrashLoopBackOff}, the terminating
+#     `State` has been overwritten by the new (not-yet-started) instance.
+#     watcher.go reads PreviousReason from `LastTerminationState`, precisely
+#     because reading `State` would report the CrashLoopBackOff itself, which is
+#     the condition and not the cause.
+#
+#   * `restartCount >= 1` is required by INVARIANT I-A3
+#     (internal/emitter/validate.go:173), and `reason == CrashLoopBackOff` is one
+#     of only two reasons the emitter will serialize at all (validate.go:119).
+#     Without a real restart, nothing is emitted.
+#
+# It must NOT produce:
+#   - `OOMKilled` (exit 137). The payload must exit 1, not be SIGKILLed. A
+#     container killed by a signal leaves exitCode = 128+signo, and 137 is
+#     reserved for the memory cgroup (watcher.go classifyExit, OOMExitCode=137).
+#   - a single non-zero exit. Exit-1-once classifies as `Terminated`
+#     (watcher.go classifyExit returns FailureKind("Terminated") for any non-137
+#     non-zero exit) and `internal/emitter/mapReason` DROPS it as unmappable.
+#     One failure is not an incident; a *sustained* one is. That is the whole
+#     point of this fixture, and it is why the script fails immediately and
+#     repeatedly instead of once.
+#   - `Evicted` (node-pressure eviction; no containerStatuses survive it).
+#
+# ---------------------------------------------------------------------------
+# WHY THIS SHAPE AND NOT OOM-LEAK.YAML
+# ---------------------------------------------------------------------------
+# The two fixtures differ in exactly one dimension that matters to the Sentinel:
+#
+#   oom-leak.yaml   SIGKILL from the cgroup. State=Terminated, exit 137.
+#                   classify() takes the Terminated branch on the FIRST failure.
+#                   One incident, deterministically, on the first cycle.
+#
+#   crashloop.yaml  exit 1, back to back. The kubelet clears State and moves the
+#                   reason to Waiting. classify() takes the Waiting branch, which
+#                   is only reachable once the kubelet is in backoff - i.e. on
+#                   the SECOND failure at the earliest.
+#
+# The delay before the first observable incident is therefore not a tuning knob
+# to be dialled down; it is a property of kubelet backoff. See the timeline at
+# the bottom of this file before writing an assertion against it.
+#
+# ---------------------------------------------------------------------------
+# IMAGE: busybox:1.36.1
+# ---------------------------------------------------------------------------
+# Same tag as oom-leak.yaml, for the same reason: a chaos fixture whose
+# behaviour depends on a floating tag is not a fixture, it is a coin toss. The
+# image choice reasoning in oom-leak.yaml (1.9 MB, musl, shell-only RSS 1-2 MB)
+# applies unchanged and is not repeated here.
+#
+# `imagePullPolicy: Never` is deliberate and matches the sibling fixture. ROADMAP
+# 4.2.2 imports images into containerd out-of-band; a pull attempt is not a
+# fallback, it is a network call that fails slowly and obscures the real failure
+# by turning a crash loop into an ErrImagePull backoff - the wrong reason, in the
+# same Waiting state, which is exactly the kind of false positive that would make
+# this fixture untestable.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-chaos-crashloop
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-chaos-crashloop
+    app.kubernetes.io/part-of: srek3s
+    app.kubernetes.io/component: chaos
+    # Distinct value from the sibling fixture's `oom` so a cleanup or an
+    # assertion can target one fault shape without the other. Valid label value
+    # (alphanumeric, <= 63 chars); no quoting needed.
+    srek3s.io/chaos: crashloop
+spec:
+  # One replica. More would produce N independent crash loops and make
+  # `detections == injected_events` (ROADMAP 4.2.3) ambiguous about what was
+  # injected - worse here than for the OOM fixture, because a crash loop's
+  # incident count is a function of wall-clock time (see TIMELINE below).
+  replicas: 1
+  # Matches oom-leak.yaml. Both fixtures will trip this at roughly the same
+  # wall-clock moment, so `kubectl rollout status` fails identically for both
+  # and a runner cannot mistake one fixture's deadline for the other's failure.
+  # Note that ProgressDeadlineExceeded does NOT stop the pod: the ReplicaSet
+  # keeps restarting the container. It only means the rollout never goes green,
+  # which is correct - this deployment is never supposed to become healthy.
+  progressDeadlineSeconds: 120
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-chaos-crashloop
+      srek3s.io/chaos: crashloop
+  template:
+    metadata:
+      labels:
+        # Selector labels are a subset of these, as the API requires. The
+        # `srek3s.io/chaos: crashloop` value is what separates this pod from the
+        # OOM fixture in any sweep; `part-of: srek3s` is what makes it show up in
+        # a project-wide listing alongside the Sentinel and the agent.
+        app.kubernetes.io/name: srek3s-chaos-crashloop
+        app.kubernetes.io/part-of: srek3s
+        app.kubernetes.io/component: chaos
+        srek3s.io/chaos: crashloop
+    spec:
+      # No API access is needed to crash on purpose, and a mounted token would be
+      # a second planted credential in the pod for no reason.
+      automountServiceAccountToken: false
+      # Stops the kubelet injecting every Service in the namespace as env vars.
+      # Same reasoning as the sibling fixture: it keeps the environment free of
+      # high-entropy strings that would confuse a masking assertion on the log.
+      enableServiceLinks: false
+
+      # Explicit, and load-bearing here in a way it is not in oom-leak.yaml.
+      # A Deployment defaults to `Always`, so this is belt-and-braces on its
+      # face - but CrashLoopBackOff is unreachable under any other policy.
+      #   Always      -> restart, back off, CrashLoopBackOff.  <- the target
+      #   OnFailure   -> identical for a non-zero exit, so also acceptable.
+      #   Never       -> pod goes straight to Failed, containerStatuses still
+      #                  show Terminated{exit 1}, and NO Waiting reason is ever
+      #                  published. classify() would never see CrashLoopBackOff.
+      # Stating it means a future edit cannot quietly pick `Never` and turn this
+      # fixture into a silent no-op.
+      restartPolicy: Always
+
+      # Pod Security Admission `restricted`, enforced (not merely warned) by the
+      # `sentinel-chaos` namespace. A fixture rejected at admission is worse
+      # than no fixture: it fails closed and reads as "the cluster is quiet".
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: crashloop-canary
+          # DNS-1123 label, which is what the agent's `container_name` pattern
+          # (internal/emitter/validate.go dns1123Label) enforces.
+          image: busybox:1.36.1
+          imagePullPolicy: Never
+
+          # Inline. No ConfigMap, no PVC, no build step - the point is that a
+          # reviewer can read the failure mode without following three files.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # ------------------------------------------------------------------
+              # PHASE 1 - plant credentials (ROADMAP 4.1.4)
+              # ------------------------------------------------------------------
+              # Twenty iterations, four lines each = 80 lines, plus two below, so
+              # ~82 lines. internal/k8s/telemetry.go reads LogTailLines=100 and
+              # LogLimitBytes=51200, so 82 lines of ~150 bytes (~12 KB) keeps every
+              # planted secret inside the tail window the Sentinel actually
+              # fetches AND under the byte cap. The arithmetic is in the manifest
+              # on purpose: raise the iteration count past ~22 and the first
+              # secrets rotate out of the tail, and the masking assertion
+              # silently weakens from "all five rules" to "a subset".
+              #
+              # Each line targets a DIFFERENT rule class, so one pass proves
+              # several independent rules rather than five copies of one:
+              #   aws_access_key_id / aws_secret_access_key -> rules 2, 3
+              #   jwt                                          -> rule 4
+              #   Authorization: Bearer                        -> rule 5
+              #   postgres://user:pass@host:port               -> rule 6
+              #
+              # DELIBERATELY OMITTED, for the reason given at length in
+              # oom-leak.yaml: any `password=`, `token=` or bare
+              # `secret_access_key=` key=value pair. Those are caught by
+              # `generic_secret_kv` (rule 7), whose replacement template is
+              # `${1}[REDACTED]${3}` over a pattern carrying a named group, and
+              # the numeric index that `${3}` resolves to could not be confirmed
+              # to be the trailing quote rather than the secret itself. Rule 6's
+              # template is verifiably correct (three sibling groups, no nesting).
+              # The masking proof here rests only on unambiguous rules.
+              #
+              # ONE PROPERTY THE SIBLING FIXTURE DOES NOT HAVE, and the reason
+              # this loop matters as much as it does: every instance of this
+              # container plants the IDENTICAL credential set. The Sentinel
+              # fetches logs with `previous: true` (internal/k8s/telemetry.go
+              # PreviousLogsFor returns true for CrashLoopBackOff), so the log it
+              # reads belongs to whichever instance preceded the current one -
+              # and the kubelet may resolve that to any index depending on when
+              # the informer observes the transition. Because all instances
+              # carry the same secrets, the evidence is the same whichever one it
+              # lands on. That is what makes the masking assertion survive a
+              # crash loop; the OOM fixture gets it for free from being
+              # single-shot.
+              i=0
+              while [ "$i" -lt 20 ]; do
+                printf '%s\n' "CHAOS-CRED seq=$i aws_access_key_id=AKIAIOSFODNN7EXAMPLE aws_secret_access_key=\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\""
+                printf '%s\n' "CHAOS-CRED seq=$i jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkNoYW9zIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                printf '%s\n' "CHAOS-CRED seq=$i Authorization: Bearer chaos-planted-bearer-token-0123456789"
+                printf '%s\n' "CHAOS-CRED seq=$i dsn=postgres://chaos_user:Sup3rS3cretPassw0rd@db.production.svc.cluster.local:5432/billing"
+                i=$((i + 1))
+              done
+
+              # ------------------------------------------------------------------
+              # PHASE 2 - fail immediately
+              # ------------------------------------------------------------------
+              # There is no settling phase here, and the absence is the design.
+              # oom-leak.yaml has a five-second settle before it exhausts memory;
+              # that phase exists to force a `Running` status to be published so
+              # the later `Terminated` is a distinct update the informer cannot
+              # miss. This fixture has no such problem, and worse, it must not
+              # have that phase: a delay would make the backoff duration depend
+              # on how long the container lived, and the whole reason this
+              # fixture exists is that the backoff path is a fixed, predictable
+              # sequence. agent/tests/test_chaos_fixtures.py asserts the script
+              # contains no such wait at all.
+              #
+              # FLUSH-BEFORE-EXIT. The concern that motivates the two lines below
+              # is real in general - a crash loop that exits before its output is
+              # flushed prints nothing, and a masking assertion over an empty
+              # string passes vacuously - but it is resolved for THIS shell, and
+              # not by guesswork. busybox 1.36.1 ash flushes on both of the paths
+              # this script could exit by, in the applet source:
+              #
+              #   shell/ash.c:10644  status = (*cmd.builtin)(argc, argv);
+              #                     flush_stdout_stderr();      <- after EVERY builtin
+              #   shell/ash.c:14450 exitreset();
+              #                     setjobctl(0);
+              #                     flush_stdout_stderr();      <- immediately before
+              #                     _exit(exitstatus);          <- process teardown
+              #
+              # `flush_stdout_stderr()` is `fflush_all()` (ash.c:748-754). The
+              # first site means every `printf` above is already durable when it
+              # returns, line by line, long before the exit is reached. The second
+              # is the load-bearing one, and it is not redundant: ash exits via
+              # `_exit()`, not `exit()`, which deliberately SKIPS libc's atexit
+              # stdio cleanup. Without the explicit fflush immediately before it,
+              # a partially-filled stdout buffer WOULD be discarded. busybox does
+              # flush there, so it is not discarded.
+              #
+              # No explicit flush primitive is added, and that is a considered
+              # decision rather than an omission: POSIX sh exposes no way to flush
+              # a stdio stream (the C library's `sync` is a filesystem sync and
+              # would be the wrong tool entirely - it would be cargo-cult
+              # signalling that does nothing for this). The correct mitigation
+              # here is structural rather than invocational, and it is already in
+              # place: the payload uses `exit 1`, a normal termination, so it
+              # takes the ash.c:14450 path. Contrast oom-leak.yaml, which is
+              # SIGKILLed by the cgroup and therefore CANNOT flush - which is a
+              # second, independent reason that fixture keeps a five-second
+              # settle before it allocates.
+              #
+              # The exit code is 1 deliberately. Not 137 (that is 128+SIGKILL and
+              # would classify as OOMKilled), not 0 (a clean exit is a false
+              # negative), not 78 or 143 (a config error or a SIGTERM would give
+              # the Sentinel a more specific and therefore less representative
+              # reading of "the app crashed").
+              printf '%s\n' "CHAOS-PHASE creds-planted next=immediate-non-zero-exit"
+              printf '%s\n' "CHAOS-FATAL deliberate exit 1 to drive the kubelet into exponential backoff"
+              exit 1
+
+          # Restricted-PSA compliant and byte-for-byte equivalent to the sibling
+          # fixture's block, so that a diff between the two files shows only the
+          # payload and the labels. readOnlyRootFilesystem is safe here precisely
+          # because the payload touches no filesystem: it writes to stdout and
+          # exits. (A payload that filled a tmpfs or a scratch volume would die of
+          # ephemeral-storage exhaustion and report `Evicted` - the wrong failure
+          # shape entirely.)
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            limits:
+              # NOT load-bearing here, and the reason is worth stating because it
+              # is the inverse of the OOM fixture. INVARIANT I-A2
+              # (internal/emitter/validate.go:167) requires a non-null
+              # resource_limits.memory_limit ONLY when reason == OOMKilled. This
+              # fixture's reason is CrashLoopBackOff, so the emitter would accept
+              # the payload with no memory limit at all.
+              #
+              # It is set anyway, and only to keep QoS at Burstable. A container
+              # with no requests and no limits is BestEffort, and BestEffort pods
+              # are the first evicted under node memory pressure - which, on a
+              # small k3s node running this fixture alongside the OOM one, would
+              # replace the crash loop we asked for with an `Evicted` pod, the
+              # wrong shape, with no containerStatuses left to classify. A limit
+              # with no request is Burstable and is evicted after Guaranteed and
+              # after Burstable pods consuming more, which is not this one: it
+              # peaks around 2 MB against the OOM fixture's 64 MB.
+              #
+              # No `requests` block, for the same reason as the sibling fixture: a
+              # request would reserve schedulable capacity the fixture does not
+              # need, and on a small node turns a chaos run into a Pending pod -
+              # the exact silent-failure mode ROADMAP 4.1.5 exists to rule out.
+              memory: 64Mi
+
+          # No liveness or readiness probe. A probe would restart the container on
+          # a schedule the fixture does not control, and readiness is meaningless
+          # for a pod whose only goal is to die.
+          # No terminationGracePeriodSeconds: the 30s default applies and is
+          # irrelevant. The container is not waiting out a cooperative shutdown -
+          # it has already exited, and the kubelet is waiting out a backoff timer.
+
+# ===========================================================================
+# TIMELINE - derived from kubelet source, not from observation
+# ===========================================================================
+# Sources (release-1.29, the branch k3s tracks):
+#   pkg/kubelet/kubelet.go:191       backOffPeriod       = 10 * time.Second
+#   pkg/kubelet/kubelet.go:145       MaxContainerBackOff = 300 * time.Second
+#   pkg/kubelet/kubelet.go:849       flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
+#   staging/.../util/flowcontrol/backoff.go:52  NewBackOff -> jitter factor 0.0
+#   staging/.../util/flowcontrol/backoff.go:101 delay = entry.backoff * 2
+#   pkg/kubelet/kuberuntime/kuberuntime_manager.go:1337-1367  doBackOff()
+#   pkg/kubelet/container/sync_result.go:29  ErrCrashLoopBackOff = "CrashLoopBackOff"
+#
+# There is NO jitter (jitter factor 0.0), so these numbers are exact, not ranges.
+#
+# The mechanism, precisely: `doBackOff` calls `IsInBackOffSince(key, finishedAt)`.
+# With no backoff entry yet, that returns FALSE - so the container after the
+# FIRST failure is restarted immediately, and only `Next()` seeds the entry at
+# 10s. From the SECOND failure onward, `IsInBackOffSince` is true, `doBackOff`
+# returns `ErrCrashLoopBackOff`, and that error is what the reason cache turns
+# into `state.waiting.reason`.
+#
+#   inst  restartCount  reason at failure      waits before next start
+#   ----  ------------  ---------------------  ------------------------
+#     0          0      (none; not in backoff)  ~0s   - restarts at once
+#     1          1      CrashLoopBackOff       10s
+#     2          2      CrashLoopBackOff       20s
+#     3          3      CrashLoopBackOff       40s
+#     4          4      CrashLoopBackOff       80s
+#     5          5      CrashLoopBackOff      160s
+#     6          6      CrashLoopBackOff      300s   (capped)
+#     7+         7+     CrashLoopBackOff      300s   (capped)
+#
+# Cumulative, measured from the first container start. Add ~1s for the pod worker
+# sync interval and ~10ms for the script itself; the script is well under 100ms.
+#
+#   t = 0s      inst 0 starts, exits 1.         restartCount 0
+#   t = ~0-1s   inst 1 starts, exits 1.         restartCount 1
+#   t = ~11s     inst 2 starts, exits 1.         restartCount 2
+#   t = ~31s     inst 3 starts, exits 1.         restartCount 3
+#   t = ~71s     inst 4 starts, exits 1.         restartCount 4
+#   t = ~151s    inst 5 starts, exits 1.         restartCount 5
+#   t = ~311s    inst 6+                        restartCount 6+
+#
+# WHERE CrashLoopBackOff FIRST BECOMES OBSERVABLE: at roughly t = 10-11s, with
+# restartCount == 2.
+#
+# Three consequences an e2e runner must not get wrong:
+#
+#   1. DO NOT ASSERT BEFORE ~12s. A test that polls for CrashLoopBackOff with a
+#      5s or 10s deadline will fail against a fixture that is working exactly as
+#      designed. 15s is a safe floor; 20s is comfortable.
+#
+#   2. I-A3 NEEDS restartCount >= 1, and the first real observation has 2, so the
+#      invariant is satisfied with margin. But an assertion of
+#      `restart_count >= 1` is weak enough to be true by accident; assert
+#      `>= 2` to prove the fixture actually went through a backoff rather than
+#      merely restarting once.
+#
+#   3. THE INCIDENT COUNT IS NOT A CONSTANT. The dedup key is
+#      `<podUID>/<containerName>:<restartCount>` (watcher.go DedupKeyFor), so
+#      every restart is a DISTINCT incident and dedup collapses nothing. After
+#      t=10 minutes this pod has emitted roughly 8 incidents, and it will keep
+#      emitting one per 300s forever until deleted. Any assertion of the form
+#      "detections == 2" will pass at t=15s and fail at t=60s for reasons that
+#      have nothing to do with the Sentinel. Assert on a WINDOW ("at least one
+#      CrashLoopBackOff incident with restart_count >= 2 within 60s"), or cap
+#      the observation window, or delete the pod before counting.
+#
+# INTERACTION WITH oom-leak.yaml (both are expected to run at once):
+#
+#   * NO SIGNAL INTERFERENCE. Separate pods, separate cgroups, separate container
+#     instances. The OOM fixture's SIGKILL lands on its own PID 1 only, because
+#     the cgroup OOM killer has exactly one candidate in that cgroup.
+#   * NO MATERIAL RESOURCE CONTENTION. Both are cgroup-bounded (64Mi each),
+#     neither declares a request, so neither reserves node allocatable and the
+#     scheduler's view is unchanged. CPU is ~1-2 MB of resident shell for a few
+#     tens of milliseconds, once per backoff cycle - a decaying duty cycle that
+#     averages well under 1%.
+#   * ONE REAL INTERFERENCE RISK, and it is eviction. The OOM fixture drives the
+#     node's memory cgroups hard and repeatedly. Under genuine node memory
+#     pressure the kubelet ranks candidates by QoS and then by usage over
+#     request; this pod is Burstable with no request and peaks at ~2 MB, so it
+#     is a better-ranked candidate than the OOM pod only by virtue of being
+#     small. If the node is undersized for the pair, this pod is a plausible
+#     Evicted - and eviction clears containerStatuses, so classify() would see
+#     nothing at all and the run would read as a silent no-op. This is why the
+#     64Mi limit above is present even though I-A2 does not require it: it keeps
+#     this pod out of the BestEffort eviction queue.
+#   * ONE INTERFERENCE THAT IS NOT RESOURCE-BUT-IS-STILL-REAL: the growing
+#     incident stream described in point 3 above. Both fixtures feed the same
+#     egress, and an exact-count assertion written for the OOM fixture (which
+#     emits a bounded number) will not transfer to this one.

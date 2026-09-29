@@ -139,13 +139,13 @@ jobs:
           echo "no GPU dependencies declared"
 
       - name: G4 — black
-        run: black --check agent/
+        run: black --check agent/ tests/
 
       - name: G5 — flake8
-        run: flake8 agent/
+        run: flake8 agent/ tests/
 
       - name: G6 — mypy --strict
-        run: mypy --strict agent/
+        run: mypy --strict agent/ tests/
 
       - name: Python unit tests
         run: pytest agent/tests/ -q

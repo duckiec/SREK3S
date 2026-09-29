@@ -49,11 +49,35 @@ _VERSION_BRANCH_MESSAGE: Final[str] = (
 )
 
 
+#: Directories whose Python sources must parse on 3.11.
+#:
+#: ``agent/`` because that is what the image ships. ``tests/`` because both of
+#: its subtrees were added to the black/flake8/mypy gates for Milestone 4, and a
+#: gate that covers a file inconsistently is worse than one that does not cover
+#: it at all - the omission is invisible at the call site.
+#:
+#: The reason this matters is measured, not assumed. ``mypy --strict`` catches
+#: PEP 695 but **silently accepts PEP 701** - a probe with a backslash inside an
+#: f-string expression reported ``Success`` under ``--python-version 3.11``,
+#: because mypy's parser is the host interpreter's. So extending the type gate
+#: did not extend the 3.11 protection; only this scan does.
+#:
+#: Add a directory here only alongside adding it to the CI gate invocations.
+#: A source list and a gate list that disagree produce a file that one of them
+#: silently omits.
+_GATED_DIRS: Final[tuple[Path, ...]] = (
+    _AGENT_DIR,
+    _REPO_ROOT / "tests" / "benchmarks",
+    _REPO_ROOT / "tests" / "e2e",
+)
+
+
 def _sources() -> list[Path]:
-    """Every module the image ships, excluding caches and this test's siblings."""
+    """Every gated module, excluding caches and this test's siblings."""
     return sorted(
         path
-        for path in _AGENT_DIR.rglob("*.py")
+        for directory in _GATED_DIRS
+        for path in directory.rglob("*.py")
         if "__pycache__" not in path.parts and path.name != "test_compat.py"
     )
 

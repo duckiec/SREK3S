@@ -1,0 +1,58 @@
+# SREK3S chaos namespace (ROADMAP 4.1.1) - the blast-radius guardrail.
+#
+# This namespace exists so that deterministic failure fixtures can be applied
+# somewhere it is unambiguous that they belong. Everything in this project that
+# produces a *guaranteed* fault - a container that always OOMs, a container that
+# always exits non-zero - is dangerous applied anywhere real, so the fixtures are
+# pinned here and the Sentinel is expected to be pointed at this namespace alone
+# (ROADMAP 4.1.5).
+#
+# The guardrail has three parts, and all three matter:
+#
+#   1. **A distinct namespace.** Not `default`, not `srek3s-system`. A fixture
+#      applied into the system namespace would be caught by the same NetworkPolicy
+#      and RBAC that protect production, and would be shut down by the first
+#      legitimate redeploy.
+#   2. **Pod Security `restricted`, enforced.** The chaos pods are as hardened as
+#      the production ones - non-root, read-only rootfs, all capabilities dropped.
+#      A chaos fixture that ran privileged would be a privilege-escalation test
+#      nobody asked for, running in a namespace whose whole purpose is to be
+#      disposable.
+#   3. **A label that identifies it as chaos.** `srek3s.io/chaos: enabled` on the
+#      namespace, so a NetworkPolicy or a cleanup script can target every fixture
+#      at once. A namespace label is the one selector that cannot drift out of
+#      sync with its contents the way per-pod labels can.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel-chaos
+  labels:
+    app.kubernetes.io/part-of: srek3s
+    # Identifies the namespace as disposable. Anything that deletes, scales, or
+    # network-restricts should match on this.
+    srek3s.io/chaos: enabled
+
+    # Enforced, not merely warned. The chaos fixtures are `restricted`-compliant
+    # by construction, so enforcement costs nothing and buys a hard failure if a
+    # future fixture forgets a field. `privileged` here would admit a root
+    # container into a namespace whose purpose is to be deleted without thought.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+    # A cleanup script matches on this. There is no cleanup controller in this
+    # repository yet; ROADMAP 4.1.1 asks for a cleanup policy, and this label is
+    # the hook it will use. Recording it now means the selector is decided before
+    # a script depends on it.
+    srek3s.io/cleanup: manual
+
+  annotations:
+    # Human-readable warning for anyone who runs `kubectl get ns` and wonders what
+    # this is. Cheap, and it is the difference between a namespace nobody deletes
+    # and one that gets deleted by someone who did not read the manifest.
+    srek3s.io/warning: >-
+      Disposable. Contains workloads that OOM and crash on purpose. Point the
+      Sentinel at this namespace only (WATCH_NAMESPACE=sentinel-chaos). Safe to
+      delete with `kubectl delete namespace sentinel-chaos`; nothing in
+      srek3s-system references it.
