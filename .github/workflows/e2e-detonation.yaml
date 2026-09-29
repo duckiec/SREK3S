@@ -222,42 +222,82 @@ jobs:
           exit 1
 
       # ---------------------------------------------------------------
-      # 5. Import busybox so `imagePullPolicy: Never` can be satisfied.
+      # 5. Get busybox into the k3s containerd namespace.
       #
-      # k3s's containerd namespace is NOT the `k8s.io` namespace the kubelet reads
-      # from. An image imported without `--namespace k8s.io` lands somewhere the
-      # kubelet never looks, and every fixture pod then reports ImagePullBackOff
-      # on a cluster that has the image. That is the single most common failure in
-      # this workflow and it looks like a network problem rather than a namespace
-      # mistake, so the verification step below is not optional.
+      # Split into three named steps on purpose. The previous version was one step
+      # running `docker pull`, `docker save` and `k3s ctr images import` under
+      # `set -e`, so the first failure aborted the step and the conclusion said
+      # only "Import busybox" - three commands, one answer. CI logs need repository
+      # admin rights and return 403 unauthenticated, so a step's *name* is the
+      # finest diagnostic available. Three steps means the failing name says which
+      # half broke, without anyone reading a log.
       # ---------------------------------------------------------------
-      - name: Import busybox into the k8s.io containerd namespace
+      - name: Pull and Archive Busybox Image
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          docker pull "$BUSYBOX_IMAGE"
-          docker save "$BUSYBOX_IMAGE" -o /tmp/busybox.tar
-          # `--namespace k8s.io`, not `--all-namespaces`: this is a running
-          # cluster, and an explicit namespace is idempotent and visible.
-          k3s ctr images import /tmp/busybox.tar --namespace k8s.io
+          # public.ecr.aws, not Docker Hub. Anonymous Docker Hub pulls are limited
+          # to 100/hour *per source IP* and GitHub runners share IPs, so a pull
+          # that works from a workstation fails intermittently in CI - the worst
+          # shape for a gate, because it is not reproducible. ECR Public serves the
+          # same official image with no such ceiling. Tag existence is asserted
+          # rather than assumed: this path was checked before it was written
+          # because a mirror path guessed from memory is exactly the sort of thing
+          # that is right until it is not.
+          MIRROR="public.ecr.aws/docker/library/busybox:1.36.1"
+          docker pull "$MIRROR"
 
-      - name: Verify the image is where the kubelet looks
+          # Both names, and both are needed. The fixtures reference
+          # `busybox:1.36.1`, which containerd normalises to
+          # `docker.io/library/busybox:1.36.1`. Importing only the mirror name
+          # leaves the kubelet unable to resolve the reference, and the failure
+          # presents as ImagePullBackOff on a cluster that visibly has the image -
+          # which reads as a network problem and is not one.
+          docker tag "$MIRROR" busybox:1.36.1
+          docker tag "$MIRROR" docker.io/library/busybox:1.36.1
+          docker save busybox:1.36.1 docker.io/library/busybox:1.36.1 -o /tmp/busybox.tar
+
+          # A successful `docker save` that wrote nothing is not worth
+          # discovering two steps later.
+          test -s /tmp/busybox.tar || {
+            echo "::error::docker save produced no archive"
+            exit 1
+          }
+          echo "archive: $(du -h /tmp/busybox.tar | cut -f1)"
+
+      - name: Import Image into k3s containerd
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          echo "--- images in k8s.io ---"
-          k3s ctr images ls --namespace k8s.io | grep -i busybox || {
+          # `sudo` is mandatory, not stylistic. /run/k3s/containerd/containerd.sock
+          # is root-only, so an unprivileged `k3s ctr` cannot reach the daemon the
+          # kubelet reads from and fails with a permission error that looks like a
+          # containerd problem. The previous step did not use sudo and would have
+          # failed here for that reason alone.
+          sudo k3s ctr images import /tmp/busybox.tar --namespace k8s.io
+
+      - name: Verify k3s Image Registration
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # The namespace matters more than it looks. k3s containerd's default
+          # namespace is not the `k8s.io` namespace the kubelet reads from, and an
+          # image imported anywhere else produces ImagePullBackOff on a cluster
+          # that has it. So this asserts the name AND the namespace.
+          sudo k3s ctr images list --namespace k8s.io | grep busybox || {
             echo "::error::busybox is not present in the k8s.io namespace"
+            sudo k3s ctr images list --namespace k8s.io || true
             exit 1
           }
-          # A `docker.io/library/...` line here means the tag was not registered
-          # under the name the fixtures reference, and every apply will fail with
-          # ImagePullBackOff.
-          k3s ctr images ls --namespace k8s.io | grep -q 'docker.io/library/busybox:1.36.1' || {
-            echo "::error::busybox did not register as docker.io/library/busybox:1.36.1"
-            k3s ctr images ls --namespace k8s.io | grep -i busybox
+          # And the fully-qualified form, which is what the fixture's `busybox:1.36.1`
+          # actually resolves to.
+          sudo k3s ctr images list --namespace k8s.io \
+            | grep -q 'docker.io/library/busybox:1.36.1' || {
+            echo "::error::busybox did not register as docker.io/library/busybox:1.36.1; the fixtures will report ImagePullBackOff"
+            sudo k3s ctr images list --namespace k8s.io | grep -i busybox || true
             exit 1
           }
-          echo "busybox registered correctly"
+          echo "busybox registered in k8s.io under the name the fixtures reference"
 
       # ---------------------------------------------------------------
       # 6. The disposable namespace, and its PSA enforcement.
