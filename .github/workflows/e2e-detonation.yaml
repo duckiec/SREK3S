@@ -359,20 +359,33 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          # Asserts the same namespace the pull wrote to. Namespace and reference
-          # name are both checked because either one wrong produces the identical
+          # The output is captured FIRST and matched from the variable, with no
+          # pipe. `producer | grep -q` is a race: grep -q exits the moment it
+          # finds a match and closes the read end, the writer takes SIGPIPE and
+          # dies with status 141, and `set -o pipefail` hands that 141 to the
+          # pipeline - so the `||` branch fires and a *passing* check reports
+          # failure. Measured on this host: 60 failures in 60 runs piped, 0 in 60
+          # with the output captured first. Six of these assertions used that
+          # form; all six are now unpiped.
+          list=$(sudo k3s ctr --timeout 30s --namespace k8s.io images list) || {
+            echo "::error::could not list images in the k8s.io namespace"
+            exit 1
+          }
+          # Same namespace the pull wrote to. Namespace and reference name are
+          # both checked because either one wrong produces the identical
           # symptom - ImagePullBackOff - from a different cause.
-          sudo k3s ctr --namespace k8s.io images list | grep -q busybox || {
+          grep -q busybox <<<"$list" || {
             echo "::error::busybox is not present in the k8s.io namespace"
-            sudo k3s ctr --namespace k8s.io images list || true
+            echo "$list"
             echo "--- is it in the default namespace instead? ---"
             sudo k3s ctr images list | grep busybox || true
             exit 1
           }
-          sudo k3s ctr --namespace k8s.io images list \
-            | grep -q 'docker.io/library/busybox:1.36.1' || {
+          # -F: the reference is a literal, and the dots in `docker.io` are not
+          # a pattern to be interpreted.
+          grep -qF 'docker.io/library/busybox:1.36.1' <<<"$list" || {
             echo "::error::busybox did not register as docker.io/library/busybox:1.36.1; the fixtures will report ImagePullBackOff"
-            sudo k3s ctr --namespace k8s.io images list | grep -i busybox || true
+            grep -i busybox <<<"$list" || true
             exit 1
           }
           echo "busybox registered in k8s.io under the name the fixtures reference"
@@ -418,10 +431,18 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
-            | grep -q 'pod-security\.kubernetes\.io/enforce: restricted' || {
+          # Captured first, matched from the variable, no pipe. `kubectl |
+          # grep -q` is a SIGPIPE race under `set -o pipefail`: grep exits at
+          # the match, kubectl dies with 141, and the pipeline reports failure
+          # on a check that passed. Measured here at 60/60 piped versus 0/60
+          # unpiped. See the image-registration step for the full account.
+          ns=$(kubectl get ns "$CHAOS_NAMESPACE" -o yaml) || {
+            echo "::error::could not read namespace $CHAOS_NAMESPACE"
+            exit 1
+          }
+          grep -q 'pod-security\.kubernetes\.io/enforce: restricted' <<<"$ns" || {
             echo "::error::pod-security.kubernetes.io/enforce is not restricted; a chaos pod could be admitted privileged"
-            kubectl get ns "$CHAOS_NAMESPACE" -o yaml | grep -A 8 'labels:' || true
+            grep -A 8 'labels:' <<<"$ns" || true
             exit 1
           }
           echo "  ok: enforce=restricted"
@@ -435,10 +456,13 @@ jobs:
           # `enforce-version` appearing with any value - the check would pass on a
           # namespace that had not opted into a version at all. The backslash in the
           # pattern anchors the `.` characters as literals.
-          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
-            | grep -q 'pod-security\.kubernetes\.io/enforce-version: latest' || {
+          ns=$(kubectl get ns "$CHAOS_NAMESPACE" -o yaml) || {
+            echo "::error::could not read namespace $CHAOS_NAMESPACE"
+            exit 1
+          }
+          grep -q 'pod-security\.kubernetes\.io/enforce-version: latest' <<<"$ns" || {
             echo "::error::pod-security.kubernetes.io/enforce-version is not latest; PSA would evaluate against an unpinned version"
-            kubectl get ns "$CHAOS_NAMESPACE" -o yaml | grep -A 8 'labels:' || true
+            grep -A 8 'labels:' <<<"$ns" || true
             exit 1
           }
           echo "  ok: enforce-version=latest"
@@ -447,8 +471,11 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
-            | grep -q 'pod-security\.kubernetes\.io/audit: restricted' || {
+          ns=$(kubectl get ns "$CHAOS_NAMESPACE" -o yaml) || {
+            echo "::error::could not read namespace $CHAOS_NAMESPACE"
+            exit 1
+          }
+          grep -q 'pod-security\.kubernetes\.io/audit: restricted' <<<"$ns" || {
             echo "::error::pod-security.kubernetes.io/audit is not restricted; a violation would leave no record"
             exit 1
           }
@@ -458,8 +485,11 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          kubectl get ns "$CHAOS_NAMESPACE" -o yaml \
-            | grep -q 'pod-security\.kubernetes\.io/warn: restricted' || {
+          ns=$(kubectl get ns "$CHAOS_NAMESPACE" -o yaml) || {
+            echo "::error::could not read namespace $CHAOS_NAMESPACE"
+            exit 1
+          }
+          grep -q 'pod-security\.kubernetes\.io/warn: restricted' <<<"$ns" || {
             echo "::error::pod-security.kubernetes.io/warn is not restricted; a violation would pass unannounced"
             exit 1
           }

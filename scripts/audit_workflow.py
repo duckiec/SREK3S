@@ -47,7 +47,10 @@ import argparse
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from typing import Any, Final
 
 import yaml
@@ -145,7 +148,7 @@ def audit_job(job_name: str, job: dict[str, Any], audit: Audit) -> None:
             f"with no timeout-minutes; the job budget is a backstop, not a control",
         )
     else:
-        print(f"  [ok] every blocking step carries its own timeout-minutes")
+        print("  [ok] every blocking step carries its own timeout-minutes")
 
     # --- 2. pipefail ------------------------------------------------------
     for i, step in enumerate(steps):
@@ -207,9 +210,7 @@ def audit_job(job_name: str, job: dict[str, Any], audit: Audit) -> None:
         # one - so a server command inside the install step itself, which is
         # exactly the `kubectl version` defect this check was written for, was
         # never flagged. The control below is what exposed it.
-        self_provisions = any(
-            tok in run for tok in PROVISIONING
-        )
+        self_provisions = any(tok in run for tok in PROVISIONING)
         provisions_after = [
             j
             for j, s in enumerate(steps)
@@ -290,7 +291,9 @@ def audit_job(job_name: str, job: dict[str, Any], audit: Audit) -> None:
     # flagged it, and an audit that cries wolf on the one path it was told about
     # is an audit that gets switched off.
     runtime_only = ("deploy/payments/",)
-    for match in sorted(set(re.findall(r"[\w./-]+\.(?:py|yaml|yml|json|mod)", all_runs))):
+    for match in sorted(
+        set(re.findall(r"[\w./-]+\.(?:py|yaml|yml|json|mod)", all_runs))
+    ):
         if match.startswith(("/", "http", ".")):
             continue
         if not match.startswith(repo_roots):
@@ -303,6 +306,81 @@ def audit_job(job_name: str, job: dict[str, Any], audit: Audit) -> None:
                 "FAIL",
                 f"{job_name} references {match}, which does not exist in the "
                 f"repository",
+            )
+
+
+def find_bash() -> str | None:
+    """Locate a bash, including the one Git ships on Windows.
+
+    Returns None when none is found, which is a *reported* skip rather than a
+    silent pass: see :func:`check_bash_syntax`.
+    """
+    for candidate in ("bash", "sh"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    if os.name == "nt":
+        for relative in (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ):
+            if os.path.exists(relative):
+                return relative
+    return None
+
+
+def check_bash_syntax(job_name: str, job: dict[str, Any], audit: Audit) -> None:
+    """Parse every ``run:`` block with ``bash -n``.
+
+    This exists because four CI failures in a row were shell defects that a
+    human would have caught by reading a log - a ``kubectl`` that contacted the
+    apiserver before it existed, a containerd socket used without ``sudo``, a
+    script path that was not in the working directory, and a ``producer | grep
+    -q`` that is a SIGPIPE race under ``set -o pipefail`` and reports failure on
+    a check that passed. None of them is a semantic bug; all of them are
+    unparseable or subtly wrong shell, and both are cheap to catch before the
+    run rather than after.
+
+    A missing bash is a WARN, not a pass. A silently-skipped check is
+    indistinguishable from a check that ran, and this repository has already
+    shipped one gate that did not do what its name said.
+    """
+    bash = find_bash()
+    if bash is None:
+        audit.add(
+            "BASH_SYNTAX",
+            "WARN",
+            "{}: no bash found; cannot parse run: blocks".format(job_name),
+        )
+        return
+
+    for step in job.get("steps", []):
+        script = step.get("run")
+        if not script:
+            continue
+        # GitHub substitutes ${{ ... }} before the shell sees the script. A
+        # benign literal keeps the parse faithful to what actually executes.
+        source = re.sub(r"\$\{\{[^}]*\}\}", "X", str(script).replace("\r\n", "\n"))
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", encoding="utf-8", delete=False, newline="\n"
+        ) as handle:
+            handle.write(source)
+            path = handle.name
+        try:
+            completed = subprocess.run(
+                [bash, "-n", path], capture_output=True, text=True, check=False
+            )
+        finally:
+            os.unlink(path)
+        if completed.returncode != 0:
+            audit.add(
+                "BASH_SYNTAX",
+                "FAIL",
+                "{}: {}".format(
+                    name_of(step),
+                    " / ".join((completed.stderr or "").strip().splitlines()[:3]),
+                ),
             )
 
 
@@ -326,10 +404,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n########## {path.name} ##########")
         for job_name, job in doc.get("jobs", {}).items():
             audit_job(job_name, job, audit)
+            check_bash_syntax(job_name, job, audit)
 
     print("\n=== findings ===")
     print(audit.report())
-    print(f"\n  FAIL: {len(audit.failures)}   WARN: {len(audit.findings) - len(audit.failures)}")
+    print(
+        "\n  FAIL: {}   WARN: {}".format(
+            len(audit.failures), len(audit.findings) - len(audit.failures)
+        )
+    )
 
     if audit.failures:
         return 1
