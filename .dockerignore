@@ -22,6 +22,41 @@
 .git/
 .github/
 
+# Credentials. .gitignore already keeps these out of git, which is a different
+# channel entirely: the build context is uploaded to the Docker daemon on every
+# `docker build -f agent/Dockerfile .`, and ci.yaml L212 does exactly that. A file
+# that .gitignore protects is still shipped in the context unless this list says
+# otherwise, so the two have to be kept in step deliberately rather than assumed.
+#
+# No COPY in agent/Dockerfile reaches the repository root - the sources are
+# ${PYTHON_DEPS} and agent/ alone - so none of this was ever baked into a layer.
+# The exposure was the upload itself, which matters more the moment a build runs
+# against a remote or cloud builder instead of the local daemon.
+opencode.json
+.mcp.json
+.env*
+!.env.example
+!.env.sample
+!.env.template
+kubeconfig
+kubeconfig.yaml
+*.kubeconfig
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.aws/
+.gcloud/
+credentials.json
+service-account*.json
+.netrc
+.npmrc
+.pypirc
+secrets.yaml
+secrets.yml
+
 # Test fixtures are not needed at runtime
 tests/
 
