@@ -745,9 +745,13 @@ jobs:
         timeout-minutes: 10
         run: |
           set -uo pipefail
-          # Waits for the background runner started before the fixture and
-          # reports its verdict. `wait` is unavailable across steps, so that
-          # step wrote the exit code to a file.
+          # This step exits 0 even when the runner fails, and that is deliberate.
+          # It ran with `exit "$rc"` and the eleven invariant steps behind it were
+          # all SKIPPED - GitHub skips the remainder of a job after a failing step,
+          # so the one mechanism built to name the failing invariant never ran.
+          # The verdict belongs to the invariant steps; this one only produces
+          # the log they read. A runner failure nothing explains is caught by the
+          # "Runner verdict" step after them.
           deadline=$((SECONDS + 420))
           while [ ! -f /tmp/runner.exit ]; do
             if [ "$SECONDS" -ge "$deadline" ]; then
@@ -758,9 +762,7 @@ jobs:
             sleep 2
           done
           cat /tmp/runner.log
-          rc=$(cat /tmp/runner.exit)
-          echo "runner exit code: $rc"
-          exit "$rc"
+          echo "runner exit code: $(cat /tmp/runner.exit) (reported by the steps that follow)"
 
       # ---------------------------------------------------------------
       # 10. The patch, verified against a real repository.
@@ -976,6 +978,26 @@ jobs:
             exit 1
           fi
           echo "  ok: Enough samples to see a chain at all"
+
+      - name: "Runner verdict (catches failures no invariant explains)"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # Last line of defence, and it exists because the step above now
+          # exits 0. The eleven invariant steps each match one failure text; a
+          # runner that died on a bad JSON line, a kubectl error or an
+          # unhandled exception would leave all of them green. This catches that,
+          # and it is ordered last so a specific invariant failure is the step a
+          # reviewer sees - a failing step skips the rest of the job.
+          rc=$(cat /tmp/runner.exit 2>/dev/null || echo 1)
+          if [ "$rc" != "0" ]; then
+            echo "::error::the runner exited $rc but no invariant step reported a failure."
+            echo "::error::The failure is outside the eleven invariants - likely a crash,"
+            echo "::error::a kubectl error, or an unreadable capture file."
+            tail -20 /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: the runner returned 0 and every invariant held"
 
 
       - name: Agent log (for triage on failure)
