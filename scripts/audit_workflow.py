@@ -462,6 +462,45 @@ def check_multicommand_if(job_name: str, job: dict[str, Any], audit: Audit) -> N
                 )
 
 
+def check_agent_url_is_a_root(job_name: str, job: dict[str, Any], audit: Audit) -> None:
+    """Reject an ``-agent-url`` that carries a path.
+
+    ``emitter.New`` computes ``incidentsURL: baseURL + IncidentsPath``, where
+    ``IncidentsPath`` is ``/v1/incidents``. So the flag is the agent's *root* and
+    a path on it produces a doubled path - ``http://host/api/v1/triage/v1/incidents``
+    - which the agent 404s.
+
+    Worth a check because the failure is close to invisible in CI: the capture
+    proxy records the exchange whatever the upstream status, so the capture file
+    is non-empty, every invariant has a real payload to examine, and the only
+    symptom is an ``upstream_status`` of 404 in a line nobody reads. Two E2E runs
+    were spent establishing that.
+    """
+    for step in job.get("steps", []):
+        script = str(step.get("run") or "")
+        for line in script.replace("\r\n", "\n").split("\n"):
+            match = re.search(r"-agent-url\s+(\S+)", line)
+            if not match:
+                continue
+            url = match.group(1)
+            # Strip the scheme, then the authority - everything up to the first
+            # slash. Stripping the authority by splitting on ":" instead would
+            # truncate the path too, so `http://host:8001/v1/incidents` would
+            # look like a bare host and pass. That is the exact form this
+            # workflow uses, and the first version of this check missed it.
+            remainder = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", url)
+            remainder = re.sub(r"^[^/]*", "", remainder, count=1).rstrip("/")
+            if remainder:
+                audit.add(
+                    "AGENT_URL_PATH",
+                    "FAIL",
+                    "{}: -agent-url is {!r}, but the emitter appends "
+                    "/v1/incidents to it; pass the agent root only".format(
+                        name_of(step), url
+                    ),
+                )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -484,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_job(job_name, job, audit)
             check_bash_syntax(job_name, job, audit)
             check_multicommand_if(job_name, job, audit)
+            check_agent_url_is_a_root(job_name, job, audit)
 
     print("\n=== findings ===")
     print(audit.report())

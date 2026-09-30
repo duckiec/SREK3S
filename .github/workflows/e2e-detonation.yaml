@@ -610,6 +610,16 @@ jobs:
       # flag value. Before the M4 fix these were the same string while the
       # informer ignored the flag entirely, and the log was simply untrue - so
       # checking the flag would have passed against a cluster-wide watch.
+      #
+      # -agent-url is the agent's ROOT, not an endpoint. The emitter appends
+      # IncidentsPath ("/v1/incidents") to it - emitter.go builds
+      # `incidentsURL: baseURL + IncidentsPath` - so this flag must not carry a
+      # path of its own. It briefly did: repointing the Sentinel at the capture
+      # proxy kept the old alias path and produced
+      # /api/v1/triage/v1/incidents, which the agent 404s. The proxy recorded
+      # the exchange anyway, which is why this cost two runs to find rather than
+      # one: the capture was non-empty and every invariant had something real to
+      # chew on, just from a payload the agent had never validated.
       # ---------------------------------------------------------------
       - name: Start the Sentinel, scoped to the chaos namespace
         timeout-minutes: 5
@@ -617,7 +627,7 @@ jobs:
           set -euo pipefail
           ./bin/sentinel \
             -namespace "$CHAOS_NAMESPACE" \
-            -agent-url http://127.0.0.1:8001/api/v1/triage \
+            -agent-url http://127.0.0.1:8001 \
             -log-level info \
             > /tmp/sentinel.log 2>&1 &
           echo $! > /tmp/sentinel.pid

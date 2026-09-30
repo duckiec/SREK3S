@@ -77,36 +77,82 @@ func TestLogsPassesTheBoundsToTheAPI(t *testing.T) {
 	}
 }
 
-// TestLogsSetsPreviousForBothIncidentShapes is the point of the Previous flag.
+// TestPreviousLogsForFollowsTheContainerState is the point of the Previous flag.
 //
-// For an OOMKill the container that died may already have been replaced; for a
-// CrashLoopBackOff the live instance is the one kubelet keeps failing to start,
-// which is blank by construction. Both cases need the *previous* instance, and
-// getting it wrong returns a blank log with no error - the worst outcome for
-// evidence collection.
-func TestLogsSetsPreviousForBothIncidentShapes(t *testing.T) {
+// The two incident shapes point in OPPOSITE directions, which is why this was
+// wrong for two runs of the E2E detonation and why a comment that said "both
+// cases need the previous instance" was never questioned:
+//
+//   - OOMKilled: the current instance is the one that died. `previous` must be
+//     false. On a first crash there is no previous instance and the kubelet
+//     errors; on a later crash it serves an older instance's log, which is
+//     evidence about a different failure.
+//   - CrashLoopBackOff: the current instance is one kubelet cannot start, and it
+//     is blank. The dead instance is the previous one. `previous` must be true.
+//
+// Getting the Terminated case wrong is quiet, which is why it survived: the
+// fetch fails, `Logs` returns an empty body without an error the caller treats
+// as fatal, and an empty body passes "no secret survived" vacuously while
+// failing "something was masked".
+func TestPreviousLogsForFollowsTheContainerState(t *testing.T) {
 	cases := []struct {
 		kind     FailureKind
 		previous bool
+		why      string
 	}{
-		{FailureOOMKilled, true},
-		{FailureCrashLoopBackOff, true},
-		{FailureKind("Terminated"), true},
-		{FailureKind("SomethingElse"), false},
+		{FailureOOMKilled, false, "the current instance is the one that died"},
+		{FailureCrashLoopBackOff, true, "the current instance is blank; the dead one is previous"},
+		{FailureKind("Terminated"), false, "same as OOMKilled: terminated now, not waiting"},
+		{FailureKind("SomethingElse"), false, "unknown shapes must not silently read the wrong instance"},
 	}
 	for _, tc := range cases {
 		if got := PreviousLogsFor(tc.kind); got != tc.previous {
-			t.Errorf("PreviousLogsFor(%q) = %v, want %v", tc.kind, got, tc.previous)
+			t.Errorf("PreviousLogsFor(%q) = %v, want %v (%s)", tc.kind, got, tc.previous, tc.why)
 		}
 	}
+}
 
-	client := newFakeClient(newPod("prev", withStatus(oomKilled(1))))
-	telemetry := NewTelemetry(client)
-	if _, err := telemetry.Logs(newCtx(t), "payments", "prev", "checkout-api", true); err != nil {
-		t.Fatalf("Logs failed: %v", err)
+// TestPreviousLogsForIsNotConstant is the negative control.
+//
+// A constant function - the bug this replaces - passes every row of the table
+// above except one. Asserting the two shapes disagree is what makes the table
+// a test rather than a restatement of the implementation.
+func TestPreviousLogsForIsNotConstant(t *testing.T) {
+	terminated := PreviousLogsFor(FailureOOMKilled)
+	waiting := PreviousLogsFor(FailureCrashLoopBackOff)
+	if terminated == waiting {
+		t.Fatalf(
+			"PreviousLogsFor returned %v for both Terminated and Waiting; one of "+
+				"the two shapes is guaranteed to read the wrong container instance",
+			terminated,
+		)
 	}
-	if opts := lastLogOptions(t, client); !opts.Previous {
-		t.Error("Previous = false; the crash log was not requested")
+}
+
+// TestLogsPassesTheDecidedPreviousThrough proves the decision reaches the wire,
+// not just the unit under test.
+func TestLogsPassesTheDecidedPreviousThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		kind     FailureKind
+		wantPrev bool
+	}{
+		{"terminated", FailureOOMKilled, false},
+		{"crashloop", FailureCrashLoopBackOff, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeClient(newPod("prev-"+tc.name, withStatus(oomKilled(1))))
+			telemetry := NewTelemetry(client)
+			if _, err := telemetry.Logs(
+				newCtx(t), "payments", "prev-"+tc.name, "checkout-api",
+				PreviousLogsFor(tc.kind),
+			); err != nil {
+				t.Fatalf("Logs failed: %v", err)
+			}
+			if opts := lastLogOptions(t, client); opts.Previous != tc.wantPrev {
+				t.Errorf("PodLogOptions.Previous = %v, want %v", opts.Previous, tc.wantPrev)
+			}
+		})
 	}
 }
 

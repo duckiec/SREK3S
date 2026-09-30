@@ -201,19 +201,37 @@ func (b *boundedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// PreviousLogsFor reports whether the previous container instance holds the
-// evidence.
+// PreviousLogsFor reports whether the evidence lives in the *previous*
+// container instance.
 //
-// Every incident this watcher emits is either Terminated or Waiting, and in both
-// cases the live instance is blank, so this is currently always true. It is a
-// named function rather than an inline constant so that the reasoning is testable
-// and so a future incident shape that *is* running gets the right answer instead of
-// inheriting a hardcoded true.
+// `previous` tells the kubelet to serve the log of the instance before the
+// current one. Which instance holds the evidence depends entirely on what the
+// container is doing at the moment of the fetch, and the two cases point in
+// opposite directions:
+//
+//   - Terminated (OOMKilled): the current instance IS the one that died, and
+//     its log is served without `previous`. Asking for the previous instance
+//     either fails outright - on a first crash there is none - or, on a later
+//     crash, silently serves an OLDER instance's log, which is evidence about
+//     a different failure entirely.
+//   - Waiting{CrashLoopBackOff}: the current instance is the one the kubelet
+//     keeps failing to start, and it is blank by construction. The dead
+//     instance is the previous one, so `previous` is correct.
+//
+// This returned true for both shapes, which asked every OOMKilled incident for
+// the wrong instance's log. The failure is quiet: `Logs` reports a fetch error
+// as empty logs, an empty log trivially contains no surviving secret, and it
+// carries no mask marker either - so the redaction assertion fails with
+// "nothing was masked" on a pipeline that is working perfectly. That is the
+// signature the E2E detonation reported.
 func PreviousLogsFor(kind FailureKind) bool {
 	switch kind {
-	case FailureOOMKilled, FailureCrashLoopBackOff, FailureKind("Terminated"):
+	case FailureCrashLoopBackOff:
 		return true
 	default:
+		// OOMKilled, Terminated, and anything this watcher does not yet emit.
+		// Defaulting to true is the safe-looking choice and is the unsafe one:
+		// it is the value that silently reads the wrong instance.
 		return false
 	}
 }
