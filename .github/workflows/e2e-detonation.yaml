@@ -510,6 +510,41 @@ jobs:
       # in-process, where a provider can be injected. Both are checked; neither is
       # assumed to cover the other.
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # 7. The pre-flight cluster snapshot (ROADMAP 4.2.8).
+      #
+      # Taken by the runner's OWN --snapshot-out, not by a `kubectl get ... -o
+      # yaml` redirect. Two reasons, both mechanical:
+      #
+      #  * --snapshot-out is a separate exit path that writes the runner's
+      #    snapshot schema and returns immediately, which is what enforces that
+      #    the before-image predates the components under test.
+      #  * snapshot_cluster() records generation and resourceVersion keyed by
+      #    apiVersion/kind/namespace/name. Raw kubectl YAML is a different shape,
+      #    and _load_snapshot would reject it as corrupt - which it would be
+      #    right to do.
+      #
+      # Its own help text says: "Must be written by --snapshot-out, in a step
+      # that predates the component under test."
+      #
+      # SNAPSHOT_KINDS is the workload kinds, not `all` plus RBAC: the comparison
+      # ignores the chaos and system namespaces and needs the objects a
+      # remediation could plausibly change.
+      # ---------------------------------------------------------------
+      - name: Take Pre-Flight Cluster Snapshot
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PYTHONUNBUFFERED=1 python tests/e2e/runner.py \
+            --snapshot-out /tmp/snapshot-before.yaml
+          if [ ! -s /tmp/snapshot-before.yaml ]; then
+            echo "::error::the pre-flight snapshot is empty. An empty before-image"
+            echo "::error::compared against an empty after-image passes every"
+            echo "::error::no-mutation assertion while proving nothing."
+            exit 1
+          fi
+          echo "snapshot: $(grep -c '"resourceVersion"' /tmp/snapshot-before.yaml) objects"
+
       - name: Start the triage agent
         timeout-minutes: 5
         run: |
@@ -520,6 +555,7 @@ jobs:
           # writes to /tmp/sentinel.log separately, but the agent's does not.
           SREK3S_SANDBOX=1 \
           SREK3S_LOG_LEVEL=INFO \
+          SREK3S_MANIFEST_ROOT="$PWD" \
           PYTHONUNBUFFERED=1 \
           PYTHONPATH="$PWD/agent" \
             nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
@@ -685,6 +721,9 @@ jobs:
               --namespace "$CHAOS_NAMESPACE" \
               --observe-seconds "${OBSERVATION_WINDOW:-90}" \
               --incident-file /tmp/captured_incidents.jsonl \
+              --manifest deploy/chaos/oom-leak.yaml \
+              --snapshot-before /tmp/snapshot-before.yaml \
+              --snapshot-after /tmp/snapshot-after.yaml \
               > /tmp/runner.log 2>&1 || rc=$?
             echo "$rc" > /tmp/runner.exit
           ) &
@@ -1025,6 +1064,52 @@ jobs:
             echo "(no capture file - the proxy never started)"
           echo "=== sentinel stats ==="
           kubectl -n "$CHAOS_NAMESPACE" describe pod -l srek3s.io/chaos=oom || true
+
+      - name: Exfiltrate Remediation Artifacts
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          # if: always() because this is the step that makes a red run
+          # diagnosable. Every other diagnostic here lives inside a step that
+          # failed; this one exists so a failed run still says what the agent
+          # proposed and what changed on the cluster.
+          #
+          # Single-line commands throughout, on purpose. A multi-line `python -c`
+          # inside a YAML block scalar has to carry the block's indentation, and
+          # when it does not the file stops being valid YAML - which is how an
+          # earlier revision of this step broke the workflow outright.
+          echo "=== provider configured on the agent ==="
+          grep -m1 "manifest_provider=" /tmp/agent.log || echo "  (no startup line)"
+
+          echo
+          echo "=== tiers across captured exchanges ==="
+          grep -o '"blast_radius_tier":"[^"]*"' /tmp/captured_incidents.jsonl || echo "  (none)"
+
+          echo
+          echo "=== how many exchanges carry an empty patch ==="
+          grep -c '"git_patch":""' /tmp/captured_incidents.jsonl || echo 0
+
+          echo
+          echo "=== full first TriageResponse ==="
+          head -n 1 /tmp/captured_incidents.jsonl > /tmp/one-capture.json
+          python tests/e2e/show_capture.py /tmp/one-capture.json || echo "  (unreadable)"
+
+          echo
+          echo "=== cluster mutation: before vs after (ROADMAP 4.2.8) ==="
+          python tests/e2e/show_mutation.py /tmp/snapshot-before.yaml /tmp/snapshot-after.yaml || echo "  (snapshots unavailable)"
+
+          echo
+          echo "=== mutation report file ==="
+          if [ -s /tmp/mutation-report.txt ]; then
+            cat /tmp/mutation-report.txt
+          else
+            echo "  (absent - the runner writes no such file; see the commit message)"
+          fi
+
+          echo
+          echo "=== runner report ==="
+          if [ -f /tmp/runner.log ]; then tail -45 /tmp/runner.log; else echo "  (none)"; fi
 
       - name: Teardown
         if: always()
