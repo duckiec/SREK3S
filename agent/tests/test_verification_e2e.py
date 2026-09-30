@@ -652,11 +652,18 @@ class TestReaderIsReadOnly:
 
 
 def _kubectl_raw(
-    args: list[str], *, timeout: int = 60
+    args: list[str], *, timeout: int = 60, input_text: str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run kubectl without raising, for lifecycle calls that must not fail hard."""
+    """Run kubectl without raising, for lifecycle calls that must not fail hard.
+
+    ``input_text`` feeds stdin, which is how ``apply -f -`` receives the
+    namespace manifest. Rendering a manifest to stdout and then discarding it is
+    a mistake this file made once: ``--dry-run=client`` exits 0 without
+    submitting anything, so the "create" silently created nothing.
+    """
     return subprocess.run(  # noqa: S603 - fixed argv, no shell
         ["kubectl", *args],
+        input=input_text,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -700,21 +707,40 @@ def verify_namespace() -> Iterator[str]:
     """
     existed = _namespace_exists()
     if not existed:
-        applied = _kubectl_raw(
-            [
-                "create",
-                "namespace",
-                VERIFY_NAMESPACE,
-                "--dry-run=client",
-                "-o",
-                "yaml",
-            ]
-        )
-        if applied.returncode != 0:
+        # One `apply` of a complete manifest, labels included.
+        #
+        # The first version did `kubectl create namespace ... --dry-run=client
+        # -o yaml`, checked the exit status, discarded the rendered stdout, and
+        # then ran `kubectl label namespace/...` - labelling a namespace that had
+        # never been created. CI reported it precisely:
+        #
+        #     could not label namespace 'srek3s-verify-chaos' with
+        #     'app.kubernetes.io/part-of': namespaces "srek3s-verify-chaos" not found
+        #
+        # The exit status was 0 the whole way. `--dry-run=client` renders without
+        # submitting, so the command succeeded and did nothing, and the failure
+        # surfaced two steps later as a NotFound from a different command. That
+        # is the same shape as the `git apply` case in
+        # docs/lessons-learned.md section 19: a green command that changed
+        # nothing, caught only because a later step happened to notice.
+        #
+        # Applying the whole manifest at once also removes the window in which
+        # the namespace exists without its Pod Security labels. Nothing applies
+        # pods in that window here, but a create-then-label sequence would admit
+        # a privileged pod if anything ever did.
+        created = _kubectl_raw(["apply", "-f", "-"], input_text=_namespace_manifest())
+        if created.returncode != 0:
             raise RuntimeError(
-                f"could not render namespace manifest: {applied.stderr.strip()}"
+                f"could not create namespace {VERIFY_NAMESPACE!r}: "
+                f"{created.stderr.strip()}"
             )
-        _apply_labels()
+        # Necessary and not sufficient, the same rule the patch helper follows:
+        # confirm the effect rather than trusting the exit status.
+        if not _namespace_exists():
+            raise RuntimeError(
+                f"kubectl apply reported success but namespace "
+                f"{VERIFY_NAMESPACE!r} does not exist"
+            )
     try:
         yield VERIFY_NAMESPACE
     finally:
@@ -732,21 +758,31 @@ def verify_namespace() -> Iterator[str]:
             )
 
 
-def _apply_labels() -> None:
-    """Stamp the ratified PSA labels onto the verification namespace."""
+def _namespace_manifest() -> str:
+    """The verification namespace, carrying the ratified PSA labels.
+
+    Rendered from ``deploy/chaos/namespace.yaml`` rather than restated, so the
+    two namespaces cannot drift: a future change to the enforcement terms is
+    picked up here automatically instead of needing to be copied and then
+    remembered. The name is the only field that differs, plus the warning
+    annotation, which is rewritten to describe this namespace rather than
+    `sentinel-chaos`.
+    """
     source = yaml.safe_load(NAMESPACE_MANIFEST.read_text(encoding="utf-8"))
-    labels: dict[str, str] = dict(
-        (source.get("metadata") or {}).get("labels") or {},
+    metadata: dict[str, Any] = dict(source.get("metadata") or {})
+    metadata["name"] = VERIFY_NAMESPACE
+    annotations = dict(metadata.get("annotations") or {})
+    annotations["srek3s.io/warning"] = (
+        f"Disposable. Namespace {VERIFY_NAMESPACE} is created and deleted by the "
+        "Milestone 4.3 post-remediation verification test. It is isolated from "
+        f"{source.get('metadata', {}).get('name')} so ROADMAP 4.2.8's object count "
+        "is unaffected. Safe to delete: nothing in srek3s-system references it."
     )
-    for key, value in labels.items():
-        result = _kubectl_raw(
-            ["label", "--overwrite", f"namespace/{VERIFY_NAMESPACE}", f"{key}={value}"]
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"could not label namespace {VERIFY_NAMESPACE!r} with {key!r}: "
-                f"{result.stderr.strip()}"
-            )
+    metadata["annotations"] = annotations
+    return yaml.safe_dump(
+        {"apiVersion": "v1", "kind": "Namespace", "metadata": metadata},
+        sort_keys=False,
+    )
 
 
 def _skip_without_cluster() -> None:
@@ -1472,6 +1508,119 @@ class TestTier1PatchMechanics:
         absent.write_text("resources:\n  limits:\n    cpu: 100m\n", encoding="utf-8")
         with pytest.raises(RuntimeError, match="no line reading exactly"):
             _memory_limit_line(absent)
+
+
+class TestNamespaceLifecycle:
+    """The namespace is created by *applying* a manifest, not by rendering one.
+
+    Regression coverage for the defect CI run `36785803765` reported:
+
+        could not label namespace 'srek3s-verify-chaos' with
+        'app.kubernetes.io/part-of': namespaces "srek3s-verify-chaos" not found
+
+    The cause was `kubectl create namespace ... --dry-run=client -o yaml`: it
+    exits 0 and writes the manifest to stdout, having submitted nothing. The
+    code checked the exit status, discarded the stdout, and then tried to label
+    a namespace that did not exist. Every command along the way reported
+    success.
+    """
+
+    def test_the_manifest_is_applied_not_merely_rendered(self) -> None:
+        """The create path must submit the manifest.
+
+        Asserted structurally: the namespace is created by `apply -f -` with the
+        rendered document on stdin. There is no code path left that renders a
+        manifest and discards it, which is the shape that failed.
+        """
+        tree = ast.parse(pathlib.Path(__file__).read_text(encoding="utf-8"))
+        fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "verify_namespace"
+        )
+        # Both call shapes. `_kubectl_raw([...])` is a bare Name, so a collector
+        # that only reads `ast.Attribute` sees nothing - which is what the first
+        # version of this test did, and why it failed on correct code.
+        invoked: set[str] = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                invoked.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                invoked.add(node.func.attr)
+        assert "_kubectl_raw" in invoked, (
+            f"the namespace create path must go through _kubectl_raw; found "
+            f"{sorted(invoked)}"
+        )
+
+        # The argv actually handed to kubectl, and the keywords beside it.
+        argvs: list[list[str]] = []
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_kubectl_raw"
+                and node.args
+                and isinstance(node.args[0], ast.List)
+            ):
+                argvs.append(
+                    [
+                        element.value
+                        for element in node.args[0].elts
+                        if isinstance(element, ast.Constant)
+                        and isinstance(element.value, str)
+                    ]
+                )
+        # No `--dry-run` anywhere in the create path: rendering is not creating.
+        # This is the assertion that pins the CI defect - the flag renders a
+        # manifest to stdout, submits nothing, and exits 0.
+        for argv in argvs:
+            assert "--dry-run" not in argv, (
+                f"the namespace create path must not use --dry-run: {argv}. It "
+                "renders without submitting, which is the defect this test pins"
+            )
+        # And something must actually submit: `apply -f -` with the manifest on
+        # stdin. Without this the assertions above would be satisfied by a create
+        # path that does nothing at all.
+        assert any(
+            argv[:2] == ["apply", "-f"] for argv in argvs
+        ), f"expected an `apply -f -` in the create path, found {argvs}"
+
+    def test_the_manifest_carries_the_ratified_psa_labels(self) -> None:
+        """Enforcement terms are copied from `sentinel-chaos`, not restated.
+
+        A verification fixture admitted under laxer terms than the fixtures it
+        verifies against would be testing a different environment than the one
+        the system ships in. Deriving them from the ratified manifest means a
+        future change to the enforcement is picked up here automatically.
+        """
+        rendered = yaml.safe_load(_namespace_manifest())
+        assert rendered["kind"] == "Namespace"
+        assert rendered["metadata"]["name"] == VERIFY_NAMESPACE
+
+        ratified = yaml.safe_load(NAMESPACE_MANIFEST.read_text(encoding="utf-8"))
+        expected = dict((ratified.get("metadata") or {}).get("labels") or {})
+        actual = dict(rendered["metadata"]["labels"])
+        # The name label is namespace-specific and carried over verbatim.
+        assert actual == expected, (
+            f"PSA labels drifted from the ratified namespace: "
+            f"missing={set(expected) - set(actual)} extra={set(actual) - set(expected)}"
+        )
+        for key in ("enforce", "enforce-version", "audit", "warn"):
+            assert f"pod-security.kubernetes.io/{key}" in actual
+
+    def test_the_warning_annotation_names_this_namespace(self) -> None:
+        """Whoever runs `kubectl get ns` should be told what this is.
+
+        The ratified manifest carries a warning annotation; copying it verbatim
+        would tell a reader this namespace is `sentinel-chaos` and that deleting
+        it is safe - which is true of that namespace and misleading here.
+        """
+        rendered = yaml.safe_load(_namespace_manifest())
+        warning = str(rendered["metadata"]["annotations"]["srek3s.io/warning"])
+        assert VERIFY_NAMESPACE in warning
+        assert "4.3" in warning
 
 
 def _mib(quantity: str) -> int:
