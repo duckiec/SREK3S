@@ -125,7 +125,7 @@ SREK3S/
 │   ├── kustomization.yaml
 │   └── chaos/                    # Milestone 4 synthetic chaos fixtures
 │       ├── oom-leak.yaml
-│       └── crashloop-badpod.yaml
+│       └── crashloop.yaml
 │
 └── tests/
     └── fixtures/

@@ -1153,8 +1153,13 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       explicit blast-radius guardrail.
 - [ ] `4.1.2` Create `deploy/chaos/oom-leak.yaml` — a Deployment with a memory limit far
       below the container's steady-state need, so it is deterministically `OOMKilled`.
-- [ ] `4.1.3` Create `deploy/chaos/crashloop-badpod.yaml` — a container exiting non-zero on
+- [ ] `4.1.3` Create `deploy/chaos/crashloop.yaml` — a container exiting non-zero on
       start to force `CrashLoopBackOff`.
+      **Filename corrected from `crashloop-badpod.yaml`,** which never existed;
+      `ARCHITECTURE.md:128` carried the same wrong name and was corrected in the
+      same commit. The file on disk is `crashloop.yaml`, unchanged from the
+      commit that introduced it, and it plants the same credentials as the OOM
+      fixture so its logs exercise masking too.
 - [ ] `4.1.4` Embed a **planted** credential in each chaos pod's log output, to verify
       end-to-end that masking holds across the real pipeline.
 - [ ] `4.1.5` Assert the chaos manifests cannot be applied outside the disposable namespace
