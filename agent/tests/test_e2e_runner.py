@@ -11,6 +11,7 @@ wrong.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 from typing import Any
@@ -33,6 +34,7 @@ from runner import (  # noqa: E402
     check_redaction,
     classify_observation,
     gate_redaction,
+    load_incidents,
     verify,
 )
 
@@ -432,3 +434,219 @@ def test_control_chat_loop_checks_cannot_fail() -> None:
     assert any(
         "observation" in note for note in report.failures
     ), f"a single-sample run reported no complaint: {report.failures}"
+
+
+# ---------------------------------------------------------------------------
+# Capture loading (ROADMAP 4.2.1)
+#
+# The capture proxy writes NDJSON; these tests pin the reader that consumes it,
+# and the negative controls prove both that a missing capture fails the run and
+# that a corrupt one is reported rather than silently truncated.
+# ---------------------------------------------------------------------------
+
+
+def test_loads_a_json_array(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "incidents.json"
+    path.write_text(json.dumps([good_incident()]), encoding="utf-8")
+    assert len(load_incidents(str(path))) == 1
+
+
+def test_loads_ndjson(tmp_path: pathlib.Path) -> None:
+    """The proxy appends one object per line, so NDJSON is the real shape."""
+    path = tmp_path / "captured.jsonl"
+    path.write_text(
+        json.dumps(good_incident()) + "\n" + json.dumps(good_incident()) + "\n",
+        encoding="utf-8",
+    )
+    assert len(load_incidents(str(path))) == 2
+
+
+def test_loads_a_single_object_as_a_one_element_window(tmp_path: pathlib.Path) -> None:
+    """One NDJSON line parses as a dict, not a list.
+
+    Wrapping it is correct rather than a special case: a run that captured one
+    incident did observe a one-element window.
+    """
+    path = tmp_path / "one.jsonl"
+    path.write_text(json.dumps(good_incident()), encoding="utf-8")
+    loaded = load_incidents(str(path))
+    assert len(loaded) == 1
+    assert loaded[0]["incident_id"] == good_incident()["incident_id"]
+
+
+def test_a_missing_capture_file_fails_the_run(tmp_path: pathlib.Path) -> None:
+    """Silent, and deliberately not papered over.
+
+    `load_incidents` returns [] for a missing file, so the *only* thing stopping
+    an empty capture from reading as a quiet run is check_incident_window. This
+    asserts that chain end to end, because the alternative - a loader that
+    raised - would fail the run for the wrong reason and say nothing about why.
+    """
+    absent = load_incidents(str(tmp_path / "never-written.jsonl"))
+    assert absent == []
+    report = verify(absent, oom_then_crashloop(), window=60.0)
+    assert not report.passed
+    assert any("no incidents collected" in f for f in report.failures), report.failures
+
+
+def test_an_empty_capture_file_fails_the_run(tmp_path: pathlib.Path) -> None:
+    """A proxy that started and captured nothing is the same failure."""
+    path = tmp_path / "empty.jsonl"
+    path.write_text("", encoding="utf-8")
+    assert load_incidents(str(path)) == []
+    assert not verify([], oom_then_crashloop(), window=60.0).passed
+
+
+def test_a_torn_line_is_reported_with_its_line_number(tmp_path: pathlib.Path) -> None:
+    """A truncated line means the proxy was killed mid-append.
+
+    Silently skipping it would leave a run that looks complete and is missing
+    evidence, which is the specific failure mode this loader exists to prevent.
+    """
+    path = tmp_path / "torn.jsonl"
+    path.write_text(
+        json.dumps(good_incident()) + "\n" + '{"incident_id": "inc_2", "reason"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(VerificationError) as error:
+        load_incidents(str(path))
+    assert ":2" in str(error.value), str(error.value)
+
+
+def test_a_scalar_capture_file_is_rejected(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "scalar.json"
+    path.write_text('"not an incident"', encoding="utf-8")
+    with pytest.raises(VerificationError):
+        load_incidents(str(path))
+
+
+# ---------------------------------------------------------------------------
+# main() wiring
+# ---------------------------------------------------------------------------
+
+
+def test_main_collects_both_incidents_and_observations(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this pins: the two halves were mutually exclusive.
+
+    `--incident-file` sat in an `if/else` against live sampling, so passing it
+    loaded payloads and skipped sampling entirely. `verify` then failed on
+    "no observations" and on the sample count, and a run wired the obvious way
+    - capture the wire, then verify - could only ever fail, just with a
+    different message. Both are now required and both are collected.
+    """
+    import runner as runner_module
+
+    capture = tmp_path / "captured.jsonl"
+    capture.write_text(
+        "\n".join(json.dumps(good_incident() | {"restart_count": n}) for n in (1, 2, 3))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    seen: list[str] = []
+
+    def _fake_get_pod(namespace: str, selector: str) -> dict[str, Any]:
+        seen.append(selector)
+        # The first poll must see the cause and later polls the effect.
+        # `len(seen)` after the append, not `not seen` - the append has already
+        # happened, so a falsy check reads as "later poll" from the very first
+        # call and the 137 is never observed at all.
+        return _pod_terminated() if len(seen) == 1 else _pod_crashloop()
+
+    monkeypatch.setattr(runner_module, "get_pod", _fake_get_pod)
+    # Patched by name rather than through the module object: `time.sleep` is a
+    # module-global, so patching the attribute on the shared module is correct
+    # and `monkeypatch` undoes it. Reaching through `runner.time` instead is a
+    # typing error, because `time` is not an explicit export of `runner`.
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    exit_code = runner_module.main(
+        [
+            "srek3s.io/chaos=oom",
+            "--incident-file",
+            str(capture),
+            "--observe-seconds",
+            "0.5",
+        ]
+    )
+
+    # Sampling ran, despite --incident-file being supplied. This assertion is
+    # the whole point: before the fix, `seen` was empty.
+    assert seen, "main() skipped live sampling when --incident-file was passed"
+
+    # And the capture was loaded rather than ignored. Re-verifying here rather
+    # than trusting the exit code means a failure says which half broke.
+    report = runner_module.verify(
+        load_incidents(str(capture)),
+        [
+            *_terminated_observation(),
+            *_crashloop_observation(),
+        ],
+        window=60.0,
+    )
+    assert len(report.incidents) == 3
+    # Kept short on purpose: a failed assertion here used to dump the whole
+    # rendered report, and the causal-chain failure lists one entry per sample,
+    # so a 90s window produced thousands of words to read past the actual cause.
+    assert not report.failures, report.failures
+    assert exit_code == 0, f"exit={exit_code}, failures={len(report.failures)}"
+
+
+def _terminated_observation() -> list[Observation]:
+    return [
+        Observation(
+            timestamp=1.0,
+            state="Terminated",
+            exit_code=137,
+            reason="OOMKilled",
+            restart_count=1,
+            previous_exit_code=None,
+            previous_reason=None,
+        )
+    ]
+
+
+def _crashloop_observation() -> list[Observation]:
+    return [
+        Observation(
+            timestamp=2.0,
+            state="CrashLoopBackOff",
+            exit_code=None,
+            reason=None,
+            restart_count=2,
+            previous_exit_code=137,
+            previous_reason="OOMKilled",
+        )
+    ]
+
+
+def _pod_terminated() -> dict[str, Any]:
+    return {
+        "status": {
+            "containerStatuses": [
+                {
+                    "restartCount": 1,
+                    "state": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}},
+                    "lastState": {},
+                }
+            ]
+        }
+    }
+
+
+def _pod_crashloop() -> dict[str, Any]:
+    return {
+        "status": {
+            "containerStatuses": [
+                {
+                    "restartCount": 2,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {
+                        "terminated": {"exitCode": 137, "reason": "OOMKilled"}
+                    },
+                }
+            ]
+        }
+    }

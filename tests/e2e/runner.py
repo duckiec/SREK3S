@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import subprocess
 import sys
 import time
@@ -500,6 +501,61 @@ def render(report: RunReport) -> str:
     return "\n".join(lines)
 
 
+def load_incidents(path: str) -> list[dict[str, Any]]:
+    """Load captured incidents, accepting either a JSON array or NDJSON.
+
+    The capture proxy appends one JSON object per line, because a proxy that
+    rewrote a growing file into an array would have to rewrite it on every
+    request and would lose everything if it were killed mid-write. NDJSON is
+    append-only and crash-tolerant, so that is what the proxy writes - which
+    means this loader has to read it.
+
+    Accepting a plain JSON array too is not leniency for its own sake: the
+    fixtures in ``tests/fixtures/`` are arrays, and a loader that only read one
+    shape would make every offline caller and every live caller disagree about
+    what a capture file is.
+
+    A missing file returns ``[]`` rather than raising. That is a *silent* failure
+    mode, so it is deliberately left to be caught by ``check_incident_window``
+    rather than being papered over: a run with no captures must fail, and that
+    invariant is what makes it fail, loudly, with a message naming the cause.
+    """
+    try:
+        raw = pathlib.Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if not raw.strip():
+        return []
+
+    try:
+        parsed: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        records: list[Any] = []
+        for number, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise VerificationError(
+                    f"{path}:{number} is not valid JSON: {error}. A truncated line "
+                    f"here means the proxy was killed mid-append, which is worth "
+                    f"knowing before trusting the rest of the file."
+                ) from error
+        parsed = records
+
+    # A single NDJSON line parses as an object, not a list. Wrapping it is
+    # correct rather than special-casing: one incident is a one-element window.
+    if isinstance(parsed, dict):
+        return [parsed]
+    if not isinstance(parsed, list):
+        raise VerificationError(
+            f"{path} holds a {type(parsed).__name__}, want a JSON array of "
+            f"incidents or NDJSON"
+        )
+    return [record for record in parsed if isinstance(record, dict)]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -527,14 +583,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     observations: list[Observation] = []
 
     if args.incident_file:
-        incidents = json.loads(open(args.incident_file, encoding="utf-8").read())
-    else:
-        deadline = time.monotonic() + args.observe_seconds
-        while time.monotonic() < deadline:
-            pod = get_pod(args.namespace, args.selector)
-            if pod is not None:
-                observations.extend(read_observation(pod))
-            time.sleep(1.0)
+        incidents = load_incidents(args.incident_file)
+
+    # Sampling is NOT in an `else`. It was, and that made the two halves of the
+    # report mutually exclusive: passing --incident-file supplied payloads but
+    # zero observations, so check_causal_chain raised "no observations; the pod
+    # was never seen" and verify() added a second failure for the sample count.
+    # A run wired the obvious way - capture the wire, then verify - could only
+    # ever fail, just with a different message. The two halves check different
+    # things and both are required: the captured file supplies the payloads,
+    # live sampling supplies the pod-state timeline that proves the cause
+    # preceded the effect.
+    deadline = time.monotonic() + args.observe_seconds
+    while time.monotonic() < deadline:
+        pod = get_pod(args.namespace, args.selector)
+        if pod is not None:
+            observations.extend(read_observation(pod))
+        time.sleep(1.0)
 
     report = verify(incidents, observations, window=args.observe_seconds)
     print(render(report))

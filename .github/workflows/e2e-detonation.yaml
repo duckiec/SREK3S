@@ -511,6 +511,59 @@ jobs:
           exit 1
 
       # ---------------------------------------------------------------
+      # 6b. The wire capture proxy.
+      #
+      # ROADMAP 4.2.1 requires the runner to "collect emitted payloads", and
+      # 4.2.4 through 4.2.7 are all assertions over collected payloads. Until
+      # something put the wire bytes where the runner could see them, the
+      # runner's incidents list was always empty and its step exited 1 on every
+      # run - which is exactly what run 36644304837 showed, after twenty-four
+      # green steps.
+      #
+      # It sits in front of the agent rather than inside the Sentinel because
+      # ARCHITECTURE.md line 30 puts the scrubber behind "no disk, no plaintext
+      # retention", and the harness must stay external to the binary whose
+      # behaviour it measures. No production code is touched.
+      #
+      # Started after the agent so the upstream is already listening, and
+      # before the Sentinel so no incident can be emitted past it. Anything the
+      # Sentinel posts that does not arrive here is invisible to the harness,
+      # which is the failure mode this whole step exists to prevent.
+      # ---------------------------------------------------------------
+      - name: Start the wire capture proxy
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PYTHONUNBUFFERED=1 \
+          PYTHONPATH="$PWD/tests/e2e" \
+            nohup python capture_proxy.py \
+              --output /tmp/captured_incidents.jsonl \
+              --listen-port 8001 \
+              --upstream-port 8000 \
+              > /tmp/capture_proxy.log 2>&1 &
+          echo $! > /tmp/capture_proxy.pid
+
+          # Liveness by process, not by HTTP. The proxy forwards every path, so
+          # there is no endpoint of its own to probe without inventing one on a
+          # component whose whole job is to be transparent; and a proxy that is
+          # up but not yet accepting is exactly the state worth catching here
+          # rather than discovering as a missing capture at the end of the run.
+          for i in $(seq 1 30); do
+            if kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
+              sleep 1
+              if kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
+                echo "capture proxy alive after ${i}s (pid $(cat /tmp/capture_proxy.pid))"
+                cat /tmp/capture_proxy.log
+                exit 0
+              fi
+            fi
+            sleep 1
+          done
+          echo "::error::the capture proxy did not stay up"
+          cat /tmp/capture_proxy.log
+          exit 1
+
+      # ---------------------------------------------------------------
       # 8. The Sentinel, scoped.
       #
       # The assertion is on the *log line the watcher reports back*, not on the
@@ -524,7 +577,7 @@ jobs:
           set -euo pipefail
           ./bin/sentinel \
             -namespace "$CHAOS_NAMESPACE" \
-            -agent-url http://127.0.0.1:8000/api/v1/triage \
+            -agent-url http://127.0.0.1:8001/api/v1/triage \
             -log-level info \
             > /tmp/sentinel.log 2>&1 &
           echo $! > /tmp/sentinel.pid
@@ -586,9 +639,23 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
+          echo "=== captured wire exchanges ==="
+          if [ -s /tmp/captured_incidents.jsonl ]; then
+            wc -l < /tmp/captured_incidents.jsonl
+          else
+            # Printed rather than swallowed. An empty capture is the single
+            # most informative thing this harness can report, and the runner's
+            # own message only says "no incidents collected" - which does not
+            # distinguish "the Sentinel never emitted" from "the proxy never
+            # saw it". This line does.
+            echo "::warning::the capture file is empty: the Sentinel emitted "
+            echo "::warning::nothing, or emitted past the proxy. Both are failures."
+          fi
+
           PYTHONUNBUFFERED=1 python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
             --namespace "$CHAOS_NAMESPACE" \
-            --observe-seconds "${OBSERVATION_WINDOW:-90}"
+            --observe-seconds "${OBSERVATION_WINDOW:-90}" \
+            --incident-file /tmp/captured_incidents.jsonl
 
       # ---------------------------------------------------------------
       # 10. The patch, verified against a real repository.
@@ -609,6 +676,10 @@ jobs:
           set -uo pipefail
           echo "=== agent ==="; cat /tmp/agent.log || true
           echo "=== sentinel ==="; cat /tmp/sentinel.log || true
+          echo "=== capture proxy ==="; cat /tmp/capture_proxy.log || true
+          echo "=== captured exchanges (one per line) ==="
+          cat /tmp/captured_incidents.jsonl 2>/dev/null || \
+            echo "(no capture file - the proxy never started)"
           echo "=== sentinel stats ==="
           kubectl -n "$CHAOS_NAMESPACE" describe pod -l srek3s.io/chaos=oom || true
 
