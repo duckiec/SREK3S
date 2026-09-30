@@ -534,9 +534,15 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          # `-m capture_proxy`, not `python capture_proxy.py`. The step runs from
+          # the repository root, where there is no capture_proxy.py, so the
+          # script-path form exits immediately with "No such file or
+          # directory" - which is what run 36649783834 did. `-m` plus
+          # PYTHONPATH is what the agent step above already does, and it does not
+          # depend on the working directory.
           PYTHONUNBUFFERED=1 \
           PYTHONPATH="$PWD/tests/e2e" \
-            nohup python capture_proxy.py \
+            nohup python -m capture_proxy \
               --output /tmp/captured_incidents.jsonl \
               --listen-port 8001 \
               --upstream-port 8000 \
@@ -548,20 +554,24 @@ jobs:
           # component whose whole job is to be transparent; and a proxy that is
           # up but not yet accepting is exactly the state worth catching here
           # rather than discovering as a missing capture at the end of the run.
+          #
+          # The double `kill -0` is deliberate. A single check passes for a
+          # process that has started and is about to exit, which is precisely
+          # the failure this step exists to catch; re-checking after a second
+          # separates "started" from "stayed up".
           for i in $(seq 1 30); do
-            if kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
-              sleep 1
-              if kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
-                echo "capture proxy alive after ${i}s (pid $(cat /tmp/capture_proxy.pid))"
-                cat /tmp/capture_proxy.log
-                exit 0
-              fi
+            if ! kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
+              break
             fi
             sleep 1
           done
-          echo "::error::the capture proxy did not stay up"
+          if ! kill -0 "$(cat /tmp/capture_proxy.pid)" 2>/dev/null; then
+            echo "::error::the capture proxy did not stay up"
+            cat /tmp/capture_proxy.log
+            exit 1
+          fi
+          echo "capture proxy alive (pid $(cat /tmp/capture_proxy.pid))"
           cat /tmp/capture_proxy.log
-          exit 1
 
       # ---------------------------------------------------------------
       # 8. The Sentinel, scoped.
