@@ -1,0 +1,237 @@
+# Bounded-leak chaos fixture for the post-remediation verification loop
+# (ROADMAP 4.3.4).
+#
+# WHY THIS EXISTS AND WHY IT IS NOT deploy/chaos/oom-leak.yaml
+# ------------------------------------------------------------
+# `deploy/chaos/oom-leak.yaml` cannot verify a remediation, because its memory
+# demand is unbounded. Its allocation loop is:
+#
+#     BLOCK=$(head -c 1048576 /dev/zero | tr '\000' 'x')
+#     while [ "$j" -lt 32 ]; do BLOCK="$BLOCK$BLOCK"; j=$((j + 1)); done
+#
+# 1 MiB doubling 32 times reaches 4 GiB, so the container is killed wherever the
+# limit sits - iteration 6 against 64Mi, iteration 7 against 128Mi, sub-second
+# either way. A memory-limit increase *delays* that kill by one iteration. It
+# does not prevent it, and the fixture says so itself:
+#
+#     # Unreachable. Reached only if the container did NOT OOM, in which
+#     # case the fixture is broken and must say so loudly...
+#
+# That is correct design for what that fixture is for: proving the Sentinel
+# *detects* an OOM. It is the wrong shape for proving the loop can *confirm a
+# fix*, because there is no fix to confirm.
+#
+# A memory-limit remediation is only correct when the workload's demand falls
+# STRICTLY BETWEEN the old and new limit. That is the whole semantic of the
+# Tier-1 patch, and it is what this fixture encodes:
+#
+#     demand  ~90 MiB   (BOUNDED_BYTES below)
+#     64Mi  ->  OOMKilled on boot. This is the fault.
+#     128Mi ->  runs stably. This is the fix.
+#
+# The band is 90 MiB against 64/128, so the demand clears the new limit with
+# ~38 MiB of headroom on the allocation itself, while the remaining RSS is small
+# and bounded. It is not wedged against either limit, which would make the test
+# pass for the wrong reason - a fixture that survives 128Mi by 2 MiB would also
+# pass on a node with a slightly different baseline, and one that needs 126Mi
+# would fail on a busier node. See HEADROOM_NOTE for the arithmetic.
+#
+# The gap to 64Mi is the other half of why this works: 90 MiB against a 64 MiB
+# limit is killed during the *allocation*, not after a slow climb, so the
+# failure is immediate and unambiguous rather than a probabilistic one that
+# might not fire before the observation window closes.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-verify-bounded
+  namespace: srek3s-verify-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-verify-bounded
+    app.kubernetes.io/part-of: srek3s
+    app.kubernetes.io/component: verification-fixture
+    # Distinct from `oom` on purpose. The e2e runner selects chaos pods by
+    # `srek3s.io/chaos=oom`, so reusing that value would put this pod inside
+    # Milestone 4.2's detection ratio - and a workload that is SUPPOSED to stay
+    # healthy would then be counted as an expected OOM. One label, one meaning.
+    srek3s.io/chaos: bounded-oom
+spec:
+  # One replica. The verification verdict is per-container, and N replicas would
+  # make "did the fix hold" ambiguous about which instance answered.
+  replicas: 1
+  # Fails fast rather than sitting in Progressing for the 600s default, so
+  # `kubectl rollout status` gives a prompt, unambiguous error on the 64Mi path.
+  progressDeadlineSeconds: 120
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-verify-bounded
+      srek3s.io/chaos: bounded-oom
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srek3s-verify-bounded
+        app.kubernetes.io/part-of: srek3s
+        app.kubernetes.io/component: verification-fixture
+        srek3s.io/chaos: bounded-oom
+    spec:
+      # Identical to deploy/chaos/oom-leak.yaml. No API access is needed to
+      # allocate memory, and a mounted token would be a second planted
+      # credential in the pod for no reason.
+      automountServiceAccountToken: false
+      # Stops the kubelet injecting every Service in the namespace as env vars.
+      # Keeps the environment free of high-entropy strings that would be a
+      # needless red herring for the scrubber.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Matches deploy/chaos/oom-leak.yaml exactly. Not required by PSA
+        # `restricted`, and nothing here mounts a writable volume, so it is
+        # inert - but "inert and identical" beats "inert and different", because
+        # a securityContext that drifts between two fixtures in the same
+        # repository is a difference nobody will notice until one of them is
+        # denied admission and the other is not.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: bounded-canary
+          # Same image and pull policy as the ratified fixtures. `Never` because
+          # the e2e workflow pre-pulls busybox into k3s containerd rather than
+          # letting the kubelet reach a registry.
+          image: busybox:1.36.1
+          imagePullPolicy: Never
+
+          # Inline, like every other fixture here. The failure mode must be
+          # readable in one file without following three others.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # ---------------------------------------------------------------
+              # PHASE 1 - plant credentials
+              # ---------------------------------------------------------------
+              # A reduced version of the M4.2 fixture's phase 1. Present so the
+              # verification path also carries scrubbed evidence - the loop's
+              # verdict is better when the war-room bundle has something in it -
+              # and NOT to re-prove masking, which ROADMAP 4.2.4 already owns.
+              #
+              # Same rule classes as the full fixture, one line each: rules 2/3
+              # (AWS), 4 (JWT), 5 (bearer), 6 (postgres DSN). Rule 7 is omitted
+              # for the reason given in deploy/chaos/oom-leak.yaml: its
+              # replacement template depends on a group index that was not
+              # confirmed, and a fixture should not silently depend on it.
+              printf '%s\n' "CHAOS-CRED aws_access_key_id=AKIAIOSFODNN7EXAMPLE aws_secret_access_key=\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\""
+              printf '%s\n' "CHAOS-CRED jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkNoYW9zIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+              printf '%s\n' "CHAOS-CRED Authorization: Bearer chaos-planted-bearer-token-0123456789"
+              printf '%s\n' "CHAOS-CRED dsn=postgres://chaos_user:Sup3rS3cretPassw0rd@db.production.svc.cluster.local:5432/billing"
+              printf '%s\n' "CHAOS-PHASE creds-planted next=bounded-allocation demand_bytes=94371840"
+
+              # ---------------------------------------------------------------
+              # PHASE 2 - settle
+              # ---------------------------------------------------------------
+              # Same five seconds, same reason as the ratified fixture: the
+              # kubelet's status manager batches updates, so a fast crash can
+              # have its Terminated state coalesced away before it is ever
+              # written. Sleeping first guarantees a Running status is
+              # published, so the later Terminated is a distinct update the
+              # informer cannot miss.
+              sleep 5
+
+              # ---------------------------------------------------------------
+              # PHASE 3 - bounded allocation
+              # ---------------------------------------------------------------
+              # HEADROOM_NOTE. 94371840 bytes = 90 MiB exactly.
+              #
+              #   against 64Mi  : 90 > 64, so the cgroup OOM killer fires DURING
+              #                    this assignment. The container is SIGKILLed
+              #                    while resident, which is what makes the
+              #                    observed failure `OOMKilled`/137 rather than
+              #                    some other termination.
+              #   against 128Mi : 90 < 128, with ~38 MiB of headroom. Survives.
+              #
+              # Why `head | tr` and not a doubling loop: the whole point of this
+              # fixture is that the demand is a KNOWN, FIXED number. A loop's
+              # demand depends on when the limit is hit, which is exactly the
+              # property that made deploy/chaos/oom-leak.yaml unusable here.
+              #
+              # Why the bytes are genuinely resident, not lazily mapped:
+              # `$(...)` command substitution forces the pipeline through a pipe
+              # and into a shell variable, so every byte is written and read. A
+              # mapping that was never touched would be reclaimable and the
+              # container would not be killed at all - the test would then pass
+              # on 64Mi for the wrong reason.
+              #
+              # `tr '\000' 'x'` over NULs rather than zeros: the result is
+              # printable, so `printf` of its length is meaningful, and a block
+              # of NULs risks being silently discarded by some shells.
+              BOUNDED=$(head -c 94371840 /dev/zero | tr '\000' 'x')
+              printf 'CHAOS-ALLOC bounded_bytes=%d\n' "${#BOUNDED}"
+
+              # ---------------------------------------------------------------
+              # PHASE 4 - idle
+              # ---------------------------------------------------------------
+              # The load-bearing line of the entire fixture.
+              #
+              # The container must remain ALIVE and KEEP RUNNING for longer
+              # than `container_uptime_seconds_min` so the verification loop can
+              # observe uptime above the minimum and return VERIFIED. Without
+              # this the container would exit, the Deployment would restart it,
+              # and uptime would reset - so a "healthy" workload would never
+              # accumulate the uptime the success criterion demands, and the
+              # loop could only ever return UNRESOLVED or INDETERMINATE.
+              #
+              # Bounded rather than `tail -f /dev/null`: a finite sleep gives a
+              # container that eventually exits on its own, which is a
+              # predictable teardown, and it means a leaked pod is obvious
+              # rather than indistinguishable from a healthy one.
+              #
+              # 3600s is comfortably longer than the 60s observation window and
+              # than any rollout the test performs, so it never fires during a
+              # run. It exists to be longer than the test, not to be used.
+              printf '%s\n' "CHAOS-PHASE allocation-stable demand_bytes=94371840 entering idle"
+              sleep 3600
+
+              # Unreachable under either limit. Reached only if the container
+              # neither OOMed nor stayed up for an hour, in which case the
+              # fixture is broken and must say so rather than exiting 0 and
+              # reading as a healthy pod.
+              printf '%s\n' "CHAOS-FATAL bounded fixture neither OOMed nor idled; fixture is broken"
+              exit 1
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            # Safe here precisely because the payload never touches the
+            # filesystem: it allocates in the heap and writes to stdout. A
+            # payload that filled a writable mount would die of
+            # ephemeral-storage exhaustion and report `Evicted` - the wrong
+            # failure shape entirely.
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            limits:
+              # The fault. A memory limit BELOW the 90 MiB demand, so the
+              # container is OOMKilled on boot and the verification loop sees a
+              # genuine recurrence.
+              #
+              # Matches the agent's Quantity pattern
+              # ^[0-9]+(\.[0-9]+)?(m|k|Ki|M|Mi|G|Gi|T|Ti|P|Pi)?$ and survives
+              # resource.Quantity.String() unchanged as "64Mi", which matters
+              # because the Tier-1 diff must round-trip this exact spelling
+              # through `git apply` and back out of the manifest.
+              memory: 64Mi
+              # No `requests` block, deliberately and for the same reason as
+              # deploy/chaos/oom-leak.yaml: a request would let the scheduler
+              # reserve memory and refuse to place the pod on a small node,
+              # turning the fixture into a Pending pod - the silent-failure mode
+              # ROADMAP 4.1.5 exists to prevent.
