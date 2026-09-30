@@ -1016,14 +1016,23 @@ class TestJobBudgetUnderRealConcurrency:
         ``time.sleep`` rather than ``asyncio.sleep``: the real engine is
         synchronous and runs in the threadpool, so blocking a worker thread is
         exactly the condition the budget exists to bound.
+
+        ``*args, **kwargs`` rather than a bare ``payload`` parameter: the
+        handler now passes ``manifest_provider`` through to the engine, so a
+        stand-in with the *old* one-argument signature raises ``TypeError``
+        before it can record anything. A seam that no longer matches the
+        function it replaces is not a seam - and the failure mode here is
+        nasty, because ``test_liveness_probe_answers_while_a_slow_triage_is_
+        in_flight`` spins on a flag the stand-in would have set, so it hangs
+        rather than failing.
         """
         import time as time_module
 
         original = triage.triage_payload
 
-        def slow(payload: object) -> object:
+        def slow(payload: Any, *args: Any, **kwargs: Any) -> object:
             time_module.sleep(0.25)
-            return original(payload)  # type: ignore[arg-type]
+            return original(payload, *args, **kwargs)
 
         monkeypatch.setattr(triage, "triage_payload", slow)
 
@@ -1062,10 +1071,10 @@ class TestJobBudgetUnderRealConcurrency:
         original = triage.triage_payload
         began: list[float] = []
 
-        def slow(payload: object) -> object:
+        def slow(payload: Any, *args: Any, **kwargs: Any) -> object:
             began.append(time_module.perf_counter())
             time_module.sleep(1.0)
-            return original(payload)  # type: ignore[arg-type]
+            return original(payload, *args, **kwargs)
 
         monkeypatch.setattr(triage, "triage_payload", slow)
         app = create_app(job_budget=JobBudget(max_active=8))
@@ -1139,9 +1148,9 @@ class TestJobBudgetUnderRealConcurrency:
 
         original_triage = triage.triage_payload
 
-        def watching(payload: object) -> object:
+        def watching(payload: Any, *args: Any, **kwargs: Any) -> object:
             observed.append(budget.active)
-            return original_triage(payload)  # type: ignore[arg-type]
+            return original_triage(payload, *args, **kwargs)
 
         monkeypatch.setattr(triage, "triage_payload", watching)
 

@@ -35,8 +35,11 @@ number from arguing its way into a tier it has not earned.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Final, Protocol
 
 import prompt
@@ -51,9 +54,11 @@ from models import (
 )
 
 __all__ = [
+    "MANIFEST_ROOT_ENV",
     "TARGET_MANIFEST",
     "affected_scope",
     "classify",
+    "FileManifestProvider",
     "ManifestProvider",
     "RemedyShape",
     "TierEvidence",
@@ -61,10 +66,13 @@ __all__ = [
     "ClassificationResult",
     "RoutingDecision",
     "StaticManifestProvider",
+    "manifest_provider_from_env",
     "unreadable_manifest_provider",
     "route",
     "PRECONDITIONS",
 ]
+
+logger = logging.getLogger("srek3s.agent")
 
 #: The single manifest Tier-1 remediation is permitted to target.
 #:
@@ -151,6 +159,167 @@ class StaticManifestProvider:
 
     def read_manifest(self, path: str) -> str | None:
         return self._manifests.get(path)
+
+
+#: Environment variable naming the GitOps checkout the provider reads from.
+#:
+#: **Unset means fail closed.** That is the whole point of the default: with no
+#: checkout mounted there is nothing against which I-B2 could be satisfied, so
+#: the engine escalates rather than proposing an uncheckable change. Turning
+#: Tier-1 on is therefore a deliberate deployment decision, not a default.
+MANIFEST_ROOT_ENV: Final[str] = "SREK3S_MANIFEST_ROOT"
+
+#: Extensions the provider will read.
+#:
+#: Narrower than "any file under the root" on purpose. The read side of this
+#: provider is the only place the agent touches a filesystem at all, so the
+#: blast radius of a bad ``path`` is whatever the checkout root contains -
+#: ``.env``, ``.git/config``, a mounted cloud credential. Restricting to the
+#: manifest extensions ARCH §5.1 already fixes for ``remediation.target_manifest``
+#: keeps a traversal bug from turning into a file-read primitive.
+_MANIFEST_SUFFIXES: Final[tuple[str, ...]] = (".yaml", ".yml", ".json")
+
+
+class FileManifestProvider:
+    """A read-only, escape-proof :class:`ManifestProvider` over a checkout.
+
+    This is what makes the Tier-1 path reachable in a running service, and the
+    constraints are the load-bearing part, not decoration:
+
+    **Read-only.** The only syscall is an open-for-read. There is no write, no
+    ``mkdir``, no create, no truncate and no unlink anywhere in this class, so
+    a bug that reached it could at worst disclose a manifest - it could not
+    modify the GitOps repository the patch is destined for. The agent's trust
+    boundary (ARCH §1) is that its only output is text; a provider that could
+    write would put a second output channel inside it.
+
+    **Repo-relative, and proven rather than assumed.** ``build_diff`` and
+    ``Remediation.target_manifest`` both reject absolute paths and colons, and
+    the schema rejects ``..`` segments. Those are *producer-side* guards: they
+    stop a bad path being written into a diff. This is the *consumer-side*
+    guard, and it is the one that actually decides which file gets opened, so
+    it does not rely on any other layer having run first. It applies three
+    independent checks - segment shape, a manifest extension, and containment
+    of the **resolved** path - and passes only if all three hold. Resolving
+    before the containment test is what makes the symlink case safe: a
+    ``deploy/`` that is a link to ``/etc`` resolves outside the root and is
+    refused, even though every segment of the *request* looked innocent.
+
+    **Fail closed on every uncertainty.** A missing file, a directory, an
+    unreadable file, a non-UTF-8 file and a refused path all return ``None``,
+    which is the documented "cannot be read" answer and routes the incident to
+    Tier-2 (I-B2). Nothing here raises for a *content* problem, because an
+    exception here would become a 500 rather than a considered escalation.
+    """
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        try:
+            resolved = Path(root).resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"manifest root {str(root)!r} is not a readable directory: {exc}"
+            ) from exc
+        if not resolved.is_dir():
+            raise ValueError(f"manifest root {str(root)!r} is not a directory")
+        self._root = resolved
+
+    @property
+    def root(self) -> Path:
+        """The resolved checkout root. Exposed for the startup log only."""
+        return self._root
+
+    def read_manifest(self, path: str) -> str | None:
+        """Return the manifest text, or ``None`` when it cannot be read.
+
+        An **empty** file is not an unreadable one: it returns ``""``. The two
+        are different facts and collapsing them would be a lie in the safe
+        direction that hides a real defect - a zero-byte manifest is a broken
+        checkout, and it reaches the caller as a manifest with no target line,
+        which escalates with a precise reason instead of a vague one.
+        """
+        resolved = self._resolve(path)
+        if resolved is None:
+            return None
+        try:
+            return resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+
+    def _resolve(self, path: str) -> Path | None:
+        """Map a repo-relative request onto a file inside the root, or ``None``."""
+        if not isinstance(path, str):
+            return None
+        # Normalise Windows separators first. The contract is a POSIX-shaped
+        # repo-relative path (ARCH §5.1, and `TARGET_MANIFEST` itself), so a
+        # request written with backslashes is *the same request*, and treating
+        # it as a single filename would make the provider behave differently on
+        # two hosts for one input - which is how a check ends up passing on the
+        # platform nobody reviewed it on.
+        candidate = path.strip().replace("\\", "/")
+        if not candidate or candidate.startswith("/") or ":" in candidate:
+            return None
+
+        segments = candidate.split("/")
+        # `.` and `` are rejected rather than normalised away. A well-formed
+        # request never contains either, and silently repairing one would mean
+        # the provider accepted an input shape its own contract does not
+        # describe - the same class of lenience that made an earlier version of
+        # `verify_patch` accept the wrong document wholesale.
+        if any(segment in {"", ".", ".."} for segment in segments):
+            return None
+        if not candidate.lower().endswith(_MANIFEST_SUFFIXES):
+            return None
+
+        try:
+            candidate_path = self._root.joinpath(*segments)
+            # strict=False: the point is to normalise `..` and follow symlinks
+            # even for a path that does not exist, so containment is decided on
+            # the real destination rather than on the request's spelling.
+            resolved = candidate_path.resolve(strict=False)
+        except (OSError, ValueError):
+            return None
+
+        if not resolved.is_relative_to(self._root):
+            return None
+        if not resolved.is_file():
+            return None
+        return resolved
+
+
+def manifest_provider_from_env(env: dict[str, str] | None = None) -> ManifestProvider:
+    """Build the provider the service should use, from the environment.
+
+    Three outcomes, and the failure modes are deliberately not errors:
+
+    * unset or blank -> :func:`unreadable_manifest_provider`, so the service
+      fails closed and every incident escalates. This stays the default.
+    * set to an unusable root -> a logged warning and the same fail-closed
+      provider. A mistyped ConfigMap must not stop the process that exists to
+      answer incident traffic; it must stop it from *patching*, which is the
+      property that actually matters.
+    * set to a usable root -> a :class:`FileManifestProvider`.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get(MANIFEST_ROOT_ENV) or "").strip()
+    if not raw:
+        return unreadable_manifest_provider()
+    try:
+        provider = FileManifestProvider(raw)
+    except ValueError as exc:
+        logger.warning(
+            "%s=%r is unusable, so every manifest is treated as unreadable and "
+            "every incident escalates: %s",
+            MANIFEST_ROOT_ENV,
+            raw,
+            exc,
+        )
+        return unreadable_manifest_provider()
+    logger.info(
+        "GitOps checkout mounted at %s; Tier-1 patches will be verified against "
+        "it (ARCH 5.4 I-B2)",
+        provider.root,
+    )
+    return provider
 
 
 @dataclass(frozen=True)

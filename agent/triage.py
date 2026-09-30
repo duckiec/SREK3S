@@ -8,6 +8,7 @@ question:
 :mod:`classifier`        What is wrong, and may we act on it automatically?
 :mod:`patch`             Given a proven target, what exactly is the diff?
 :mod:`prompt`            What do we tell the human, in prose?
+:mod:`warroom`           What a Tier-2 responder is handed at 3am.
 this module              How do those answers become a Contract B response?
 ======================  ====================================================
 
@@ -40,6 +41,7 @@ import classifier
 import patch as patch_engine
 import prompt
 import rescan
+import warroom
 from classifier import (
     ManifestProvider,
     StaticManifestProvider,
@@ -47,6 +49,7 @@ from classifier import (
     TARGET_MANIFEST,
     unreadable_manifest_provider,
 )
+from warroom import WarRoomDispatch
 from models import (
     SCHEMA_VERSION,
     BlastRadiusTier,
@@ -69,6 +72,7 @@ __all__ = [
     "StaticManifestProvider",
     "TriagePolicy",
     "TriageOutcome",
+    "WarRoomDispatch",
     "triage_payload",
     "unreadable_manifest_provider",
 ]
@@ -125,12 +129,22 @@ class TriageOutcome:
     so a caller can log *why* a decision was made. It is the audit trail a
     War-Room reviewer needs and the first thing to inspect when a routing rule
     looks wrong.
+
+    ``dispatch`` is the Tier-2 War-Room artefact (ARCH §2.6.1). It is ``None``
+    for Tier-1, and non-``None`` for **every** Tier-2 outcome - including one
+    reached by an unhandled precondition rather than by the tier router itself.
+    It is not a field on :class:`~models.TriageResponse` because ARCH §5 fixes
+    that schema, and adding a field to it is a breaking contract change (§10).
+    It is also not a new HTTP endpoint, because §4 fixes those too. The
+    dispatch is therefore carried in-process and *rendered into* the response's
+    existing ``rca_markdown``, which is where a responder actually reads it.
     """
 
     response: TriageResponse
     tier: BlastRadiusTier
     reasons: list[str] = field(default_factory=list)
     latency_ms: int = 0
+    dispatch: WarRoomDispatch | None = None
 
 
 #: Binary suffixes ordered **largest first**.
@@ -292,13 +306,39 @@ def _escalate(
     reasons: list[str],
     started: float,
 ) -> TriageOutcome:
-    """Fail closed to Tier-2, recording why."""
+    """Fail closed to Tier-2, recording why.
+
+    Every path that lands here also **emits a War-Room dispatch**, which is what
+    ROADMAP §2.6.1 asks for and what the classification ``TIER_2_ARCHITECTURAL``
+    promises a human. The dispatch is not decoration attached to a tier label:
+    it is the deliverable, and it is rendered into ``rca_markdown`` so it
+    travels on the wire a responder is already reading.
+
+    That last step is the reason this is not merely a log line. Until it,
+    ``warroom.build_dispatch`` had **no production caller at all** - it was
+    exercised only by ``agent/tests/test_milestone2.py`` - so a Tier-2 response
+    was the only artefact an escalation ever produced. That response cannot
+    carry ``do_not_apply`` (ARCH §5.1 has no field for it, and adding one is a
+    breaking schema change per ARCH §10), so the one marker ARCH §2.6.2 calls
+    "a field a channel renderer cannot drop" existed nowhere an operator could
+    reach. Rendering the dispatch into the RCA puts it there without inventing
+    a field, a path or an endpoint.
+    """
     latency_ms = int((time.perf_counter() - started) * 1000)
+    response = _tier2_response(payload, result, severity, confidence, latency_ms)
+    dispatch = warroom.build_dispatch(payload, response, reasons)
+    # Assignment rather than `model_copy(update=...)`: the model sets
+    # `validate_assignment`, so this re-runs the field validators and the
+    # I-B1 model validator against the rendered text. `model_copy` would not,
+    # and a field that is re-validated by an update but not by a construction
+    # is a field nobody can reason about.
+    response.rca_markdown = warroom.render_markdown(dispatch)
     return TriageOutcome(
-        response=_tier2_response(payload, result, severity, confidence, latency_ms),
+        response=response,
         tier=BlastRadiusTier.TIER_2_ARCHITECTURAL,
         reasons=reasons,
         latency_ms=latency_ms,
+        dispatch=dispatch,
     )
 
 

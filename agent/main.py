@@ -46,6 +46,7 @@ from pydantic import ValidationError
 
 import triage
 from budget import JobBudget, budget_from_env
+from classifier import ManifestProvider, manifest_provider_from_env
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner
 from models import IncidentPayload, TriageResponse
 
@@ -120,11 +121,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     budget = getattr(app.state, "job_budget", None)
+    provider = getattr(app.state, "manifest_provider", None)
+    # The logged provider name is derived from the object, not hard-coded. The
+    # startup line used to say `manifest_provider=unreadable` unconditionally,
+    # which is a claim about the service's capability printed by the service
+    # itself. Wiring a GitOps checkout in would have made that line a lie, and a
+    # log that misreports whether patches are possible is worse than no log:
+    # an operator reads it to decide whether Tier-1 is reachable.
     logger.info(
-        "srek3s agent starting: version=%s manifest_provider=unreadable "
-        "(tier-1 patches require a GitOps checkout, ARCH 5.4 I-B2) "
-        "max_active_jobs=%s",
+        "srek3s agent starting: version=%s manifest_provider=%s "
+        "job_budget=%s max_active_jobs=%s",
         triage.AGENT_VERSION,
+        type(provider).__name__ if provider is not None else "unset",
+        "configured" if provider is not None else "unconfigured",
         getattr(budget, "max_active", "unknown"),
     )
     yield
@@ -162,7 +171,10 @@ def _busy(request_id: str, budget: JobBudget) -> JSONResponse:
     )
 
 
-def create_app(job_budget: JobBudget | None = None) -> FastAPI:
+def create_app(
+    job_budget: JobBudget | None = None,
+    manifest_provider: ManifestProvider | None = None,
+) -> FastAPI:
     """Application factory.
 
     A factory rather than a module-level singleton so tests can build an
@@ -171,6 +183,17 @@ def create_app(job_budget: JobBudget | None = None) -> FastAPI:
     ``job_budget`` is injectable so a test can set a tiny budget, or hold a slot
     open deliberately, and observe the 429 path against the real handler rather
     than against a mock of it.
+
+    ``manifest_provider`` is injectable for the same reason, and it is the
+    difference between an agent that can only escalate and one that can reach
+    Tier-1. It is threaded to :func:`triage.triage_payload` on every request.
+
+    **The default is still fail-closed.** ``None`` means "take it from the
+    environment", and an unset ``SREK3S_MANIFEST_ROOT`` yields
+    :func:`unreadable_manifest_provider`, so a deployment with no GitOps
+    checkout behaves exactly as before: every incident escalates and no patch
+    is emitted. Making Tier-1 reachable is therefore an explicit, logged
+    deployment act rather than a side effect of this refactor.
     """
     application = FastAPI(
         title="SREK3S Triage Agent",
@@ -205,6 +228,18 @@ def create_app(job_budget: JobBudget | None = None) -> FastAPI:
     # inspect counters, and so it is replaced wholesale per instance rather than
     # shared between tests through a module global.
     application.state.job_budget = job_budget or budget_from_env()
+
+    # Resolved once, at construction, and held on app.state. Resolving per
+    # request would re-stat the checkout on the hot path and, worse, would make
+    # the provider's identity depend on when the request arrived - so a
+    # mid-incident change of configuration could change the tier decision for a
+    # retry of the same payload. The provider is a deployment fact, not a
+    # per-request one.
+    application.state.manifest_provider = (
+        manifest_provider
+        if manifest_provider is not None
+        else manifest_provider_from_env()
+    )
 
     # Constructed eagerly, not lazily: tests inspect the runner's peak-concurrency
     # counter, and an absent sandbox should be a configuration fact rather than a
@@ -407,7 +442,11 @@ def create_app(job_budget: JobBudget | None = None) -> FastAPI:
             )
 
         try:
-            outcome = await run_in_threadpool(triage.triage_payload, payload)
+            outcome = await run_in_threadpool(
+                triage.triage_payload,
+                payload,
+                manifest_provider=getattr(request.app.state, "manifest_provider", None),
+            )
         except Exception:  # noqa: BLE001 - catch-all, see module docstring
             # The traceback stays server-side. An unrecoverable failure escalates
             # the incident to Tier-2, which is the safe direction: a human sees
