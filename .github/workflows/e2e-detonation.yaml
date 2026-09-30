@@ -530,12 +530,23 @@ jobs:
       # SNAPSHOT_KINDS is the workload kinds, not `all` plus RBAC: the comparison
       # ignores the chaos and system namespaces and needs the objects a
       # remediation could plausibly change.
+      #
+      # The selector is passed and is not used. `main` declares it as a required
+      # positional, so argparse rejects the invocation before the --snapshot-out
+      # exit path is ever reached - which is what run on 3966578 did, exiting 2
+      # with "the following arguments are required: selector".
+      #
+      # It is passed rather than made optional because that is a change to
+      # runner.py, and the workflow is what this commit was scoped to. Worth
+      # naming as a design point rather than leaving as a trap: a required
+      # positional that the snapshot path never reads will be forgotten again by
+      # whoever writes the next snapshot invocation.
       # ---------------------------------------------------------------
       - name: Take Pre-Flight Cluster Snapshot
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          PYTHONUNBUFFERED=1 python tests/e2e/runner.py \
+          PYTHONUNBUFFERED=1 python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
             --snapshot-out /tmp/snapshot-before.yaml
           if [ ! -s /tmp/snapshot-before.yaml ]; then
             echo "::error::the pre-flight snapshot is empty. An empty before-image"
