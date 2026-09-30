@@ -25,6 +25,7 @@ dist/
 .mypy_cache/
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .venv/
 venv/
@@ -43,4 +44,80 @@ probe_*.go
 scrubber.test
 cpu*.out
 ci-g3-output.txt
+
+# ---------------------------------------------------------------------------
+# Credentials and local tool configuration
+#
+# Added after a `git add -A` swept opencode.json into a commit. That file holds
+# a live GitHub personal access token, and GitHub push protection rejected the
+# push - the only reason it never reached origin/main. It was a lucky outcome:
+# nothing in the local gates would have caught it, because a leaked token is not
+# a syntax error and not a type error.
+#
+# The rule generalised: `git add -A` in a working tree where tool configs appear
+# has an unbounded blast radius, and the mitigation is to make the credential
+# shapes un-addable rather than to remember not to add them.
+# ---------------------------------------------------------------------------
+
+# Tool configuration that carries credentials. opencode.json holds
+# GITHUB_PERSONAL_ACCESS_TOKEN; .mcp.json is the other standard MCP location and
+# has the same shape.
 opencode.json
+.mcp.json
+
+# Environment files, matched at any depth rather than only at the repository
+# root. A first attempt anchored these with a leading slash so that
+# `.env.example` would survive by accident; a negative control then showed the
+# cost - a token in `agent/.env` was unprotected, which is just as leaked as one
+# at the root. So the pattern is broad and the example forms are re-admitted
+# explicitly, which is the trade the previous version was making by accident.
+.env*
+!.env.example
+!.env.sample
+!.env.template
+
+# Cluster credentials. The E2E workflow reads KUBECONFIG from the environment,
+# so a developer's kubeconfig landing at the repo root is an expected accident.
+kubeconfig
+kubeconfig.yaml
+*.kubeconfig
+
+# Key material. `*.key` is narrow: this repository has no tracked file matching
+# it today, which was checked rather than assumed, and a `Secret` fixture named
+# `something.key` would be a manifest test rather than key material.
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Cloud and package credentials, which follow developers into a repo root by
+# habit rather than by intent.
+.aws/
+.gcloud/
+credentials.json
+service-account*.json
+.netrc
+.npmrc
+.pypirc
+
+# ---------------------------------------------------------------------------
+# Kubernetes Secret manifests
+#
+# Deliberately narrow, and the tension is real: a redacted Secret fixture is a
+# legitimate thing to commit and blocking it would be wrong, but an unredacted
+# one is the single most common leak in a Kubernetes repository. Scoped to the
+# repository root so `deploy/**` can still hold reviewed, redacted fixtures,
+# which is what the deploy tests read.
+#
+# Nothing tracked matches this today.
+# ---------------------------------------------------------------------------
+/secrets.yaml
+/secrets.yml
+
+# Tooling binaries dropped into the working tree rather than installed.
+# github-mcp-server.exe is also matched by `*.exe` above; it is named explicitly
+# because it is unexpected in a Go/Python repository and should be recognised
+# when someone finds it.
+/github-mcp-server
