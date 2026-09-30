@@ -7,6 +7,7 @@
 | Status | Draft — **single source of truth for schemas and layout** |
 | Requirement source | `PRD.md` |
 | Delivery plan | `ROADMAP.md` |
+| Defect history | `docs/lessons-learned.md` |
 
 > Per AGENTS.md §5, this document is the single source of truth for schemas and directory
 > layout. Changes here require an explicit decision; roadmap tasks must not invent new

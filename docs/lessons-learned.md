@@ -12,9 +12,18 @@ they caused more wasted cycles than any individual bug:
 1. **A check that cannot fail is worse than a missing check.** It converts an
    untested claim into a falsely-proven one. This project produced that failure
    three times — see §8, §9 and §11.
-2. **A diagnostic you cannot read is not a diagnostic.** CI logs return HTTP 403
-   to the unauthenticated API for this repository, so step *names* are the finest
-   signal available. Most of §12 exists because of that constraint.
+2. **A diagnostic you cannot read is not a diagnostic.** For most of Milestone 4
+   this was a hard constraint: CI logs returned HTTP 403 to the unauthenticated
+   API, so step *names* were the finest signal available, and most of §12 exists
+   because of it. **That constraint has since been lifted** — see the correction
+   at the head of §12 — which makes the discipline it produced more valuable, not
+   less: every hypothesis formed from a step name instead of a log was a guess, and
+   the run that finally went green came from a hypothesis nobody had submitted.
+
+Sections 1–13 were written at the end of Milestone 4.2 and record what was known
+then. Sections 14–18 were added afterwards, covering defects found or closed
+later — including the Milestone 4.2 ratification run itself. Where an entry is
+reconstruction rather than verbatim record, it says so in place.
 
 ---
 
@@ -331,6 +340,21 @@ stories. The printer calls the runner's predicate rather than restating it.
 
 ## 12. Log-Blindness, and What It Costs
 
+> **CORRECTION — this constraint no longer holds, and the old text was the most
+> dangerous thing in this file.** CI logs used to return HTTP 403 to the
+> unauthenticated API, so only step and job *conclusions* were readable. That is
+> no longer true: an authenticated GitHub client can read full job logs, and it
+> now does. Milestone 4.2's final diagnosis — the `Terminated` dispatch failures
+> in §16 — came from reading the log text directly, not from a step name.
+>
+> If you are reading this and concluding that logs are unavailable, you have read
+> a stale constraint. The failure mode this section describes is now a choice, not
+> a limitation: every fix below remains correct, but the reason to split compound
+> steps is legibility, not necessity. The original text is kept because the
+> *discipline* it produced is what ended the guessing, and because a reader who
+> was told "logs are unreadable" once will not believe otherwise without seeing it
+> stated here.
+
 **Trap.** CI logs return HTTP 403 to the unauthenticated GitHub API for this
 repository. Only step and job *conclusions* are readable. A step that runs eleven
 checks and reports one boolean tells a reviewer nothing they can act on.
@@ -386,3 +410,180 @@ log that a maintainer could read.
   `mypy --strict agent/` was red "at HEAD" and that the gate "cannot currently
   pass". It had run `agent/` alone; the gate is `agent/ tests/`, and the gate was
   green. The actual defect it introduced was three errors in the real invocation.
+
+---
+
+## 14. Rule 7 and Rule 10 — Two Confirmed Secret Leaks (Milestone 1)
+
+### Quoting defeated the key pattern, so every JSON-form secret survived (D-1)
+
+- **What happened:** Rule 7 (`generic_secret_kv`) required `\s*[:=]` immediately
+  after the key name. Any closing quote sat between the two and the rule did not
+  match. Separately, the key was anchored with `\b`, which fails on `auth_token`
+  because `_` is a word character and therefore no boundary exists between the
+  segments. Measured against the ratified patterns, all three of these passed
+  through unchanged: `{"password":"hunter2"}`, `auth_token=abc123xyz789`, and
+  `reading /var/run/secrets/kubernetes.io/serviceaccount/token for kube-system`.
+- **Why it is a problem:** This is a plain credential leak in the safety path.
+  The scrubber is the only thing standing between raw container output and an LLM
+  and a network egress, and a rule that reports "matched" while matching nothing
+  is worse than an absent rule, because it is counted as coverage.
+- **How we fixed it:** Three changes to Rule 7: an optional `["']?` between key
+  and separator; the key prefixed `[\w-]{0,20}` with a non-capturing alternation so
+  multi-word keys match; and the key plus its trailing quote are **captured**, so
+  only the value is replaced. That last one is load-bearing — replacing the whole
+  match would destroy the surrounding JSON and break the Contract A payload the
+  agent parses. Negative controls confirm the widening did not become a
+  bludgeon: `token_count=12345`, `secret_version=v3`, `mytokenizer=abcdefgh` and
+  `password_policy=strict-mode-value` all survive untouched. Rule 10 now accepts
+  both word orders — the original required the namespace *before* the token,
+  while the canonical log form is the reverse — bounded to 80 non-newline
+  characters so it cannot reach across unrelated lines.
+
+### Marker-level redaction ran before block-level removal (D-3)
+
+- **What happened:** The per-line pass ran rule 11 `private_key_pem_body` before
+  the cross-line pass ran rule 1 `pem_private_key`. Rule 11 redacted only the
+  `-----BEGIN` marker, so by the time rule 1 saw the joined batch there was no
+  `BEGIN…END` pair left to match, and the base64 key body survived verbatim.
+- **Why it is a problem:** A private key is the highest-value secret in the
+  corpus, and the failure mode is a green report. The pipeline processed the log,
+  matched a rule, and shipped a body it believed it had removed.
+- **How we fixed it:** The cross-line pass runs **first**, on the raw lines, so
+  rule 1 sees an intact block; multi-line rules therefore evaluate ahead of the
+  single-line fallbacks. Each `Rule` now carries `IsMultiLine`, and the cross-line
+  pass filters strictly on it, so single-line rules can never run against a joined
+  batch. The general rule, which cost a second defect (D-5) to learn: **block-level
+  removal must not be pre-empted by marker-level removal.**
+
+---
+
+## 15. A `type: ignore` That Was Correct on One Platform and Fatal on Another (Milestone 2)
+
+- **What happened:** `sandbox.py` carried `os.setsid()  # type: ignore[attr-defined]`.
+  `setsid` is absent from typeshed on Windows and present on Linux, so the ignore
+  was **used** on the `windows/arm64` development host and **dead** on
+  `ubuntu-latest`. `setup.cfg` sets `warn_unused_ignores = True`, so CI failed on
+  an ignore that the local machine was relying on.
+- **Why it is a problem:** This is the third host/CI divergence with the same
+  signature — green locally, red on CI, with no other signal. The failure mode is
+  that the local machine is not running the configuration that will be graded, so
+  a passing local gate stops being evidence of anything. It is also the exact
+  inverse of the usual worry: the ignore was not hiding a type error, it was
+  hiding the fact that the type only exists on one platform.
+- **How we fixed it:** `getattr(os, "setsid", None)`, which type-checks identically
+  on both. `agent/tests/test_compat_platform.py` now fails the build if an ignore
+  ever sits on a platform-sensitive line again, and it carries its own negative
+  control so the detector cannot silently stop working. See also §3: the same
+  milestone produced the PEP 701 case, where mypy accepts syntax the CI
+  interpreter rejects — two gates, one lesson, that a type checker is not a
+  portability check.
+
+---
+
+## 16. The Dedup Key Carries No Kind, So the Symptom Was Suppressed as a Duplicate (Milestone 4.2)
+
+- **What happened:** The dedup key is `<podUID>/<containerName>:<restartCount>`
+  and does not include the failure kind. A crash-looping container therefore
+  produces, for the *same* restart count, a transient
+  `Terminated{exit 1, reason: Error}` and then a `Waiting{CrashLoopBackOff}`. The
+  transient state claims the key first, and the state carrying the evidence is
+  rejected as a duplicate. The E2E log showed five `dispatch failed` lines for the
+  crashloop pod, every one `kind: Terminated — failure kind has no wire
+  representation`, and **not one** `CrashLoopBackOff`. The emitter was never at
+  fault: refusing an unmappable kind is correct fail-closed behaviour, and
+  emitting the nearest member would have asserted an OOM kill that never
+  happened — which is precisely what unlocks a memory-limit diff.
+- **Why it is a problem:** A container was detected and then never reported at
+  all. The failure is silent in the worst way: the dedup cache is doing exactly
+  what it was built to do, and the observable result is that a real incident
+  disappears. Nothing in the system distinguishes "already seen this" from "seen
+  this, then it changed into something worse".
+- **How we fixed it:** Non-OOM terminations are dropped in `internal/k8s/watcher.go`
+  **before the record is constructed**, so the un-serialisable state never claims
+  a key. Mapping `Terminated` to `CrashLoopBackOff` instead was rejected: it
+  would report the kubelet asserting a state the Sentinel never observed, and it
+  would make the 4.2.7 check pass without ever exercising it.
+- **The limitation this leaves, recorded deliberately.** A container that exits
+  non-zero and *stays dead* — `restartPolicy: Never` — is now completely silent.
+  It is neither an OOM nor a backoff, so no record is built. This is a real
+  observability hole introduced by the fix, accepted because the architect ruled
+  the schema must not widen, and it is written down here so that a later
+  maintainer rediscovers it as a decision rather than re-deriving it as a bug.
+
+---
+
+## 17. Blind Structural Changes, Because the Failure Left No Trace (Milestone 4)
+
+- **What happened:** Four consecutive CI runs were consumed by hypotheses formed
+  from step *names* alone, two of them wrong, one costing two runs. The
+  structural changes thrown at the pipeline during that stretch were blind: the
+  interesting shape of the episode is a fixture whose failure mode was altered
+  to try to make evidence appear, when the evidence's absence was a property of
+  the *observation*, not of the workload. A Deployment forces
+  `restartPolicy: Always`, so an OOM'd pod settles permanently into
+  `CrashLoopBackOff` and the chain `Terminated → Waiting{CrashLoopBackOff}` is
+  observable — but only if sampled *across* the lifecycle, because the kubelet
+  clears `state.terminated` the instant it restarts the container. A pod
+  configured to *not* restart removes the backoff states entirely: it would
+  produce a `Terminated` and then nothing, so an assertion on the symptom would
+  see no symptom and the change would read as a regression rather than as the
+  removal of the very evidence being looked for.
+- **Why it is a problem:** Changing the system under test in order to make a test
+  pass is the failure mode that produces green runs proving nothing. It is
+  especially dangerous when the change is *plausible* — a `restartPolicy` edit
+  looks like configuration, and its blast radius reaches the causal chain the
+  runner depends on. The reason it kept happening is the one in §12: with no
+  readable log, the only evidence available was a boolean, and a boolean cannot
+  distinguish "the workload failed differently" from "the observation is still
+  wrong".
+- **How we fixed it:** Two independent changes, one to the harness and one to the
+  discipline. The harness: the runner is started **before** the fixture and samples
+  across the whole lifecycle, and each invariant became its own named step so a
+  failure names itself (§9, §10, §12). The discipline, which was the part that
+  actually mattered: **refusing to submit a fourth blind change and asking instead
+  for a log a maintainer could read.** A green run arrived on the next attempt
+  from a hypothesis nobody had submitted, which is the clearest possible statement
+  of what the previous four runs had been buying.
+- **Provenance note.** The four-run episode, the two wrong hypotheses and the
+  fourth-change refusal are recorded in §12. The `restartPolicy: Never` framing is
+  an account of the *shape* of the change rather than a verbatim record: no
+  `restartPolicy: Never` fixture exists in `deploy/chaos/`, and
+  `tests/e2e/runner.py` documents only the `Always` case. It is written down here
+  as the generalisable trap — do not alter the subject to satisfy the observer —
+  and flagged as reconstruction so a later reader does not treat it as a quote.
+
+---
+
+## 18. `git add -A` in a Tree Where Tool Configs Appear (Milestone 4.2)
+
+- **What happened:** A `git add -A` swept `opencode.json` — the MCP config created
+  when the GitHub server was added — into a commit. It holds a live personal
+  access token on line 15.
+- **Why it is a problem:** Every local gate passed over it. A leaked credential is
+  not a syntax error and not a type error, so `go vet`, `gofmt`, `black`,
+  `flake8`, `mypy --strict` and the test suites all reported green over a
+  repository containing a live secret. The only thing that caught it was GitHub
+  push protection, a server-side rule that happened to exist. Had the repository
+  not had push protection enabled, the token would have been public history and
+  the recovery would have been rotation plus history rewrite rather than one
+  amended commit.
+- **How we fixed it:** The token was removed from the commit, the orphaned object
+  was pruned with `reflog expire --expire=now --all` and `git gc --prune=now`, and
+  the token was rotated. The durable fix is that credential-bearing files are now
+  un-addable **by shape and at any depth** — `opencode.json`, `.mcp.json`, `.env*`,
+  kubeconfig in all spellings, PEM and key material, cloud and package
+  credentials — with template and fixture forms re-admitted explicitly so the
+  protection costs no legitimate commit. A landmine check confirms **zero** already
+  tracked files are matched by any pattern, because a pattern that shadows a
+  tracked file silently untracks it on the next `git add`.
+- **The second channel, which the first fix missed.** `.gitignore` protects
+  exactly one channel. The Docker build context is uploaded to the daemon on every
+  `docker build -f agent/Dockerfile .`, and `ci.yaml` does precisely that, so the
+  token was in the context of every CI and local build. No `COPY` reaches the
+  repository root, so it was never baked into an image layer — but it was
+  uploaded, which becomes a network transfer the moment anyone builds against a
+  remote builder. `.dockerignore` now lists the same shapes, and the two files say
+  in comments that they must be kept in step. The generalisable form: **a file one
+  ignore list protects is still shipped by every other channel that reads the
+  working tree.**
