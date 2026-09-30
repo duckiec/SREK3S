@@ -705,6 +705,55 @@ def _namespace_exists() -> bool:
     )
 
 
+def _namespace_terminating() -> bool:
+    """Whether the namespace exists *and* carries a deletionTimestamp.
+
+    A namespace mid-deletion still answers `get`, so `_namespace_exists` is
+    true for one, and everything created inside it is refused. This is the state
+    that made the second live test fail in CI run 36787429694.
+    """
+    result = _kubectl_raw(
+        [
+            "get",
+            "namespace",
+            VERIFY_NAMESPACE,
+            "-o",
+            "jsonpath={.status.phase}",
+        ]
+    )
+    return result.returncode == 0 and result.stdout.strip() == "Terminating"
+
+
+def _await_namespace_absent(deadline_seconds: int) -> None:
+    """Block until the namespace is genuinely gone, or raise.
+
+    Bounded and checked. The previous `kubectl wait --for=delete` was neither:
+    its return code was discarded, so a wait that failed or timed out left the
+    caller believing teardown had completed.
+
+    Absence is polled rather than waited on because `wait --for=delete` on a
+    namespace is not reliable across apiserver versions - a namespace stuck
+    Terminating is a real state, and the only honest signal is a `get` that
+    keeps failing until the deadline.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + deadline_seconds
+    while _time.monotonic() < deadline:
+        if not _namespace_exists():
+            return
+        _time.sleep(2.0)
+    phase = _kubectl_raw(
+        ["get", "namespace", VERIFY_NAMESPACE, "-o", "jsonpath={.status.phase}"]
+    )
+    raise RuntimeError(
+        f"namespace {VERIFY_NAMESPACE!r} still exists {deadline_seconds}s after "
+        f"deletion was requested (phase={phase.stdout.strip() or 'unknown'!r}). "
+        "A leaked namespace would make the next run reuse whatever state this "
+        "one left behind."
+    )
+
+
 @contextmanager
 def verify_namespace() -> Iterator[str]:
     """Create :data:`VERIFY_NAMESPACE` for the duration of a live test.
@@ -756,21 +805,42 @@ def verify_namespace() -> Iterator[str]:
                 f"kubectl apply reported success but namespace "
                 f"{VERIFY_NAMESPACE!r} does not exist"
             )
+        if _namespace_terminating():
+            raise RuntimeError(
+                f"namespace {VERIFY_NAMESPACE!r} was created but is already "
+                "Terminating; a previous run's deletion has not finished, and "
+                "nothing created in it will be admitted"
+            )
     try:
         yield VERIFY_NAMESPACE
     finally:
         if not existed:
-            # `--wait=false` and a bounded grace period: the API server finalises
-            # a namespace deletion asynchronously, and an unbounded wait here is
-            # indistinguishable from a hang.
+            # Delete, then *confirm the deletion completed* before returning.
+            #
+            # CI run 36787429694 is why this is not a fire-and-forget delete.
+            # Test 1 tore the namespace down and test 2 immediately created a
+            # Deployment in it, and got:
+            #
+            #     unable to create new content in namespace
+            #     srek3s-verify-chaos because it is being terminated
+            #
+            # The apiserver finalises a namespace deletion asynchronously, so
+            # the name is free before the object is gone. The first version used
+            # `delete --wait=false` followed by `wait --for=delete` and never
+            # checked either return code - `_kubectl_raw` exists precisely to not
+            # raise, so a wait that failed or timed out was indistinguishable
+            # from one that succeeded. The second test then raced the first
+            # test's teardown.
+            #
+            # The replacement polls for absence with a bounded deadline and
+            # raises if the namespace outlives it. Necessary and not sufficient,
+            # as everywhere else in this file: absence is confirmed, not assumed
+            # from an exit status.
             _kubectl_raw(
                 ["delete", "namespace", VERIFY_NAMESPACE, "--wait=false"],
                 timeout=120,
             )
-            _kubectl_raw(
-                ["wait", "--for=delete", f"namespace/{VERIFY_NAMESPACE}"],
-                timeout=180,
-            )
+            _await_namespace_absent(deadline_seconds=180)
 
 
 def _namespace_manifest() -> str:
@@ -1662,6 +1732,66 @@ class TestNamespaceLifecycle:
         )
         for key in ("enforce", "enforce-version", "audit", "warn"):
             assert f"pod-security.kubernetes.io/{key}" in actual
+
+    def test_teardown_confirms_deletion_rather_than_requesting_it(self) -> None:
+        """Teardown must *verify* the namespace is gone, not ask for it.
+
+        CI run 36787429694: the first live test tore the namespace down and the
+        second created a Deployment in it immediately, and got
+
+            unable to create new content in namespace srek3s-verify-chaos
+            because it is being terminated
+
+        The apiserver finalises a namespace deletion asynchronously, so the name
+        frees up before the object does. The previous teardown issued
+        `delete --wait=false` and then `wait --for=delete`, discarding both
+        return codes - `_kubectl_raw` exists to not raise, so a wait that failed
+        was indistinguishable from one that worked.
+        """
+        tree = ast.parse(pathlib.Path(__file__).read_text(encoding="utf-8"))
+        fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "verify_namespace"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert (
+            "_await_namespace_absent" in called
+        ), f"teardown must confirm the namespace is gone; it calls {sorted(called)}"
+        assert "wait" not in called, (
+            "`kubectl wait --for=delete` on a namespace is not reliable across "
+            "apiserver versions and its return code was being discarded; absence "
+            "is polled and checked instead"
+        )
+
+    def test_creation_refuses_a_terminating_namespace(self) -> None:
+        """A namespace mid-deletion still answers `get`, and refuses writes.
+
+        This is the exact state CI run 36787429694 hit, so the create path has to
+        recognise it rather than proceed and fail later with a Forbidden from a
+        command that has nothing to do with namespaces.
+        """
+        tree = ast.parse(pathlib.Path(__file__).read_text(encoding="utf-8"))
+        fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "verify_namespace"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "_namespace_terminating" in called
+        source = ast.unparse(fn)
+        assert "is already" in source and "Terminating" in source, (
+            "a Terminating namespace must be reported by name, not allowed to "
+            "surface later as an unrelated Forbidden"
+        )
 
     def test_the_warning_annotation_names_this_namespace(self) -> None:
         """Whoever runs `kubectl get ns` should be told what this is.
