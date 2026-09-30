@@ -742,6 +742,212 @@ jobs:
       # generator output against a checker that silently repaired it, and never
       # asked git about a diff the generator had actually produced.
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # Each invariant as its own step.
+      #
+      # The runner already reports every broken invariant at once, which is
+      # right for a human with a log and useless for anyone reading step
+      # conclusions - all the unauthenticated API returns. These steps do no
+      # checking of their own: each matches the failure text that one invariant
+      # alone can produce and re-reports it as a conclusion, so the failing
+      # step's *name* is the diagnosis.
+      #
+      # The strings are duplicated from runner.py rather than shared. That
+      # duplication is the cost, and a real one: rename a message in runner.py
+      # and the matching step goes quietly green. They are checked against
+      # runner.py at authoring time for exactly that reason.
+      # ---------------------------------------------------------------
+
+      - name: "Invariant: Logs were captured (non-empty, within the 100-line tail)"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "scrubbed_logs is empty" /tmp/runner.log
+            grep -qF "scrubbed_logs has" /tmp/runner.log
+            grep -qF "want list" /tmp/runner.log; then
+            echo "::error::invariant failed: Logs were captured (non-empty, within the 100-line tail)"
+            grep -nF -e "scrubbed_logs is empty" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Logs were captured (non-empty, within the 100-line tail)"
+
+
+      - name: "Invariant: No planted secret survived scrubbing"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "planted secret(s) in its scrubbed_logs" /tmp/runner.log; then
+            echo "::error::invariant failed: No planted secret survived scrubbing"
+            grep -nF -e "planted secret(s) in its scrubbed_logs" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: No planted secret survived scrubbing"
+
+
+      - name: "Invariant: Scrubbing actually masked something"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "scrubbed_logs contain no [REDACTED] marker" /tmp/runner.log; then
+            echo "::error::invariant failed: Scrubbing actually masked something"
+            grep -nF -e "scrubbed_logs contain no [REDACTED] marker" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Scrubbing actually masked something"
+
+
+      - name: "Invariant: Masking preserved diagnostic evidence"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "no planted-credential marker survived" /tmp/runner.log; then
+            echo "::error::invariant failed: Masking preserved diagnostic evidence"
+            grep -nF -e "no planted-credential marker survived" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Masking preserved diagnostic evidence"
+
+
+      - name: "Invariant: The container entered backoff (restart_count>=2)"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "no incident reached restart_count>=2" /tmp/runner.log; then
+            echo "::error::invariant failed: The container entered backoff (restart_count>=2)"
+            grep -nF -e "no incident reached restart_count>=2" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: The container entered backoff (restart_count>=2)"
+
+
+      - name: "Invariant: Only mappable reasons were emitted"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "carry a reason outside" /tmp/runner.log; then
+            echo "::error::invariant failed: Only mappable reasons were emitted"
+            grep -nF -e "carry a reason outside" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Only mappable reasons were emitted"
+
+
+      - name: "Invariant: OOMKilled(137) was observed"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "never observed Terminated" /tmp/runner.log
+            grep -qF "no observations; the pod was never seen" /tmp/runner.log; then
+            echo "::error::invariant failed: OOMKilled(137) was observed"
+            grep -nF -e "never observed Terminated" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: OOMKilled(137) was observed"
+
+
+      - name: "Invariant: CrashLoopBackOff was observed"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "never Waiting{{CrashLoopBackOff}}" /tmp/runner.log; then
+            echo "::error::invariant failed: CrashLoopBackOff was observed"
+            grep -nF -e "never Waiting{{CrashLoopBackOff}}" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: CrashLoopBackOff was observed"
+
+
+      - name: "Invariant: The cause preceded the effect"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "causal chain is inverted" /tmp/runner.log; then
+            echo "::error::invariant failed: The cause preceded the effect"
+            grep -nF -e "causal chain is inverted" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: The cause preceded the effect"
+
+
+      - name: "Invariant: Backoff samples carried the cause"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "sample carried previous_reason" /tmp/runner.log; then
+            echo "::error::invariant failed: Backoff samples carried the cause"
+            grep -nF -e "sample carried previous_reason" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Backoff samples carried the cause"
+
+
+      - name: "Invariant: Enough samples to see a chain at all"
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # No checking of its own. The runner already judged this invariant
+          # and wrote its verdict into /tmp/runner.log; this step only matches
+          # the text that invariant alone can produce and re-reports it as a
+          # step conclusion, because with CI logs returning 403 a step name is
+          # the finest diagnostic a reviewer has.
+          if             grep -qF "observation(s); the causal chain needs" /tmp/runner.log; then
+            echo "::error::invariant failed: Enough samples to see a chain at all"
+            grep -nF -e "observation(s); the causal chain needs" /tmp/runner.log || true
+            exit 1
+          fi
+          echo "  ok: Enough samples to see a chain at all"
+
+
       - name: Agent log (for triage on failure)
         if: failure()
         # `continue-on-error`: a diagnostic step that fails would replace the real
