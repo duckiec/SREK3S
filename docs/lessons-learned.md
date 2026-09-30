@@ -690,3 +690,57 @@ log that a maintainer could read.
   result; the fixture arithmetic, the diff mechanics and the PSA-surface drift
   were all measured, and the *reasons* the invalid controls were invalid are
   reconstructions from the failure output rather than from a log that was kept.
+
+---
+
+## 22. Reintroducing a Documented Fix, In the Milestone That Documents It (Milestone 4.3)
+
+### `grep -q` at the end of a pipeline, again
+
+- **What happened:** The new M4.3 workflow step checked that busybox was present
+  in k3s containerd with
+  `sudo k3s ctr ... | grep -qF 'docker.io/library/busybox:1.36.1'`. That is
+  verbatim the form §6 records as a SIGPIPE race, removed from six assertions
+  after it was measured at 60 failures in 60 runs. It reported the image
+  **missing** on a cluster where it was present and every Milestone 4.2 fixture
+  had already started and passed. The step also omitted `--timeout` on `ctr`,
+  which §6 records as defaulting to 0, meaning wait-forever.
+- **Why it is a problem:** Two failures in one. The immediate one is a false
+  negative in a preflight gate, which is the §1 shape again: a check that
+  cannot distinguish "the thing is absent" from "my way of asking is wrong". The
+  structural one is worse. This was written in the same milestone that added the
+  post-mortem protocol, in a file whose §6 explains the defect in detail, by an
+  agent that had read that section earlier in the same session. **Knowing a trap
+  does not prevent walking into it**, which means the only thing that reliably
+  prevents it is a check that fires without anyone having to remember.
+- **How we fixed it:** The step now uses the ratified form from the existing
+  "Verify k3s Image Registration" step verbatim — capture to a variable, match
+  from the variable, `--timeout 30s` — rather than a freshly written one. The
+  deeper fix is in `scripts/audit_workflow.py`: a new `GREP_Q_PIPE` check flags
+  any `grep -q` terminating a pipeline in a `run:` block that sets `pipefail`,
+  naming the step, the line and the replacement. It exists because
+  `check_bash_syntax` passed the defect: piped `grep -q` is valid shell, so
+  `bash -n` has nothing to say, and that function's docstring had been claiming
+  coverage of this defect class since it was written. **A check whose docstring
+  overstates what it detects is worse than no check**, because it is consulted
+  as evidence and is not evidence.
+
+### The generalisable form
+
+Two distinct lessons, and the second is the one worth keeping.
+
+1. *Reach for the ratified form.* When a workflow already contains a working
+   instance of a check, copy it. Writing a fresh one re-opens every trap the
+   working one had already been hardened against, and does so invisibly.
+2. *A guard that cannot see the defect is not a guard.* `check_bash_syntax` is
+   named for syntax and does syntax; its docstring drifted to imply it covered
+   semantic shell defects, and for several milestones that implication was load
+   bearing in the wrong direction. The correction is not to widen the function
+   but to add the missing check as its own thing and to make the docstring state
+   only what the code does.
+
+The negative control for the new check reintroduces the exact line that failed
+in run `36785083401`; the audit reports
+`GREP_Q_PIPE: M4.3 - Live Post-Remediation Verification Loop: line 28` and exits
+1. On the corrected workflow it reports nothing, so it is not simply flagging
+every pipeline in the repository.

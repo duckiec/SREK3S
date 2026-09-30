@@ -1227,10 +1227,31 @@ jobs:
             kubectl cluster-info 2>&1 | head -20 || true
             exit 1
           fi
-          sudo k3s ctr --namespace k8s.io images list 2>/dev/null \
-            | grep -qF 'docker.io/library/busybox:1.36.1' \
-            && echo "  ok: busybox:1.36.1 registered in k3s containerd" \
-            || { echo "::error::busybox:1.36.1 is not in k3s containerd; the bounded fixture cannot start"; exit 1; }
+          # Captured to a variable first, then matched from the variable, with no
+          # pipe - identical to the ratified "Verify k3s Image Registration" step
+          # above. The first draft of this check used
+          # `sudo k3s ctr ... | grep -qF ...` and it reported the image MISSING on
+          # a cluster where it was present and every other fixture had already
+          # started: `grep -q` exits the instant it matches, the writer takes
+          # SIGPIPE, and `pipefail` hands that 141 to the pipeline in place of
+          # grep's 0. That is the defect in docs/lessons-learned.md section 6,
+          # reintroduced verbatim in the same milestone that quoted it, and it is
+          # why this step reuses the ratified form instead of a fresh one.
+          # `--timeout 30s` because ctr's default of 0 means wait-forever, and a
+          # step timeout is reported by CI as `failure` - byte-identical to an
+          # error, so an unbounded wait is indistinguishable from a real one.
+          images=$(sudo k3s ctr --timeout 30s --namespace k8s.io images list) || {
+            echo "::error::could not list images in the k8s.io namespace for the M4.3 step"
+            exit 1
+          }
+          # -F: the reference is a literal and the dots in `docker.io` are not a
+          # pattern to be interpreted.
+          grep -qF 'docker.io/library/busybox:1.36.1' <<<"$images" || {
+            echo "::error::busybox:1.36.1 is not in k3s containerd; the bounded fixture cannot start"
+            grep -i busybox <<<"$images" || echo "  (no busybox image at all)"
+            exit 1
+          }
+          echo "  ok: busybox:1.36.1 registered in k3s containerd"
 
           echo
           echo "=== M4.3 live verification loop ==="

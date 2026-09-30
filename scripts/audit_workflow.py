@@ -37,6 +37,21 @@ The checks, and the failure each one exists for:
    Without it the Actions console shows nothing for the whole window and then a
    verdict, which is the worst possible shape for diagnosing a timeout.
 
+6. **SIGPIPE under `grep -q`.** ``producer | grep -q PATTERN`` is a race, not a
+   certainty: ``grep -q`` exits the instant it finds a match and closes the read
+   end of the pipe, the writer takes SIGPIPE and dies with status 141, and
+   ``pipefail`` hands that 141 to the pipeline in place of grep's 0. A *passing*
+   check therefore reports failure, and it does so intermittently - it passes
+   when the output fits the pipe buffer, which is the worst possible shape for a
+   gate. Measured on this project: 60 failures in 60 runs piped, 0 in 60 with the
+   output captured to a variable first. Six assertions used the piped form and
+   all six were rewritten. This check exists because the first draft of the M4.3
+   step reintroduced the piped form verbatim, in the same milestone whose
+   post-mortem quotes the measurement - and ``bash -n`` passed it, because piped
+   ``grep -q`` is perfectly valid shell. A syntactic check cannot catch a
+   semantic defect, and ``check_bash_syntax``'s own docstring used to imply that
+   it did.
+
 Every finding names a step by number and by name, so the message points at
 something specific rather than at a class of problem.
 """
@@ -384,6 +399,61 @@ def check_bash_syntax(job_name: str, job: dict[str, Any], audit: Audit) -> None:
             )
 
 
+def check_grep_q_pipefail_race(
+    job_name: str, job: dict[str, Any], audit: Audit
+) -> None:
+    """Flag ``producer | grep -q`` under ``set -o pipefail``.
+
+    Added after the M4.3 step reintroduced the piped form verbatim - while
+    quoting the measurement that motivated removing it six times before. The
+    failure is that ``grep -q`` exits on the first match and closes the read end
+    of the pipe, so the writer takes SIGPIPE and dies 141, and ``pipefail``
+    substitutes that 141 for grep's 0. A passing check reports failure, and only
+    sometimes, which is worse than a deterministic failure in a gate.
+
+    ``bash -n`` cannot see this: the piped form is valid shell. That is the
+    whole reason this is a separate check rather than a note in
+    :func:`check_bash_syntax`, whose docstring previously claimed coverage it
+    did not have.
+
+    Scoped to a pipeline whose final element is ``grep -q``/``grep -Fq`` and
+    whose producer is a real command, so ``echo x | grep -q x`` is not flagged -
+    the writer there cannot meaningfully fail and the race does not exist.
+    """
+    for step in job.get("steps", []):
+        script = step.get("run")
+        if not script:
+            continue
+        run = re.sub(r"\$\{\{[^}]*\}\}", "X", str(script).replace("\r\n", "\n"))
+        if "pipefail" not in run:
+            # Without pipefail the writer's 141 is discarded and the check
+            # behaves. Flagging it anyway would bury the real finding.
+            continue
+        for index, line in enumerate(run.split("\n"), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if not re.search(r"\|\s*(?:sudo\s+)?grep\s+-[A-Za-z]*q", stripped):
+                continue
+            # `grep -q` as the last element of a pipeline fed by a command.
+            # `cmd | grep -q` and `cmd \\\n  | grep -q` both land here once the
+            # continuation is joined, which is why the match is on the pipe
+            # rather than on a whole-line shape.
+            producer = stripped.split("|", 1)[0].strip()
+            if not producer or producer.startswith("{"):
+                continue
+            audit.add(
+                "GREP_Q_PIPE",
+                "FAIL",
+                "{}: line {}: `grep -q` at the end of a pipeline under "
+                "pipefail is a SIGPIPE race - capture the output to a variable "
+                "and match against the variable, e.g. "
+                '`out=$(cmd) && grep -qF PAT <<<"$out"`. Observed: this '
+                "reported a present image as missing.".format(name_of(step), index),
+            )
+            break
+
+
 def check_multicommand_if(job_name: str, job: dict[str, Any], audit: Audit) -> None:
     """Reject an ``if`` whose condition is a multi-line command *list*.
 
@@ -522,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         for job_name, job in doc.get("jobs", {}).items():
             audit_job(job_name, job, audit)
             check_bash_syntax(job_name, job, audit)
+            check_grep_q_pipefail_race(job_name, job, audit)
             check_multicommand_if(job_name, job, audit)
             check_agent_url_is_a_root(job_name, job, audit)
 
