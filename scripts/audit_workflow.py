@@ -384,6 +384,84 @@ def check_bash_syntax(job_name: str, job: dict[str, Any], audit: Audit) -> None:
             )
 
 
+def check_multicommand_if(job_name: str, job: dict[str, Any], audit: Audit) -> None:
+    """Reject an ``if`` whose condition is a multi-line command *list*.
+
+    ``if grep A; grep B; grep C; then`` is not "A or B or C". It is a list of
+    three commands whose status is the last one's, so only needle C decides the
+    branch. Two of this workflow's eleven invariant steps were written that way
+    by a generator that joined its needles with newlines, and both reported
+    green no matter what the runner said.
+
+    Found because a step that reads ``scrubbed_logs is empty`` was reported as
+    passing while the log contained exactly that text - i.e. a guard that
+    could not fail, which is the failure mode AGENTS.md 5.5 exists to catch.
+    Written to run on the *rendered* run: block, since YAML block scalars
+    re-indent a generator's output and the shape in the file is not the shape
+    the generator wrote.
+    """
+    for step in job.get("steps", []):
+        script = str(step.get("run") or "")
+        if not script:
+            continue
+        run = script.replace("\r\n", "\n").split("\n")
+        for index, line in enumerate(run):
+            # `^\s*if\b.*\bgrep\b`, and deliberately not the more elaborate
+            # `^\s*if\s+.*(?:^|\s)grep\b` that came first. That version only
+            # matched when there were two or more spaces after `if`, because
+            # `(?:^|\s)` had to match a space that `\s+` had already consumed and
+            # could only backtrack into if more than one was available. So the
+            # guard silently passed the exact defect it was written for, and its
+            # negative control reported "not fired" for a run in which the defect
+            # was present. A regex that fails open on the common spacing is worse
+            # than no regex.
+            if not re.match(r"^\s*if\b.*\bgrep\b", line):
+                continue
+            if "||" in line:
+                continue
+            # Only the multi-line case is checked. A single-line `if cmd; then`
+            # cannot be a command list, and trying to split a single line on `;`
+            # is wrong: one of this workflow's needles is
+            # `observation(s); the causal chain needs`, whose semicolon is
+            # inside quotes. Splitting on it produced a false positive on a
+            # correct step, which is how the first two versions of this check
+            # were useless in opposite directions.
+            #
+            # The limitation is real and left visible: a hand-written single-line
+            # `if grep A; grep B; then` would pass this check.
+            if line.rstrip().endswith("; then"):
+                continue
+            body = [line]
+            for follower in run[index + 1 :]:
+                body.append(follower)
+                if follower.rstrip().endswith("; then"):
+                    break
+            else:
+                continue
+            commands = [
+                part.rstrip() for part in "\n".join(body).split("\n") if part.strip()
+            ]
+            # A pipeline is one command, however many greps appear in it, so a
+            # line that continues with `\`, `|`, `||` or `&&` does not make a
+            # list. ci.yaml's GPU gate is exactly this:
+            #     if grep -vE '^\s*#' requirements.txt \
+            #        | grep -iE 'torch|cuda'; then
+            # and flagging it would be a false positive on a security check that
+            # is correct.
+            continued = all(
+                part.endswith(("\\", "|", "||", "&&")) for part in commands[:-1]
+            )
+            if len(commands) > 1 and not continued:
+                audit.add(
+                    "IF_CONDITION_LIST",
+                    "FAIL",
+                    "{}: an `if` condition lists {} commands without a `||`, `|` "
+                    "or line continuation; only the last decides the branch".format(
+                        name_of(step), len(commands)
+                    ),
+                )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -405,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         for job_name, job in doc.get("jobs", {}).items():
             audit_job(job_name, job, audit)
             check_bash_syntax(job_name, job, audit)
+            check_multicommand_if(job_name, job, audit)
 
     print("\n=== findings ===")
     print(audit.report())

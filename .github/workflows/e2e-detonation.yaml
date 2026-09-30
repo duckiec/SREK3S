@@ -799,9 +799,9 @@ jobs:
           # the text that invariant alone can produce and re-reports it as a
           # step conclusion, because with CI logs returning 403 a step name is
           # the finest diagnostic a reviewer has.
-          if             grep -qF "scrubbed_logs is empty" /tmp/runner.log
-            grep -qF "scrubbed_logs has" /tmp/runner.log
-            grep -qF "want list" /tmp/runner.log; then
+          if grep -qF "scrubbed_logs is empty" /tmp/runner.log ||
+          grep -qF "scrubbed_logs has" /tmp/runner.log ||
+          grep -qF "want list" /tmp/runner.log; then
             echo "::error::invariant failed: Logs were captured (non-empty, within the 100-line tail)"
             grep -nF -e "scrubbed_logs is empty" /tmp/runner.log || true
             exit 1
@@ -903,8 +903,8 @@ jobs:
           # the text that invariant alone can produce and re-reports it as a
           # step conclusion, because with CI logs returning 403 a step name is
           # the finest diagnostic a reviewer has.
-          if             grep -qF "never observed Terminated" /tmp/runner.log
-            grep -qF "no observations; the pod was never seen" /tmp/runner.log; then
+          if grep -qF "never observed Terminated" /tmp/runner.log ||
+          grep -qF "no observations; the pod was never seen" /tmp/runner.log; then
             echo "::error::invariant failed: OOMKilled(137) was observed"
             grep -nF -e "never observed Terminated" /tmp/runner.log || true
             exit 1
