@@ -650,3 +650,103 @@ def _pod_crashloop() -> dict[str, Any]:
             ]
         }
     }
+
+
+def test_a_window_opened_after_the_restart_cannot_see_the_cause() -> None:
+    """Why the runner must start before the fixture.
+
+    `is_oom` is `exit_code == 137`, and `read_observation` reads exit_code from
+    `state.terminated`. By the time a pod is in CrashLoopBackOff the kubelet has
+    cleared `state.terminated`: the 137 survives only in `lastState`, which
+    lands in previous_exit_code. So a runner whose window opens after the
+    restart observes the symptom and nothing else, and the chain check fails no
+    matter how healthy the system under test was.
+
+    This is a property of the cluster, not of the harness, so it is asserted
+    rather than assumed - and it is asserted in the failing direction, because
+    a test that only proves the happy path would still pass with the sampling
+    window in the wrong place.
+    """
+    during_backoff = [
+        Observation(
+            timestamp=float(i),
+            state="CrashLoopBackOff",
+            exit_code=None,
+            reason=None,
+            restart_count=2,
+            previous_exit_code=137,
+            previous_reason="OOMKilled",
+        )
+        for i in range(1, 30)
+    ]
+    with pytest.raises(VerificationError) as error:
+        check_causal_chain(during_backoff)
+    message = str(error.value)
+    assert "never observed Terminated" in message, message
+    # The 137 IS present in the samples, in lastState. The failure is about
+    # where the harness looked, which is why the message has to name the
+    # symptom it did see rather than just the one it missed.
+    assert "CrashLoopBackOff/exit=None" in message, message
+
+
+def test_the_capture_is_read_after_sampling(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order inside main() is load-bearing, not incidental.
+
+    The proxy appends for as long as it runs. Reading the capture *before*
+    sampling would load a file that at that moment is empty, and the run would
+    then fail "no incidents collected" even though the Sentinel went on to emit
+    several. So the capture is written by the fake poller and the order of the
+    two events is asserted directly.
+
+    Asserted as a sequence rather than as call counts, because a count cannot
+    distinguish "loaded once" from "loaded before anything was sampled" - which
+    is precisely the bug. An earlier version of this test counted calls and
+    passed while testing nothing.
+    """
+    import runner as runner_module
+
+    capture = tmp_path / "captured.jsonl"
+    events: list[str] = []
+
+    def _fake_get_pod(namespace: str, selector: str) -> dict[str, Any]:
+        if not events:
+            # The Sentinel "emits" during the first poll, exactly as the proxy
+            # would record it: the capture only exists once sampling has begun.
+            capture.write_text(
+                json.dumps(good_incident() | {"restart_count": 3}) + "\n",
+                encoding="utf-8",
+            )
+        events.append("sampled")
+        return _pod_terminated() if events.count("sampled") == 1 else _pod_crashloop()
+
+    def _tracking_load(path: str) -> list[dict[str, Any]]:
+        events.append("loaded")
+        return original_load(path)
+
+    original_load = runner_module.load_incidents
+    monkeypatch.setattr(runner_module, "get_pod", _fake_get_pod)
+    monkeypatch.setattr(runner_module, "load_incidents", _tracking_load)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    runner_module.main(
+        [
+            "srek3s.io/chaos=oom",
+            "--incident-file",
+            str(capture),
+            "--observe-seconds",
+            "0.3",
+        ]
+    )
+
+    assert events, "main() did neither"
+    # Counted rather than echoed: a 90s window polls ~90 times, and dumping the
+    # whole event list buries the one fact the assertion is about.
+    sampled = events.count("sampled")
+    assert events[-1] == "loaded", (
+        f"capture read before sampling finished ({sampled} polls, loaded at "
+        f"position {len(events) - 1})"
+    )
+    assert events[0] == "sampled", "sampling did not start first"
+    assert sampled > 1, f"only {sampled} poll(s)"

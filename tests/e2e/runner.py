@@ -582,24 +582,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     incidents: list[dict[str, Any]] = []
     observations: list[Observation] = []
 
-    if args.incident_file:
-        incidents = load_incidents(args.incident_file)
-
     # Sampling is NOT in an `else`. It was, and that made the two halves of the
     # report mutually exclusive: passing --incident-file supplied payloads but
     # zero observations, so check_causal_chain raised "no observations; the pod
     # was never seen" and verify() added a second failure for the sample count.
     # A run wired the obvious way - capture the wire, then verify - could only
-    # ever fail, just with a different message. The two halves check different
-    # things and both are required: the captured file supplies the payloads,
-    # live sampling supplies the pod-state timeline that proves the cause
-    # preceded the effect.
+    # ever fail, just with a different message. Both halves are required and
+    # both are collected.
+    #
+    # Sampling runs BEFORE the capture is read, and the order is load-bearing.
+    # The capture proxy appends for as long as it is running, so a runner
+    # started before the chaos fixture is applied sees the whole lifecycle: the
+    # cause while the container is still Terminated, and the symptom after it
+    # restarts. Reading the capture first - or starting the runner after the
+    # fixture - opens the window too late, and `check_causal_chain` then fails
+    # with "never observed Terminated{exit_code: 137}" because a poll taken
+    # after the restart can only ever show the symptom. This function's own
+    # docstring says so, and the workflow was doing the opposite.
     deadline = time.monotonic() + args.observe_seconds
     while time.monotonic() < deadline:
         pod = get_pod(args.namespace, args.selector)
         if pod is not None:
             observations.extend(read_observation(pod))
         time.sleep(1.0)
+
+    if args.incident_file:
+        incidents = load_incidents(args.incident_file)
 
     report = verify(incidents, observations, window=args.observe_seconds)
     print(render(report))

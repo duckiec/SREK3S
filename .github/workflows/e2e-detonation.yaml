@@ -611,6 +611,52 @@ jobs:
       # unobservable before ~10s. A 5s or 10s deadline fails against a fixture
       # that is working perfectly.
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # 7a. Start the invariant runner BEFORE the fixture.
+      #
+      # This ordering is the whole point, and getting it wrong is silent.
+      # `check_causal_chain` verifies that Terminated{137} preceded
+      # Waiting{CrashLoopBackOff}, and by the time a pod reaches
+      # CrashLoopBackOff the kubelet has already cleared `state.terminated`:
+      # the 137 survives only in `lastState`, which `read_observation` files
+      # under previous_exit_code, not exit_code, and `is_oom` requires
+      # `exit_code == 137`. A runner whose window opens after the restart can
+      # therefore only ever observe the symptom, and the check fails with
+      # "never observed Terminated{exit_code: 137}" however healthy the system
+      # under test was.
+      #
+      # The previous revision applied the fixture, waited for the pod to reach
+      # its failure state, and only then started the runner - guaranteeing the
+      # window opened too late. The runner's own docstring states the
+      # requirement that wiring contradicted.
+      #
+      # Backgrounded with the exit code written to a file, because `wait`
+      # cannot reach a job started in a previous step's shell and the verdict
+      # has to survive to the step that reports it.
+      # ---------------------------------------------------------------
+      - name: Start the E2E invariant runner (samples the whole lifecycle)
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          rm -f /tmp/runner.exit
+          (
+            rc=0
+            PYTHONUNBUFFERED=1 python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
+              --namespace "$CHAOS_NAMESPACE" \
+              --observe-seconds "${OBSERVATION_WINDOW:-90}" \
+              --incident-file /tmp/captured_incidents.jsonl \
+              > /tmp/runner.log 2>&1 || rc=$?
+            echo "$rc" > /tmp/runner.exit
+          ) &
+          echo $! > /tmp/runner.pid
+          sleep 2
+          if [ -f /tmp/runner.exit ]; then
+            echo "::error::the runner exited immediately; it must outlive the fixture"
+            cat /tmp/runner.log
+            exit 1
+          fi
+          echo "runner sampling for ${OBSERVATION_WINDOW:-90}s (pid $(cat /tmp/runner.pid))"
+
       - name: Apply the OOM chaos fixture (ROADMAP 4.1.2)
         timeout-minutes: 5
         run: |
@@ -642,30 +688,49 @@ jobs:
           kubectl -n "$CHAOS_NAMESPACE" logs -l srek3s.io/chaos=oom --tail=40 || true
           exit 1
 
-      - name: Run the E2E invariant runner (ROADMAP 4.2.1)
-        # The runner prints a NOTE line per sample, which is the live view of the
-        # Sentinel's progress. Unbuffered, or the console shows nothing for the
-        # whole observation window and then a verdict.
-        timeout-minutes: 10
+      - name: Assert the capture is non-empty (ROADMAP 4.2.1)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
-          echo "=== captured wire exchanges ==="
-          if [ -s /tmp/captured_incidents.jsonl ]; then
-            wc -l < /tmp/captured_incidents.jsonl
-          else
-            # Printed rather than swallowed. An empty capture is the single
-            # most informative thing this harness can report, and the runner's
-            # own message only says "no incidents collected" - which does not
-            # distinguish "the Sentinel never emitted" from "the proxy never
-            # saw it". This line does.
-            echo "::warning::the capture file is empty: the Sentinel emitted "
-            echo "::warning::nothing, or emitted past the proxy. Both are failures."
+          # Its own step, deliberately. "Did the Sentinel emit at all" and "did
+          # an invariant fail" are different investigations with different
+          # owners, and the runner's message for an empty capture - "no
+          # incidents collected" - does not distinguish "the Sentinel never
+          # emitted" from "the proxy never saw it". A step name can.
+          if [ ! -s /tmp/captured_incidents.jsonl ]; then
+            echo "::error::the capture file is empty: the Sentinel emitted nothing,"
+            echo "::error::or emitted past the proxy. Both are failures."
+            exit 1
           fi
+          echo "captured $(wc -l < /tmp/captured_incidents.jsonl | tr -d ' ') exchange(s):"
+          # No embedded python here on purpose. A multi-line `python -c` inside
+          # a YAML block scalar has to be indented to the block, and getting
+          # that wrong breaks the parse rather than the command - and the raw
+          # capture is dumped in the triage step below anyway.
+          grep -o '"incident_id":"[^"]*"' /tmp/captured_incidents.jsonl || true
+          grep -o '"restart_count":[0-9]*' /tmp/captured_incidents.jsonl || true
+          grep -o '"upstream_status":[0-9]*' /tmp/captured_incidents.jsonl || true
 
-          PYTHONUNBUFFERED=1 python tests/e2e/runner.py 'srek3s.io/chaos=oom' \
-            --namespace "$CHAOS_NAMESPACE" \
-            --observe-seconds "${OBSERVATION_WINDOW:-90}" \
-            --incident-file /tmp/captured_incidents.jsonl
+      - name: Run the E2E invariant runner (ROADMAP 4.2.1)
+        timeout-minutes: 10
+        run: |
+          set -uo pipefail
+          # Waits for the background runner started before the fixture and
+          # reports its verdict. `wait` is unavailable across steps, so that
+          # step wrote the exit code to a file.
+          deadline=$((SECONDS + 420))
+          while [ ! -f /tmp/runner.exit ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the runner never finished; it should have exited by now"
+              cat /tmp/runner.log
+              exit 1
+            fi
+            sleep 2
+          done
+          cat /tmp/runner.log
+          rc=$(cat /tmp/runner.exit)
+          echo "runner exit code: $rc"
+          exit "$rc"
 
       # ---------------------------------------------------------------
       # 10. The patch, verified against a real repository.
