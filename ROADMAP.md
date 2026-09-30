@@ -1289,8 +1289,40 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       requeues alongside a budget reporting 0, which is the rewind this design
       exists to prevent. There is no `while` loop in the module, and a test
       asserts that too.
-- [ ] `4.3.4` Integration test: apply a correct Tier-1 diff via GitOps and assert a `Verified`
+- [x] `4.3.4` Integration test: apply a correct Tier-1 diff via GitOps and assert a `Verified`
       verdict; re-inject the same fault and assert `Unresolved` + promotion to Tier-2.
+      **Proven by run `36788100076`** (sha `8780b33`), both paths in one run:
+      `test_a_correct_tier1_diff_verifies PASSED` and
+      `test_reinjecting_the_fault_promotes_to_tier2 PASSED`, 41 passed in 83s. The
+      Verified path applied a real unified diff with real `git apply`, synced the
+      workload, and observed a container holding uptime above
+      `container_uptime_seconds_min` with zero OOM kills — returning `VERIFIED`
+      routing to `CLOSE_INCIDENT`. The Unresolved path reverted the limit and
+      observed a real OOM recurrence, returning `UNRESOLVED` with cause
+      `OOM_KILLED` routing to `PROMOTE_TO_TIER_2`.
+
+      Three supporting assertions ran in the same step, each guarding a failure
+      that would otherwise be silent: `srek3s-verify-chaos was removed` (a
+      teardown that did not run would make the next run reuse whatever state this
+      one left), `no verification objects in sentinel-chaos` (the isolation
+      ROADMAP 4.2.8's object count depends on), and `busybox:1.36.1 registered in
+      k3s containerd` (an `imagePullPolicy: Never` fixture cannot start without
+      it, and would otherwise report a confusing verdict rather than a setup
+      error).
+
+      **It took five runs to get here, and the failures were the point.** Run
+      `36785083401` failed on a `producer | grep -q` SIGPIPE race in the step's own
+      preflight — §6's defect, reintroduced in the milestone quoting it. Run
+      `36785803765` rendered the namespace manifest with `--dry-run=client` and
+      never applied it, so the "create" created nothing while exiting 0. Run
+      `36786601947` sized the fixture on the *payload* when the quantity that must
+      sit between the two limits is the *peak*: `$(head -c N ...)` buffers the whole
+      result before assignment, and a 90 MiB payload peaked above 128 MiB. Run
+      `36787429694` deleted the namespace without checking that the deletion
+      completed, and the second test raced the first test's teardown. Each was
+      caught only by the live cluster, which is the argument for having run this
+      live rather than declaring the box on the strength of 39 green offline
+      tests.
 - [x] `4.3.5` Assert the loop observes only — it performs no write of its own.
       **Proven twice, statically and at runtime.** `TestZeroWrites` (5 tests)
       introspects the module's AST: no import that could reach a cluster, and no
