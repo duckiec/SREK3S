@@ -130,13 +130,28 @@ NAMESPACE_MANIFEST: Final[Path] = _ROOT / "deploy" / "chaos" / "namespace.yaml"
 FROM_LIMIT: Final[str] = "64Mi"
 TO_LIMIT: Final[str] = "128Mi"
 
-#: The fixture's fixed demand, in bytes. 90 MiB - strictly between 64 and 128.
+#: The fixture's fixed payload, in bytes: 52 MiB.
 #:
-#: Read out of the manifest by `test_the_demand_sits_between_the_two_limits`
-#: rather than trusted from a constant here, because a constant in the test and
-#: a number in the fixture that agree only by luck is exactly the kind of
-#: agreement that stops being true when one of them is edited.
-BOUNDED_DEMAND_BYTES: Final[int] = 94_371_840
+#: The quantity that must sit between the two limits is the container's *peak*
+#: RSS, not this payload, and the difference is not academic. CI run 36786601947
+#: recorded a 90 MiB payload OOMKilled under a 128 MiB limit, so the peak exceeds
+#: 128 MiB for a 90 MiB payload - command substitution buffers the whole result
+#: before the shell can assign it, and the realloc growth puts the old and new
+#: buffers live simultaneously. A fixture sized on the payload alone is sized on
+#: the wrong quantity, and that is exactly how the 90 MiB version failed.
+BOUNDED_PAYLOAD_BYTES: Final[int] = 54_525_952
+
+#: The plausible range of peak-to-payload multiples, bracketed by what the
+#: cluster actually showed: a 90 MiB payload exceeded 128 MiB, so the multiple is
+#: above 1.42. 2.0 is the pessimistic end - the transient during realloc growth
+#: where the old and new buffers are both live.
+#:
+#: A range rather than a single figure, because the exact multiple is a property
+#: of busybox `ash`'s allocator and is not measured here. What *is* measured is
+#: that 52 MiB behaves correctly across the whole range, which is the property
+#: that makes the fixture mean the same thing on any machine.
+PEAK_MULTIPLE_MIN: Final[float] = 1.45
+PEAK_MULTIPLE_MAX: Final[float] = 2.0
 
 #: ARCH 5.2 floors the window at 60s. A test that passed against a window the
 #: spec forbids would mean nothing, so the floor is used verbatim.
@@ -1250,44 +1265,82 @@ class TestBoundedFixture:
         assert found is not None, f"unparseable allocation: {matches[0]!r}"
         return int(found.group(1))
 
-    def test_the_demand_sits_strictly_between_the_two_limits(self) -> None:
-        demand = self._allocated_bytes()
-        old = _mib(FROM_LIMIT)
-        new = _mib(TO_LIMIT)
-        assert old < demand < new, (
-            f"demand {demand} B ({demand / 2**20:.0f} MiB) must be strictly "
-            f"between {FROM_LIMIT} and {TO_LIMIT}, or the Tier-1 patch is not a "
-            "fix: below the old limit nothing OOMs, above the new one the old "
-            "limit was not the fault"
-        )
+    def test_the_peak_sits_strictly_between_the_two_limits(self) -> None:
+        """The PEAK must be between 64 and 128 - not the payload.
 
-    def test_the_demand_is_not_wedged_against_either_limit(self) -> None:
-        """Both margins must be wide enough that a node's baseline cannot flip it.
-
-        A demand of 126 MiB would survive 128Mi by 2 MiB and fail on any busier
-        node; a demand of 66 MiB would die at 64Mi only on an idle one. Either
-        makes the test pass for a reason that is not "the remediation worked".
+        Correcting the assertion CI falsified. The 90 MiB payload satisfied
+        "payload is between the limits" and the container was still OOMKilled at
+        128Mi, because command substitution's peak is a multiple of the payload.
+        Asserting on the payload would have passed on that broken fixture.
         """
-        demand = self._allocated_bytes()
-        mib = 2**20
-        assert demand - _mib(FROM_LIMIT) >= 8 * mib, (
-            "demand clears the faulting limit by under 8 MiB; the OOM would "
-            "depend on the node's baseline rather than on the demand"
-        )
-        assert _mib(TO_LIMIT) - demand >= 16 * mib, (
-            "demand leaves under 16 MiB of slack under the fixed limit; survival "
-            "would depend on the node's baseline rather than on the headroom"
+        payload_mib = self._allocated_bytes() / 2**20
+        old = _mib(FROM_LIMIT) / 2**20
+        new = _mib(TO_LIMIT) / 2**20
+        for multiple in _peak_multiples():
+            peak = payload_mib * multiple
+            assert old < peak < new, (
+                f"at a peak multiple of {multiple:.2f} the peak is "
+                f"{peak:.1f} MiB, which is not strictly between {FROM_LIMIT} and "
+                f"{TO_LIMIT}. Either the fixture never faults, or the Tier-1 "
+                "patch is not a fix."
+            )
+
+    def test_the_peak_is_not_wedged_against_either_limit(self) -> None:
+        """Both margins must hold across the whole plausible multiple range.
+
+        A payload whose peak only just clears 64Mi would fail to fault on a
+        machine with a smaller shell baseline; one that only just fits under
+        128Mi would fail to survive on a busier node. 48 MiB clears both across
+        1.45x-2.0x, and 40 or 44 MiB would not clear 64Mi at the low end.
+        """
+        payload_mib = self._allocated_bytes() / 2**20
+        old = _mib(FROM_LIMIT) / 2**20
+        new = _mib(TO_LIMIT) / 2**20
+        for multiple in _peak_multiples():
+            peak = payload_mib * multiple
+            assert peak - old >= 6, (
+                f"at {multiple:.2f}x the peak clears the faulting limit by only "
+                f"{peak - old:.1f} MiB; the fault would depend on the node's "
+                "baseline rather than on the payload"
+            )
+            assert new - peak >= 16, (
+                f"at {multiple:.2f}x the peak leaves only {new - peak:.1f} MiB of "
+                f"slack under the fixed limit; survival would depend on the "
+                "node's baseline rather than on the headroom"
+            )
+
+    def test_the_payload_is_centred_in_the_usable_band(self) -> None:
+        """Why 52 MiB rather than a number outside the usable band.
+
+        A regression guard on the *coarse* choice, so a later edit to a rounder
+        number has to argue for itself. The band is bounded below by what still
+        faults at 64Mi and above by what still fits at 128Mi, evaluated at the
+        pessimistic end of each constraint.
+
+        This is the coarse guard, not the fine one. 48 MiB passes here and is
+        still rejected, by `test_the_peak_is_not_wedged_against_either_limit`:
+        at the low end of the multiple range its peak clears 64Mi by only
+        5.6 MiB, and 1.45 is barely above the 1.42 the cluster actually
+        established, so that margin was not worth carrying. Two guards at two
+        granularities, because one number has two ways to be wrong.
+        """
+        payload_mib = self._allocated_bytes() / 2**20
+        lowest = _mib(FROM_LIMIT) / 2**20 / PEAK_MULTIPLE_MAX + 6
+        highest = _mib(TO_LIMIT) / 2**20 / PEAK_MULTIPLE_MIN - 16
+        assert lowest < payload_mib < highest, (
+            f"{payload_mib:.0f} MiB is outside the usable band "
+            f"({lowest:.1f}, {highest:.1f}) MiB across the plausible peak range"
         )
 
-    def test_the_documented_demand_matches_the_allocation(self) -> None:
+    def test_the_documented_payload_matches_the_allocation(self) -> None:
         """The constant in this test and the number in the fixture must agree.
 
         Two copies of a load-bearing number is a liability, so they are compared
         rather than trusted - and this is the check that would catch someone
         editing one of them.
         """
-        assert self._allocated_bytes() == BOUNDED_DEMAND_BYTES
-        assert str(BOUNDED_DEMAND_BYTES) in TARGET_MANIFEST.read_text(
+        assert self._allocated_bytes() == BOUNDED_PAYLOAD_BYTES
+        assert str(BOUNDED_PAYLOAD_BYTES) in TARGET_MANIFEST.read_text(
             encoding="utf-8"
         ), "the manifest's prose and its allocation have drifted apart"
 
@@ -1621,6 +1674,17 @@ class TestNamespaceLifecycle:
         warning = str(rendered["metadata"]["annotations"]["srek3s.io/warning"])
         assert VERIFY_NAMESPACE in warning
         assert "4.3" in warning
+
+
+def _peak_multiples() -> tuple[float, ...]:
+    """Peak-to-payload multiples checked at both ends and the midpoint.
+
+    Ends plus a midpoint rather than a sweep, because the assertion is about
+    margins and the margins are monotonic in the multiple - if both ends hold,
+    the interval between them holds.
+    """
+    mid = (PEAK_MULTIPLE_MIN + PEAK_MULTIPLE_MAX) / 2
+    return (PEAK_MULTIPLE_MIN, mid, PEAK_MULTIPLE_MAX)
 
 
 def _mib(quantity: str) -> int:

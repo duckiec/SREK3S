@@ -29,17 +29,38 @@
 #     64Mi  ->  OOMKilled on boot. This is the fault.
 #     128Mi ->  runs stably. This is the fix.
 #
-# The band is 90 MiB against 64/128, so the demand clears the new limit with
-# ~38 MiB of headroom on the allocation itself, while the remaining RSS is small
-# and bounded. It is not wedged against either limit, which would make the test
-# pass for the wrong reason - a fixture that survives 128Mi by 2 MiB would also
-# pass on a node with a slightly different baseline, and one that needs 126Mi
-# would fail on a busier node. See HEADROOM_NOTE for the arithmetic.
+# The band is 52 MiB of payload against 64/128 limits, and the number that has
+# to sit between them is the PEAK, not the payload - see PEAK_NOTE below, which
+# is the correction a live cluster forced.
 #
-# The gap to 64Mi is the other half of why this works: 90 MiB against a 64 MiB
-# limit is killed during the *allocation*, not after a slow climb, so the
-# failure is immediate and unambiguous rather than a probabilistic one that
-# might not fire before the observation window closes.
+# PEAK_NOTE. The first version of this fixture allocated 90 MiB and asserted
+# that 90 sat between 64 and 128. That assertion was arithmetically true of the
+# number written in the file and false of the container: CI run 36786601947
+# recorded
+#
+#     observation=ContainerObservation(visible=True, oomkilled_terminations=1,
+#                                     container_uptime_seconds=4)
+#
+# on a pod limited to 128Mi. The container was OOMKilled, so its peak exceeded
+# 128 MiB while the payload was only 90 MiB - a ratio above 1.42x.
+#
+# The reason is `BOUNDED=$(head -c N /dev/zero | tr ...)`. Command substitution
+# buffers the entire pipeline result before the shell can assign it, and the
+# realloc growth needed to get there puts the old and new buffers live at the
+# same moment. So the peak is a multiple of the payload, and sizing the fixture
+# on the payload alone sizes it on the wrong quantity.
+#
+# 52 MiB is chosen because it is the only payload in the neighbourhood that
+# works across the whole plausible range of that multiple. At 1.45x it peaks at
+# 70 MiB, comfortably over the 64 MiB fault; at 2.0x it peaks at 96 MiB,
+# comfortably under the 128 MiB fix. 40 and 44 MiB would SURVIVE at 64 MiB and
+# so produce no fault at all, and 56 MiB leaves too little room under 128 for a
+# busier node. 52 MiB clears both margins across the range, which is the property
+# that makes the test mean the same thing on any machine.
+#
+# The fault fires during the allocation rather than after a slow climb, so it is
+# immediate and unambiguous rather than a probabilistic one that might not fire
+# before the observation window closes.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -128,7 +149,7 @@ spec:
               printf '%s\n' "CHAOS-CRED jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkNoYW9zIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
               printf '%s\n' "CHAOS-CRED Authorization: Bearer chaos-planted-bearer-token-0123456789"
               printf '%s\n' "CHAOS-CRED dsn=postgres://chaos_user:Sup3rS3cretPassw0rd@db.production.svc.cluster.local:5432/billing"
-              printf '%s\n' "CHAOS-PHASE creds-planted next=bounded-allocation demand_bytes=94371840"
+              printf '%s\n' "CHAOS-PHASE creds-planted next=bounded-allocation payload_bytes=54525952"
 
               # ---------------------------------------------------------------
               # PHASE 2 - settle
@@ -144,31 +165,30 @@ spec:
               # ---------------------------------------------------------------
               # PHASE 3 - bounded allocation
               # ---------------------------------------------------------------
-              # HEADROOM_NOTE. 94371840 bytes = 90 MiB exactly.
+              # HEADROOM_NOTE. 54525952 bytes = 52 MiB exactly.
               #
-              #   against 64Mi  : 90 > 64, so the cgroup OOM killer fires DURING
-              #                    this assignment. The container is SIGKILLed
-              #                    while resident, which is what makes the
-              #                    observed failure `OOMKilled`/137 rather than
-              #                    some other termination.
-              #   against 128Mi : 90 < 128, with ~38 MiB of headroom. Survives.
+              #   against 64Mi  : peaks at 1.45x-2.0x this payload, i.e. 70-96
+              #                    MiB, so the cgroup OOM killer fires DURING this
+              #                    assignment. SIGKILL lands on the shell, which is
+              #                    what makes the observed failure OOMKilled/137
+              #                    rather than some other termination.
+              #   against 128Mi : the same 70-96 MiB peak fits. Survives.
               #
               # Why `head | tr` and not a doubling loop: the whole point of this
-              # fixture is that the demand is a KNOWN, FIXED number. A loop's
-              # demand depends on when the limit is hit, which is exactly the
-              # property that made deploy/chaos/oom-leak.yaml unusable here.
+              # fixture is that the demand is a KNOWN payload. A loop's demand
+              # depends on when the limit is hit, which is exactly the property
+              # that made deploy/chaos/oom-leak.yaml unusable here.
               #
-              # Why the bytes are genuinely resident, not lazily mapped:
-              # `$(...)` command substitution forces the pipeline through a pipe
-              # and into a shell variable, so every byte is written and read. A
-              # mapping that was never touched would be reclaimable and the
-              # container would not be killed at all - the test would then pass
-              # on 64Mi for the wrong reason.
+              # Why the bytes are genuinely resident, not lazily mapped: the
+              # pipeline writes and reads every byte on its way into the shell
+              # variable. A mapping that was never touched would be reclaimable
+              # and the container would not be killed at all - the test would
+              # then pass on 64Mi for the wrong reason.
               #
               # `tr '\000' 'x'` over NULs rather than zeros: the result is
               # printable, so `printf` of its length is meaningful, and a block
               # of NULs risks being silently discarded by some shells.
-              BOUNDED=$(head -c 94371840 /dev/zero | tr '\000' 'x')
+              BOUNDED=$(head -c 54525952 /dev/zero | tr '\000' 'x')
               printf 'CHAOS-ALLOC bounded_bytes=%d\n' "${#BOUNDED}"
 
               # ---------------------------------------------------------------
@@ -192,7 +212,7 @@ spec:
               # 3600s is comfortably longer than the 60s observation window and
               # than any rollout the test performs, so it never fires during a
               # run. It exists to be longer than the test, not to be used.
-              printf '%s\n' "CHAOS-PHASE allocation-stable demand_bytes=94371840 entering idle"
+              printf '%s\n' "CHAOS-PHASE allocation-stable payload_bytes=54525952 entering idle"
               sleep 3600
 
               # Unreachable under either limit. Reached only if the container
