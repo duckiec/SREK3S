@@ -211,16 +211,40 @@ func classify(pod *corev1.Pod, now time.Time) []IncidentRecord {
 		key := DedupKeyFor(pod.UID, container.Name, restarts)
 
 		// Terminated with a non-zero exit. Exit code 137 is SIGKILL from the
-		// memory cgroup; other non-zero exits are application errors. Both are
-		// reportable - the classifier downstream decides, not the watcher.
+		// memory cgroup; other non-zero exits are application errors.
+		//
+		// A non-OOM termination is DROPPED here rather than reported. Two
+		// reasons, and the second is the one that was a bug.
+		//
+		// First, there is nowhere to put it. Contract A's `reason` admits
+		// OOMKilled and CrashLoopBackOff only, so `emitter.mapReason` refuses
+		// everything else and rejects the incident before it reaches the wire.
+		// A record that cannot be serialised should not be built.
+		//
+		// Second, and this is what it actually cost: the dedup key is
+		// `<podUID>/<containerName>:<restartCount>` and does not include the
+		// kind. A transient `Terminated{exit 1}` at restart N therefore claims
+		// the key that `Waiting{CrashLoopBackOff}` at the same restart N needs,
+		// and the symptom - which is the state carrying the evidence - is
+		// suppressed as a duplicate. A crash-looping container was detected and
+		// then never reported at all.
+		//
+		// Filtering here, before the record exists, is what stops the
+		// un-serialisable state from poisoning the cache in the first place.
+		// Mapping it to CrashLoopBackOff instead would report the kubelet
+		// asserting a state the Sentinel has not observed.
 		if term := TerminationOf(status); term.Found && term.ExitCode != 0 {
+			kind := classifyExit(term)
+			if kind != FailureOOMKilled {
+				continue
+			}
 			records = append(records, IncidentRecord{
 				DedupKey:       key,
 				Namespace:      pod.Namespace,
 				PodName:        pod.Name,
 				PodUID:         string(pod.UID),
 				ContainerName:  container.Name,
-				Kind:           classifyExit(term),
+				Kind:           kind,
 				ExitCode:       term.ExitCode,
 				Reason:         term.Reason,
 				Message:        term.Message,

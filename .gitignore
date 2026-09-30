@@ -43,3 +43,4 @@ probe_*.go
 scrubber.test
 cpu*.out
 ci-g3-output.txt
+opencode.json
