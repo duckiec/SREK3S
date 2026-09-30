@@ -800,6 +800,73 @@ jobs:
           # owners, and the runner's message for an empty capture - "no
           # incidents collected" - does not distinguish "the Sentinel never
           # emitted" from "the proxy never saw it". A step name can.
+          #
+          # A bounded wait goes in front of that assertion, added after run
+          # 36726696428. This step used to test for emptiness the instant the
+          # previous one returned, and the capture is not written when the
+          # Sentinel emits - it is written when the agent finishes answering.
+          # The proxy forwards upstream first and appends after the response is
+          # read, so the file stays empty for the whole of the agent's bounded
+          # inference plus triage plus patch verification. The three preceding
+          # runs passed because the agent took the fail-closed Tier-2 exit,
+          # which returns an empty patch without synthesising one; giving it a
+          # manifest provider made it take the slower Tier-1 path, and the
+          # assertion outran it. A harness regression, not a Sentinel one.
+          #
+          # 20 is measured against two ceilings, not chosen by taste:
+          #   * the proxy's upstream timeout is 10s and this workflow does not
+          #     raise it. A healthy exchange is on disk within ~10s of the
+          #     Sentinel's first POST however slow the inference is; past that
+          #     the proxy records its own 502 and the file is non-empty anyway.
+          #     20s is twice that, and it is the number that decides whether a
+          #     slow run is a Sentinel fault or merely a slower agent.
+          #   * the runner's window. It samples for the observation window from
+          #     before the fixture is applied and reads the capture only after
+          #     sampling ends, so nothing this step does can change what the
+          #     runner sees. Worst case the loop below starts at ~T+20s and ends
+          #     at ~T+40s against a capture read at ~T+91s - 50s of margin. The
+          #     wait is nowhere near able to eat the runner's window.
+          # The elapsed seconds are echoed because the two failure shapes are
+          # indistinguishable without them: a wait that routinely returns in 0s
+          # is not covering the Tier-1 case it was written for, and one that
+          # always burns all 20 iterations means the budget is wrong.
+          echo "Waiting for Sentinel to emit (Tier-1 patch generation takes several seconds)..."
+          wait_started=$SECONDS
+          for i in $(seq 1 20); do
+            if [ -s /tmp/captured_incidents.jsonl ]; then
+              break
+            fi
+            sleep 1
+          done
+          echo "capture wait finished after $(( SECONDS - wait_started ))s"
+
+          # The wait above makes *this* assertion patient and nothing else. The
+          # runner is what actually judges the run, and its ordering is
+          # load-bearing: main() samples first and reads the capture afterwards,
+          # because a poll taken after the kubelet has already cleared
+          # state.terminated can only ever see CrashLoopBackOff and never the
+          # 137 that caused it. So there is a second failure mode the wait does
+          # not cover - an emit that lands after the runner has read the file
+          # is invisible to it. This step would then pass on a capture the
+          # runner never saw, and the run would go red four steps later at
+          # "Runner verdict" with a message about a missing capture rather than
+          # about a timing window. Named here, where the timing is.
+          if [ -s /tmp/captured_incidents.jsonl ]; then
+            runner_pid="$(cat /tmp/runner.pid 2>/dev/null || true)"
+            if [ -z "$runner_pid" ]; then
+              echo "::warning::no /tmp/runner.pid; cannot confirm the runner is still sampling"
+            elif kill -0 "$runner_pid" 2>/dev/null; then
+              echo "runner still sampling (pid $runner_pid); it reads the capture when its window closes"
+            else
+              echo "::error::the capture is non-empty but the invariant runner (pid $runner_pid) has already exited."
+              echo "::error::That is a harness timing fault, not a Sentinel failure: the runner"
+              echo "::error::samples first and reads the capture afterwards, so an emit landing"
+              echo "::error::after it exits cannot be seen by it. Left alone this surfaces four"
+              echo "::error::steps later as a missing-capture invariant, which names the wrong half."
+              echo "runner exit code: $(cat /tmp/runner.exit 2>/dev/null || echo '(none written)')"
+              exit 1
+            fi
+          fi
           if [ ! -s /tmp/captured_incidents.jsonl ]; then
             echo "::error::the capture file is empty: the Sentinel emitted nothing,"
             echo "::error::or emitted past the proxy. Both are failures."
