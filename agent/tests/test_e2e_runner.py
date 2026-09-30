@@ -29,6 +29,7 @@ from runner import (  # noqa: E402
     VerificationError,
     check_causal_chain,
     check_diagnostics_survived,
+    check_detection_latency,
     check_incident_window,
     check_logs_were_captured,
     check_redaction,
@@ -750,3 +751,157 @@ def test_the_capture_is_read_after_sampling(
     )
     assert events[0] == "sampled", "sampling did not start first"
     assert sampled > 1, f"only {sampled} poll(s)"
+
+
+# ---------------------------------------------------------------------------
+# Why the runner's selector stays value-pinned
+#
+# Both chaos fixtures carry `srek3s.io/chaos`, with different values. The
+# workflow applies both so a Tier-2 (CrashLoopBackOff) incident is observed -
+# and the runner samples only the OOM pod. This section is the evidence for
+# that asymmetry rather than an assertion from reading the code: it drives the
+# real `get_pod` and the real checks over the same cluster state under both
+# selectors.
+# ---------------------------------------------------------------------------
+
+
+def _pod(name: str, statuses: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "metadata": {"name": name, "namespace": "sentinel-chaos"},
+        "status": {"containerStatuses": statuses},
+    }
+
+
+#: A real two-item `kubectl get pods -l srek3s.io/chaos -o json` body: both
+#: fixtures carry the label, and the apiserver lists pods by name, so the
+#: crashloop pod is first.
+_BOTH_FIXTURES: dict[str, Any] = {
+    "items": [
+        {
+            "metadata": {"name": "srek3s-chaos-crashloop-6b4f8c7d9-4kq2v"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "crashloop-canary",
+                        "restartCount": 3,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}},
+                    }
+                ]
+            },
+        },
+        {
+            "metadata": {"name": "srek3s-chaos-oom-7d9f4b6c8d-x2k9p"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "oom-canary",
+                        "restartCount": 2,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {
+                            "terminated": {
+                                "exitCode": 137,
+                                "reason": "OOMKilled",
+                            }
+                        },
+                    }
+                ]
+            },
+        },
+    ]
+}
+
+
+def _stub_kubectl(monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]) -> None:
+    import runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "run_kubectl", lambda _args, **_kw: json.dumps(body)
+    )
+
+
+def test_a_bare_label_selector_silently_samples_the_wrong_pod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect: `-l srek3s.io/chaos` matches both fixtures, and get_pod takes items[0].
+
+    `get_pod` returns ``items[0]`` and the apiserver lists pods by name, so with
+    both fixtures applied the runner samples ``srek3s-chaos-crashloop-*`` and
+    never sees the OOM pod at all. The crashloop fixture exits **1**, so no
+    sample it produces carries a 137 and both the causal chain and the latency
+    ratio fail - on a cluster where the OOM fixture worked perfectly.
+
+    This is asserted through the real `get_pod`, not by describing it, because
+    the argument for keeping the selector value-pinned is entirely about what
+    `items[0]` returns and that is a property of the response body.
+    """
+    import runner as runner_module
+
+    _stub_kubectl(monkeypatch, _BOTH_FIXTURES)
+
+    pod = runner_module.get_pod("sentinel-chaos", "srek3s.io/chaos")
+    assert pod is not None
+    assert pod["metadata"]["name"].startswith("srek3s-chaos-crashloop"), (
+        "the bare selector no longer resolves to the crashloop pod; if this "
+        "assertion starts failing the ordering argument above has expired and "
+        "the whole section needs re-deriving"
+    )
+
+    # And the consequence, on the checks themselves. These samples are the
+    # crashloop pod's real state, so there is no 137 anywhere in them.
+    observations = runner_module.read_observation(pod)
+    assert observations, "read_observation produced nothing"
+    with pytest.raises(VerificationError, match="never observed Terminated"):
+        check_causal_chain(observations)
+    with pytest.raises(VerificationError, match="exit_code 137"):
+        check_detection_latency(
+            [good_incident() | {"detection_latency_ms": 45, "restart_count": 1}],
+            observations,
+        )
+
+
+def test_the_value_pinned_selector_samples_the_oom_pod_and_the_checks_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction: the shipped selector keeps the run green.
+
+    The control for the test above. If the selector were ever widened to the
+    bare label, this still passes - so it is not the guard - but together they
+    pin the cost of widening it, which is the decision the workflow records.
+    """
+    import runner as runner_module
+
+    # The apiserver applies the value filter; the stub does the same, so the
+    # fixture body is exercised rather than bypassed. `args` is the argv list
+    # `run_kubectl` receives, so the selector is matched as a whole element -
+    # a substring test here would be the very bug this section is about.
+    monkeypatch.setattr(
+        runner_module,
+        "run_kubectl",
+        lambda args, **kw: (
+            json.dumps(
+                {
+                    "items": [
+                        item
+                        for item in _BOTH_FIXTURES["items"]
+                        if "oom" in item["metadata"]["name"]
+                    ]
+                }
+            )
+            if "srek3s.io/chaos=oom" in args
+            else json.dumps(_BOTH_FIXTURES)
+        ),
+    )
+
+    pod = runner_module.get_pod("sentinel-chaos", "srek3s.io/chaos=oom")
+    assert pod is not None
+    assert pod["metadata"]["name"].startswith("srek3s-chaos-oom")
+
+    # A real poll never lands on a single instant: the cause is only visible
+    # while the container is still Terminated. Both halves of the history, in
+    # order, which is what `oom_then_crashloop` already encodes.
+    check_causal_chain(oom_then_crashloop())
+    check_detection_latency(
+        [good_incident() | {"detection_latency_ms": 45, "restart_count": 1}],
+        oom_then_crashloop(),
+    )

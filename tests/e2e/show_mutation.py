@@ -23,6 +23,13 @@ So the verdict is not reimplemented here. The listing is for a human; the
 **verdict** is :func:`runner.check_no_cluster_mutation`'s, quoted verbatim, and
 the two cannot diverge because there is only one of them.
 
+The same holds for *how* an object is decided exempt. The rule is the runner's
+:func:`runner.is_exempt_object` - the chaos namespace, the k3s system
+namespaces, and the two per-namespace control-plane objects by kind and name -
+and it is not restated here either. A namespace-only rule is not sufficient:
+``default`` is not a system namespace, and the objects k3s writes there
+asynchronously are named, not the namespace.
+
 Usage: ``python tests/e2e/show_mutation.py before.json after.json [namespace]``
 """
 
@@ -41,9 +48,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from runner import (  # noqa: E402
     CHAOS_NAMESPACE,
+    CONTROL_PLANE_LABELS,
     VerificationError,
     check_no_cluster_mutation,
+    is_control_plane_object,
     is_exempt_namespace,
+    is_exempt_object,
+    object_namespace,
 )
 
 # Re-exported deliberately, and named here because `mypy --strict` implies
@@ -52,15 +63,18 @@ from runner import (  # noqa: E402
 # import above is real and the test suite uses it.
 #
 # The re-export is the point rather than an accident of the import list. The
-# printer and the runner must agree on which namespaces are exempt, and the
+# printer and the runner must agree on which objects are exempt, and the
 # anti-drift test asserts they read the *same* function. Re-exporting makes that
 # a declared contract instead of an incidental side effect of import order.
 __all__ = [
     "CHAOS_NAMESPACE",
     "VerificationError",
     "check_no_cluster_mutation",
+    "is_control_plane_object",
     "is_exempt_namespace",
+    "is_exempt_object",
     "main",
+    "object_namespace",
 ]
 
 
@@ -80,24 +94,6 @@ def _version(entry: Any) -> Any:
     if isinstance(entry, dict):
         return entry.get("resourceVersion")
     return None
-
-
-def _namespace_of(key: str, entry: Any) -> str:
-    """The namespace of one snapshot entry, from the entry or from its key.
-
-    ``snapshot_cluster`` writes ``metadata.namespace`` into every entry, so the
-    first read is the normal path. The key fallback exists because a snapshot
-    is a file a reviewer may have edited or hand-built, and a printer that
-    silently treated the namespace as empty would classify every object as
-    out-of-namespace. The key is ``<apiVersion>/<kind>/<namespace>/<name>`` and
-    ``apiVersion`` itself contains a slash, so the split is from the right.
-    """
-    if isinstance(entry, dict):
-        value = entry.get("namespace")
-        if isinstance(value, str) and value:
-            return value
-    parts = key.rsplit("/", 2)
-    return parts[1] if len(parts) == 3 else ""
 
 
 def _show(label: str, keys: list[str], limit: int = 12) -> None:
@@ -141,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     def is_exempt(key: str, snapshot: dict[str, Any]) -> bool:
-        return is_exempt_namespace(_namespace_of(key, snapshot[key]), chaos_namespace)
+        return is_exempt_object(key, snapshot[key], chaos_namespace)
 
     interesting_created = [k for k in created if not is_exempt(k, after)]
     interesting_deleted = [k for k in deleted if not is_exempt(k, before)]
@@ -149,11 +145,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(
-        "  exempt from the verdict: the chaos namespace {!r} plus the k3s"
-        " system".format(chaos_namespace)
-    )
-    print(
-        "  namespaces (helm install/upgrade, leader election, local-path provisioner)."
+        "  exempt from the verdict: the chaos namespace {!r}, the k3s system"
+        " namespaces (helm install/upgrade, leader election, local-path"
+        " provisioner), and the per-namespace control-plane objects {}.".format(
+            chaos_namespace, list(CONTROL_PLANE_LABELS)
+        )
     )
     print()
     _show("CREATED outside the exempt namespaces", interesting_created)

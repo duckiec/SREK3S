@@ -33,6 +33,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from runner import (  # noqa: E402
     CAPTURE_KEY,
     CHAOS_NAMESPACE,
+    CONTROL_PLANE_LABELS,
+    CONTROL_PLANE_OBJECTS,
     DETECTION_LATENCY_BUDGET_MS,
     MIN_RCA_STRONG_CITATIONS,
     NOISY_SYSTEM_NAMESPACES,
@@ -57,7 +59,12 @@ from runner import (  # noqa: E402
     declared_patch_path,
     git_apply,
     injectable_restart_counts,
+    is_control_plane_object,
+    is_exempt_namespace,
+    is_exempt_object,
+    object_namespace,
     oom_restart_counts,
+    parse_snapshot_key,
     percentile_nearest_rank,
     render,
     response_of,
@@ -1459,6 +1466,216 @@ def test_a_chaos_namespace_that_is_only_a_prefix_is_not_exempt() -> None:
         check_no_cluster_mutation(before, after)
 
 
+# --- 4.2.8: the k3s per-namespace control-plane objects --------------------
+#
+# The live failure this answers: CI run on 6ad69b6 reported
+# `ServiceAccount/default` and `ConfigMap/kube-root-ca.crt` under `default` as
+# out-of-namespace creations. k3s creates the `default` namespace first and
+# publishes both objects into it a moment later, so they land between the
+# pre-flight before-image and the after-image.
+#
+# `default` is NOT a system namespace and is not exempted as one. It is where
+# ordinary workloads run and where a stray write would land, so exempting the
+# namespace would disable the box 4.2.8 exists to be. The two objects are
+# exempted by kind and name; nothing else in `default` is.
+# ---------------------------------------------------------------------------
+
+
+def test_control_the_k3s_control_plane_objects_do_not_fail_the_run() -> None:
+    """**Negative control, direction 1: the noise must not fail the run.**
+
+    What this catches, in order of how quietly it would have done so:
+
+    * **no object-level rule at all** - the run fails on the two objects, which
+      is the defect being fixed;
+    * **a namespace-level rule instead** - ``srek3s-system`` and ``payments`` are
+      ordinary namespaces here and are *not* in the exempt set, so a rule that
+      worked by exempting ``default`` could not possibly exempt these. The
+      assertion is per namespace precisely so that a wide rule cannot pass it;
+    * **an exemption applied to one sub-check only** - the same asymmetry that
+      was fixed for :data:`NOISY_SYSTEM_NAMESPACES`, where coredns was reported
+      as a creation by a component that structurally cannot write. Creation,
+      deletion, generation and resourceVersion are all covered below.
+
+    The last group is uniformity rather than realism: no controller bumps
+    ``generation`` on a ConfigMap or a ServiceAccount. It is here because the
+    defect class it catches is real and has already happened once in this
+    repository, and a rule that is narrow for one sub-check and wide for another
+    is not a rule.
+    """
+    # A **creation** between the images, which is what k3s actually does and
+    # what CI reported. Every namespace, so the rule is pinned to the object
+    # rather than to the one that happened to fail.
+    for namespace in ("default", "srek3s-system", "payments"):
+        before, after = healthy_pair()
+        for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+            after[f"v1/{kind}/{namespace}/{name}"] = snapshot_entry(
+                namespace, resource_version="1"
+            )
+        description = check_no_cluster_mutation(before, after)
+        assert "2 object(s) churned as per-namespace control-plane objects" in (
+            description
+        )
+        assert "2 created" in description
+        # Counted and **named**, not silently dropped. A reader who cannot see
+        # what was absorbed has to trust that there was none.
+        for label in CONTROL_PLANE_LABELS:
+            assert label in description
+
+    # In-place churn on both: the root CA publisher rewriting its ConfigMap, and
+    # a namespace teardown removing the ServiceAccount. Both directions of the
+    # object set, plus the resourceVersion and generation sub-checks.
+    before, after = healthy_pair()
+    for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+        before[f"v1/{kind}/default/{name}"] = snapshot_entry(
+            "default", generation=1, resource_version="10"
+        )
+        after[f"v1/{kind}/default/{name}"] = snapshot_entry(
+            "default", generation=2, resource_version="11"
+        )
+    description = check_no_cluster_mutation(before, after)
+    assert "2 object(s) churned as per-namespace control-plane objects" in description
+    assert "2 generation change(s)" in description
+    assert "2 resourceVersion change(s)" in description
+
+    before, after = healthy_pair()
+    for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+        before[f"v1/{kind}/default/{name}"] = snapshot_entry("default")
+    description = check_no_cluster_mutation(before, after)
+    assert "2 object(s) churned as per-namespace control-plane objects" in description
+    assert "2 deleted" in description
+
+
+def test_control_a_real_mutation_in_the_default_namespace_still_fails() -> None:
+    """**Negative control, direction 2: everything else in `default` is signal.**
+
+    What this catches: the exemption drifting into a namespace exemption. The
+    two controls above are the only reason the first one is safe - without this,
+    "exclude the noise in ``default``" and "exclude ``default``" are the same
+    sentence to a reader, and only one of them is defensible.
+
+    A create, a spec write and a delete are each covered, because they are three
+    separate predicates in three separate lists, and an exemption added to one
+    but not the others has already happened in this file.
+    """
+    # A create, of each shape a remediation could plausibly write into `default`.
+    # `kube-root-ca.crt` is deliberately absent from this list: a ConfigMap that
+    # is not the root CA has nothing to do with the control plane.
+    for key in (
+        "apps/v1/Deployment/default/checkout-api",
+        "v1/Service/default/checkout-api",
+        "v1/ConfigMap/default/app-config",
+        "v1/Secret/default/db-credentials",
+        "v1/StatefulSet/default/ledger",
+    ):
+        before, after = healthy_pair()
+        after[key] = snapshot_entry("default", resource_version="1")
+        with pytest.raises(VerificationError, match="were created outside"):
+            check_no_cluster_mutation(before, after)
+
+    # A spec write, seeded into both images so the object-set check stays quiet
+    # and the generation check is the one under test.
+    before, after = healthy_pair()
+    before["apps/v1/Deployment/default/checkout-api"] = snapshot_entry(
+        "default", generation=1, resource_version="10"
+    )
+    after["apps/v1/Deployment/default/checkout-api"] = snapshot_entry(
+        "default", generation=2, resource_version="11"
+    )
+    with pytest.raises(VerificationError, match="changed generation"):
+        check_no_cluster_mutation(before, after)
+
+    # A status write: no generation bump, so only the resourceVersion check sees
+    # it. This is the shape a `kubectl patch` against a live object takes when
+    # the field it touches is not spec, and it is the sub-check a name-only
+    # exemption is most likely to leave out.
+    before, after = healthy_pair()
+    before["v1/ConfigMap/default/app-config"] = snapshot_entry(
+        "default", resource_version="10"
+    )
+    after["v1/ConfigMap/default/app-config"] = snapshot_entry(
+        "default", resource_version="11"
+    )
+    with pytest.raises(VerificationError, match="changed resourceVersion"):
+        check_no_cluster_mutation(before, after)
+
+    # A delete, which is the other half of the object-set predicate. Seeded
+    # into the before-image only, so it is a removal rather than a no-op.
+    before, after = healthy_pair()
+    before["v1/ConfigMap/default/app-config"] = snapshot_entry("default")
+    with pytest.raises(VerificationError, match="were deleted outside"):
+        check_no_cluster_mutation(before, after)
+
+
+def test_control_the_object_exemption_is_an_exact_kind_and_name_match() -> None:
+    """The defect: a name that merely *looks* like an excluded one.
+
+    The namespace exemption already had this defect once - ``show_mutation.py``
+    matched with a substring test and so exempted ``kube-system-staging`` and
+    ``my-kube-system``. Moving the rule from namespaces to names invites exactly
+    the same broadening: a prefix test would exempt
+    ``kube-root-ca.crt-staging`` and a substring test would exempt a ``Secret``
+    named after the ConfigMap. Either would turn the narrow fix back into a hole
+    in the one check that catches an out-of-namespace write, and neither would
+    fail a test that only asserted the two real names.
+
+    So each near miss is asserted twice: the predicate says no, and the whole
+    check still fails. A rule that returns the right answer for
+    ``kube-root-ca.crt`` and the wrong one for everything else is not a fix.
+    """
+    for key in (
+        # The same name, the wrong kind: a Secret is not the published CA and a
+        # credential leak would hide behind this exemption if it did.
+        "v1/Secret/default/kube-root-ca.crt",
+        # The same kind, a longer name: the per-namespace default ServiceAccount
+        # is one object, not a family of them.
+        "v1/ServiceAccount/default/admin",
+        "v1/ServiceAccount/default/default-token",
+        # Near-miss spellings of the ConfigMap name.
+        "v1/ConfigMap/default/kube-root-ca.crt-staging",
+        "v1/ConfigMap/default/kube-root-ca-crt",
+        "v1/ConfigMap/default/kube-root-cacrt",
+        "v1/ConfigMap/default/root-ca.crt",
+    ):
+        assert is_control_plane_object(key) is False, key
+        before, after = healthy_pair()
+        after[key] = snapshot_entry("default", resource_version="1")
+        with pytest.raises(VerificationError, match="were created outside"):
+            check_no_cluster_mutation(before, after)
+
+    # And the pair must match in **any** namespace, which is what makes the
+    # rule namespace-independent. `payments` is not in the exempt namespace set,
+    # so this cannot be satisfied by a `default` exemption.
+    for namespace in ("srek3s-system", "payments", "kube-public-lookalike"):
+        for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+            assert is_control_plane_object(f"v1/{kind}/{namespace}/{name}") is True
+            assert is_exempt_namespace(namespace) is False
+
+
+def test_the_exclusion_is_reported_even_when_nothing_churned() -> None:
+    """A reader must be able to see what was excluded, not infer it.
+
+    The two rules are different in kind - a namespace rewritten by the control
+    plane, and two objects it publishes everywhere - so a report that merged
+    them would make a reviewer read harness work as cluster noise. This pins
+    both clauses onto a run where nothing happened at all, which is the state a
+    reader is most likely to be looking at when asking "what is this excluding?".
+    """
+    before, after = healthy_pair()
+    description = check_no_cluster_mutation(before, after)
+    for namespace in NOISY_SYSTEM_NAMESPACES:
+        assert namespace in description
+    assert "0 object(s) churned inside the exempt system namespaces" in description
+    assert "0 object(s) churned as per-namespace control-plane objects" in description
+    for label in CONTROL_PLANE_LABELS:
+        assert label in description
+    # The namespace the noise was reported under is named nowhere as exempt.
+    # `ServiceAccount/default` contains the substring, so this is about the
+    # namespace *set* and the predicate, never about a substring search.
+    assert "default" not in sorted(NOISY_SYSTEM_NAMESPACES)
+    assert is_exempt_namespace("default") is False
+
+
 def test_a_one_sided_snapshot_is_a_failure_not_a_skip() -> None:
     """The defect: a harness that took only a before-image.
 
@@ -1612,6 +1829,13 @@ def test_the_printer_and_the_runner_share_one_exemption_rule() -> None:
     to *each other*: a future edit that adds a namespace to
     :data:`NOISY_SYSTEM_NAMESPACES` without the printer following is a failure
     here rather than a divergence discovered in a CI log weeks later.
+
+    The **object** rule is pinned the same way, and for the same reason with a
+    sharper edge: a printer holding a namespace-only rule would print the two
+    k3s objects under "CREATED outside the exempt namespaces" while the runner
+    exempts them - the exact "clean console beside a red exit code" defect from
+    the first printer, pointing the other way. A reviewer would go hunting for a
+    write that the control plane performed on its own.
     """
     import show_mutation  # noqa: PLC0415 - see the note on the first import
 
@@ -1619,6 +1843,107 @@ def test_the_printer_and_the_runner_share_one_exemption_rule() -> None:
         assert show_mutation.is_exempt_namespace(namespace) is True
     for namespace in ("default", "srek3s-system", "kube-system-staging"):
         assert show_mutation.is_exempt_namespace(namespace) is False
+
+    # The object rule, read through the printer's re-exports rather than
+    # through the runner's, so a printer that stopped delegating fails here.
+    assert show_mutation.is_control_plane_object is is_control_plane_object
+    assert show_mutation.is_exempt_object is is_exempt_object
+    assert show_mutation.object_namespace is object_namespace
+    for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+        key = f"v1/{kind}/default/{name}"
+        assert show_mutation.is_exempt_object(key, {"namespace": "default"}) is True
+        # The near miss the printer and the runner must agree on as well.
+        assert (
+            show_mutation.is_exempt_object(
+                f"v1/{kind}/default/{name}-staging", {"namespace": "default"}
+            )
+            is False
+        )
+
+
+def test_control_the_printer_does_not_list_the_control_plane_objects_as_offending(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console side of the 4.2.8 fix, in the direction the first printer broke.
+
+    The two k3s objects appear between the images - the run on 6ad69b6, exactly.
+    The verdict is clean, and the printer must not put them under "CREATED
+    outside the exempt namespaces". If it did, the CI log would show a red
+    listing beside a green verdict on objects nobody under test wrote, and the
+    next person to read that section would go looking for a write that does not
+    exist.
+
+    The reverse half is pinned by
+    :func:`test_control_a_real_mutation_in_the_default_namespace_still_fails`,
+    which fails the verdict on a real write in the same namespace. Both
+    directions, or the printer is only half agreeing with the runner.
+    """
+    import show_mutation  # noqa: PLC0415 - see the note on the first import
+
+    before, after = healthy_pair()
+    for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+        after[f"v1/{kind}/default/{name}"] = snapshot_entry("default")
+    before_path, after_path = _write_snapshots(tmp_path, before, after)
+
+    check_no_cluster_mutation(before, after)  # the verdict: clean
+    assert show_mutation.main([before_path, after_path]) == 0
+    output = capsys.readouterr().out
+
+    listed = output.split("CREATED outside")[1].split("exempt churn")[0]
+    for kind, name in sorted(CONTROL_PLANE_OBJECTS):
+        assert f"{kind}/default/{name}" not in listed
+    # Absorbed, but attributed: the exempt-churn tally covers them.
+    assert "2 created" in output.split("exempt churn")[1]
+    assert "VERDICT: no mutation outside" in output
+    assert "VERDICT: FAIL" not in output
+
+
+def test_parse_snapshot_key_survives_both_api_version_shapes() -> None:
+    """The key format is not one shape, and guessing wrong exempts nothing - or everything.
+
+    ``apps/v1/Deployment`` carries an API group and ``v1/ConfigMap`` is the bare
+    core group, and :func:`snapshot_cluster` puts both in the same snapshot. A
+    parser that assumed a fixed segment count raises ``ValueError`` on the
+    shorter form - which is every ConfigMap, ServiceAccount and Secret in the
+    cluster, so the check would crash on the run it exists to protect rather
+    than pass or fail it.
+
+    A malformed key must yield empty parts, which match no exemption and land on
+    the asserted side: a key the check cannot read is a key it must not excuse.
+    """
+    assert parse_snapshot_key("apps/v1/Deployment/default/checkout-api") == (
+        "Deployment",
+        "default",
+        "checkout-api",
+    )
+    assert parse_snapshot_key("v1/ConfigMap/default/kube-root-ca.crt") == (
+        "ConfigMap",
+        "default",
+        "kube-root-ca.crt",
+    )
+    for malformed in ("", "Deployment", "default/checkout-api"):
+        assert parse_snapshot_key(malformed) == ("", "", "")
+        assert is_control_plane_object(malformed) is False
+
+
+def test_object_namespace_prefers_the_entry_and_falls_back_to_the_key() -> None:
+    """Two sources, one answer, and the fallback exists for hand-built snapshots.
+
+    :func:`snapshot_cluster` writes ``metadata.namespace`` into every entry, so
+    the entry is the normal read. The key fallback is for a snapshot a reviewer
+    edited, and getting it wrong in the other direction - reading the entry and
+    finding nothing - would classify every object as out-of-namespace and fail a
+    clean run.
+    """
+    assert object_namespace("v1/ConfigMap/default/any", {"namespace": "payments"}) == (
+        "payments"
+    )
+    assert (
+        object_namespace("v1/ConfigMap/payments/any", {"namespace": ""}) == "payments"
+    )
+    assert object_namespace("v1/ConfigMap/payments/any", None) == "payments"
+    assert object_namespace("malformed", {"namespace": "payments"}) == "payments"
+    assert object_namespace("malformed", {}) == ""
 
 
 # ---------------------------------------------------------------------------

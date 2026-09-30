@@ -1445,6 +1445,49 @@ NOISY_SYSTEM_NAMESPACES: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Objects the apiserver writes in **every** namespace, on its own schedule.
+#:
+#: ``ServiceAccount/default`` is reconciled by the service-account controller
+#: and ``ConfigMap/kube-root-ca.crt`` is published by the root CA publisher, one
+#: per namespace, **asynchronously** - they land after any pre-flight baseline.
+#: On a fresh k3s the ``default`` namespace is created first and its two objects
+#: arrive afterwards, so a before-image taken early and an after-image taken
+#: later legitimately differ. This is the same class of background noise as
+#: :data:`NOISY_SYSTEM_NAMESPACES`, and it is what CI run on 6ad69b6 actually
+#: reported: ``ServiceAccount/default`` and ``ConfigMap/kube-root-ca.crt`` under
+#: ``default``.
+#:
+#: **Why these are excluded by name and not by namespace.** ``default`` is not a
+#: system namespace. It is where ordinary workloads land, it is where a
+#: Sentinel or agent that wrongly held a write credential would put something,
+#: and it is the namespace the negative control uses precisely because it is
+#: *not* exempt. Exempting it wholesale would silence the exact writes ROADMAP
+#: 4.2.8 exists to catch, and it would do so for a reason - "it is a system
+#: namespace" - that is simply false. The noise is two named objects; the signal
+#: is every other object in the namespace, and there is no version of a
+#: namespace-wide exemption that keeps both.
+#:
+#: Matched on **kind and name, in any namespace**, including the empty namespace
+#: a hand-built snapshot may carry. The objects are per-namespace by
+#: construction, so matching them in one namespace only would be an incomplete
+#: fix that still fails the next time a namespace is created mid-run, and the
+#: name `kube-root-ca.crt` is the same in all of them. A namespace-level
+#: exemption was considered and rejected; this is the narrow alternative.
+CONTROL_PLANE_OBJECTS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("ConfigMap", "kube-root-ca.crt"),
+        ("ServiceAccount", "default"),
+    }
+)
+
+#: How the report spells each excluded object, derived so the message and the
+#: set cannot drift apart. A reader has to be able to see what was absorbed by
+#: name, and a hand-copied second list would eventually disagree with the one the
+#: check reads.
+CONTROL_PLANE_LABELS: Final[tuple[str, ...]] = tuple(
+    f"{kind}/{name}" for kind, name in sorted(CONTROL_PLANE_OBJECTS)
+)
+
 
 def is_exempt_namespace(namespace: str, chaos_namespace: str = CHAOS_NAMESPACE) -> bool:
     """Whether churn in ``namespace`` says nothing about the components under test.
@@ -1464,6 +1507,82 @@ def is_exempt_namespace(namespace: str, chaos_namespace: str = CHAOS_NAMESPACE) 
     function, so the console and the exit code cannot disagree.
     """
     return namespace == chaos_namespace or namespace in NOISY_SYSTEM_NAMESPACES
+
+
+def parse_snapshot_key(key: str) -> tuple[str, str, str]:
+    """``(kind, namespace, name)`` from a :func:`snapshot_cluster` key.
+
+    The key is ``<apiVersion>/<kind>/<namespace>/<name>``, and ``apiVersion``
+    is **not** a fixed number of segments: ``apps/v1/Deployment`` carries a
+    group and a version, ``v1/ConfigMap`` is the bare core group, and both
+    appear in the same snapshot. The last two segments are always the
+    namespace and the name, so the split is from the **right** by two and the
+    kind is whatever precedes the namespace - which is the last segment of
+    whatever is left.
+
+    A key with fewer than two slashes yields three empty strings, so it matches
+    no exemption and lands on the asserted side of the comparison. That is the
+    safe direction for a check whose job is to catch writes: a malformed key
+    must be loud, not quiet.
+    """
+    parts = key.rsplit("/", 2)
+    if len(parts) != 3:
+        return ("", "", "")
+    head, namespace, name = parts
+    return (head.rsplit("/", 1)[-1], namespace, name)
+
+
+def object_namespace(key: str, entry: Any) -> str:
+    """The namespace of one snapshot entry, from the entry or from its key.
+
+    :func:`snapshot_cluster` writes ``metadata.namespace`` into every entry, so
+    the first read is the normal path. The key fallback exists because a snapshot
+    is a file a reviewer may have edited or hand-built, and a check that silently
+    treated the namespace as empty would classify every object as
+    out-of-namespace. It lives here rather than in the printer so the verdict and
+    the console read the namespace the same way; the printer used to derive it
+    itself, which is the drift this file exists to prevent.
+    """
+    if isinstance(entry, dict):
+        value = entry.get("namespace")
+        if isinstance(value, str) and value:
+            return value
+    return parse_snapshot_key(key)[1]
+
+
+def is_control_plane_object(key: str) -> bool:
+    """Whether ``key`` names one of the per-namespace :data:`CONTROL_PLANE_OBJECTS`.
+
+    Kind and name, and nothing else - no namespace, because these objects exist
+    once per namespace and an exemption scoped to the one that happened to fail
+    would be fixed by luck rather than by design. The pair must match exactly, so
+    ``ConfigMap/kube-root-ca.crt-staging``, ``Secret/kube-root-ca.crt`` and
+    ``ServiceAccount/admin`` all stay on the asserted side.
+    """
+    kind, _namespace, name = parse_snapshot_key(key)
+    return (kind, name) in CONTROL_PLANE_OBJECTS
+
+
+def is_exempt_object(
+    key: str, entry: Any, chaos_namespace: str = CHAOS_NAMESPACE
+) -> bool:
+    """The single per-object exemption predicate, shared by the verdict and the printer.
+
+    One function for both, and it delegates to :func:`is_exempt_namespace` rather
+    than restating it, so there is exactly one place where "exempt" is decided.
+    ``tests/e2e/show_mutation.py`` calls this function; it does not carry a set of
+    its own. An earlier revision of the printer held its own ``SYSTEM_PREFIXES``
+    tuple and matched with a substring test, and the console then listed a
+    different set of objects from the one the exit code was computed over.
+
+    The namespace argument is *not* enough on its own, which is why this exists
+    as a separate function rather than as a wider namespace test: the two k3s
+    control-plane objects live in ``default``, which is a namespace where every
+    other write is signal.
+    """
+    return is_exempt_namespace(
+        object_namespace(key, entry), chaos_namespace
+    ) or is_control_plane_object(key)
 
 
 def snapshot_cluster() -> dict[str, dict[str, Any]]:
@@ -1511,10 +1630,10 @@ def check_no_cluster_mutation(
     after: dict[str, dict[str, Any]],
     chaos_namespace: str = CHAOS_NAMESPACE,
 ) -> str:
-    """ROADMAP 4.2.8: prove only the chaos namespace changed.
+    """ROADMAP 4.2.8: prove the run mutated nothing it should not have.
 
-    Three checks, in decreasing strictness, each applied outside the exempt
-    namespaces of :func:`is_exempt_namespace`:
+    Three checks, in decreasing strictness, each applied outside the exemptions
+    of :func:`is_exempt_object`:
 
     1. **Object set.** Anything created or deleted is a write, full stop. A
        `generation` comparison alone would miss a create entirely, and a create
@@ -1525,20 +1644,34 @@ def check_no_cluster_mutation(
        live cluster where ``resourceVersion`` is not.
     3. **resourceVersion.** Strictly broader, and the one that fires most.
 
-    All three share **one** exemption set, the chaos namespace plus
-    :data:`NOISY_SYSTEM_NAMESPACES`. Applying it to all three is what makes the
-    check usable on a live k3s: the control plane's Helm controller installs
-    coredns and traefik *asynchronously*, so their objects legitimately appear
-    after the pre-flight baseline. That is background noise, not a mutation by
-    a component that holds no write credential.
+    All three share **one** exemption rule, and it has two parts because the
+    noise has two different sources:
 
-    **What the exemption does not do.** It is not a deletion of the checks and
-    it is not a blanket amnesty:
+    * **by namespace** - the chaos namespace (the harness applies the fixture
+      itself) plus :data:`NOISY_SYSTEM_NAMESPACES`, which the k3s control plane
+      rewrites on its own schedule, including coredns and traefik installed
+      **asynchronously** by the Helm controller, after the pre-flight baseline;
+    * **by object** - :data:`CONTROL_PLANE_OBJECTS`, the two names the apiserver
+      publishes in *every* namespace, and which is what CI run on 6ad69b6
+      reported under ``default``.
+
+    The object part exists because the namespace part cannot be widened. k3s
+    creates ``ServiceAccount/default`` and ``ConfigMap/kube-root-ca.crt`` in
+    ``default`` shortly after the namespace itself, so they land between the two
+    images - and ``default`` is the namespace where ordinary workloads live and
+    where a stray write would land, so exempting it wholesale would disable the
+    box. Two named objects is the whole of the noise; everything else in
+    ``default`` is still asserted on all three checks.
+
+    Applying the rule to all three sub-checks is what makes the check usable on
+    a live k3s at all. That is not a deletion of the checks and it is not a
+    blanket amnesty:
 
     * inside the chaos namespace everything is allowed, because the harness
       applies the fixture there itself;
     * a creation, deletion, generation bump or resourceVersion move in *any*
-      namespace outside both sets still fails, and each direction has a
+      namespace outside the exempt sets, and on any object outside
+      :data:`CONTROL_PLANE_OBJECTS`, still fails, and each direction has a
       negative control proving it;
     * exempt changes are **counted and reported** in the returned description,
       so a reader sees how much noise was absorbed rather than trusting that
@@ -1546,22 +1679,33 @@ def check_no_cluster_mutation(
     """
 
     def _namespace(key: str, entry: dict[str, Any]) -> str:
-        value = entry.get("namespace")
-        return str(value) if isinstance(value, str) else ""
+        return object_namespace(key, entry)
 
-    def _bucket(namespace: str) -> str:
-        """``"chaos"``, ``"noisy"`` or ``"asserted"`` - the only three answers.
+    def _bucket(key: str, entry: dict[str, Any]) -> str:
+        """``"chaos"``, ``"noisy"``, ``"control-plane"`` or ``"asserted"``.
 
-        One classifier for all three sub-checks, so an object cannot be exempt
-        from the object set and asserted on by the generation check. That
-        asymmetry is exactly the defect being fixed: the exemption used to be
-        applied to one sub-check and not the others, and a check that is strict
-        about some writes and lenient about others is not a check.
+        The only four answers, and one classifier for all three sub-checks, so an
+        object cannot be exempt from the object set and asserted on by the
+        generation check. That asymmetry is exactly the defect being fixed: the
+        exemption used to be applied to one sub-check and not the others, and a
+        check that is strict about some writes and lenient about others is not a
+        check.
+
+        ``control-plane`` is keyed on the object, not the namespace, and is
+        therefore the narrow counterpart to ``noisy``: it catches only the two
+        names in :data:`CONTROL_PLANE_OBJECTS` and leaves every other object in
+        ``default`` asserted on. Precedence is chaos, then noisy namespace, then
+        control-plane object, so an object in a noisy namespace is attributed to
+        the control plane's *namespace* churn rather than to this rule, and
+        nothing is double-counted.
         """
+        namespace = _namespace(key, entry)
         if namespace == chaos_namespace:
             return "chaos"
         if namespace in NOISY_SYSTEM_NAMESPACES:
             return "noisy"
+        if is_control_plane_object(key):
+            return "control-plane"
         return "asserted"
 
     before_keys = set(before)
@@ -1572,30 +1716,34 @@ def check_no_cluster_mutation(
 
     # Partitioned once, up front, so every later comparison reads a decision
     # that was already made rather than re-deriving it.
-    assert_created = [
-        k for k in created if _bucket(_namespace(k, after[k])) == "asserted"
+    assert_created = [k for k in created if _bucket(k, after[k]) == "asserted"]
+    assert_deleted = [k for k in deleted if _bucket(k, before[k]) == "asserted"]
+    chaos_created = [k for k in created if _bucket(k, after[k]) == "chaos"]
+    chaos_deleted = [k for k in deleted if _bucket(k, before[k]) == "chaos"]
+    noisy_created = [k for k in created if _bucket(k, after[k]) == "noisy"]
+    noisy_deleted = [k for k in deleted if _bucket(k, before[k]) == "noisy"]
+    control_plane_created = [
+        k for k in created if _bucket(k, after[k]) == "control-plane"
     ]
-    assert_deleted = [
-        k for k in deleted if _bucket(_namespace(k, before[k])) == "asserted"
+    control_plane_deleted = [
+        k for k in deleted if _bucket(k, before[k]) == "control-plane"
     ]
-    chaos_created = [k for k in created if _bucket(_namespace(k, after[k])) == "chaos"]
-    chaos_deleted = [k for k in deleted if _bucket(_namespace(k, before[k])) == "chaos"]
-    noisy_created = [k for k in created if _bucket(_namespace(k, after[k])) == "noisy"]
-    noisy_deleted = [k for k in deleted if _bucket(_namespace(k, before[k])) == "noisy"]
 
     if assert_created:
         raise VerificationError(
             f"{len(assert_created)} object(s) were created outside "
-            f"{chaos_namespace!r} and outside {sorted(NOISY_SYSTEM_NAMESPACES)} "
-            f"during the run: {assert_created[:6]}. The "
-            f"Sentinel and the agent are structurally read-only; a create here "
-            f"means one of them held and used a write credential."
+            f"{chaos_namespace!r}, outside {sorted(NOISY_SYSTEM_NAMESPACES)} and "
+            f"outside the per-namespace control-plane objects "
+            f"{list(CONTROL_PLANE_LABELS)} during the run: {assert_created[:6]}. "
+            f"The Sentinel and the agent are structurally read-only; a create "
+            f"here means one of them held and used a write credential."
         )
     if assert_deleted:
         raise VerificationError(
             f"{len(assert_deleted)} object(s) were deleted outside "
-            f"{chaos_namespace!r} and outside {sorted(NOISY_SYSTEM_NAMESPACES)} "
-            f"during the run: {assert_deleted[:6]}"
+            f"{chaos_namespace!r}, outside {sorted(NOISY_SYSTEM_NAMESPACES)} and "
+            f"outside the per-namespace control-plane objects "
+            f"{list(CONTROL_PLANE_LABELS)} during the run: {assert_deleted[:6]}"
         )
 
     generation_changes: list[str] = []
@@ -1606,10 +1754,12 @@ def check_no_cluster_mutation(
     #: together. They are different reasons and a reader is owed the difference.
     noisy_generation: set[str] = set()
     noisy_version: set[str] = set()
+    control_plane_generation: set[str] = set()
+    control_plane_version: set[str] = set()
     for key in sorted(shared):
         left = before[key]
         right = after[key]
-        bucket = _bucket(_namespace(key, right))
+        bucket = _bucket(key, right)
         if left.get("generation") != right.get("generation"):
             if bucket == "chaos":
                 chaos_changed.add(key)
@@ -1618,6 +1768,8 @@ def check_no_cluster_mutation(
                 # (k3s upgrading coredns or traefik). Counted and reported, not
                 # failed - the same reason the object set is exempt above.
                 noisy_generation.add(key)
+            elif bucket == "control-plane":
+                control_plane_generation.add(key)
             else:
                 generation_changes.append(
                     f"{key} generation {left.get('generation')!r} -> "
@@ -1628,6 +1780,8 @@ def check_no_cluster_mutation(
                 chaos_changed.add(key)
             elif bucket == "noisy":
                 noisy_version.add(key)
+            elif bucket == "control-plane":
+                control_plane_version.add(key)
             else:
                 version_changes.append(
                     f"{key} resourceVersion {left.get('resourceVersion')!r} -> "
@@ -1636,15 +1790,18 @@ def check_no_cluster_mutation(
 
     if generation_changes:
         raise VerificationError(
-            f"{len(generation_changes)} object(s) outside {chaos_namespace!r} "
-            f"and outside {sorted(NOISY_SYSTEM_NAMESPACES)} changed generation "
-            f"during the run, which is a spec write: {generation_changes[:6]}"
+            f"{len(generation_changes)} object(s) outside {chaos_namespace!r}, "
+            f"outside {sorted(NOISY_SYSTEM_NAMESPACES)} and outside the "
+            f"per-namespace control-plane objects {list(CONTROL_PLANE_LABELS)} "
+            f"changed generation during the run, which is a spec write: "
+            f"{generation_changes[:6]}"
         )
     if version_changes:
         raise VerificationError(
-            f"{len(version_changes)} object(s) outside {chaos_namespace!r} and "
-            f"outside the continuously-written system namespaces changed "
-            f"resourceVersion: {version_changes[:6]}"
+            f"{len(version_changes)} object(s) outside {chaos_namespace!r}, "
+            f"outside {sorted(NOISY_SYSTEM_NAMESPACES)} and outside the "
+            f"per-namespace control-plane objects {list(CONTROL_PLANE_LABELS)} "
+            f"changed resourceVersion: {version_changes[:6]}"
         )
 
     # Counted per **object**, not per event. A coredns Deployment that appears
@@ -1656,10 +1813,17 @@ def check_no_cluster_mutation(
     noisy_objects = (
         set(noisy_created) | set(noisy_deleted) | noisy_generation | noisy_version
     )
+    control_plane_objects = (
+        set(control_plane_created)
+        | set(control_plane_deleted)
+        | control_plane_generation
+        | control_plane_version
+    )
     return (
-        f"no mutation outside {chaos_namespace!r} and outside "
-        f"{sorted(NOISY_SYSTEM_NAMESPACES)}: {len(shared)} shared object(s) "
-        f"unchanged in generation and resourceVersion; "
+        f"no mutation outside {chaos_namespace!r}, outside "
+        f"{sorted(NOISY_SYSTEM_NAMESPACES)} and outside the per-namespace "
+        f"control-plane objects {list(CONTROL_PLANE_LABELS)}: {len(shared)} "
+        f"shared object(s) unchanged in generation and resourceVersion; "
         f"{len(chaos_objects)} object(s) appeared or changed inside the chaos "
         f"namespace ({len(chaos_created)} created, {len(chaos_deleted)} "
         f"deleted, {len(chaos_changed)} changed in place); "
@@ -1668,7 +1832,15 @@ def check_no_cluster_mutation(
         f"deleted, {len(noisy_generation)} generation change(s), "
         f"{len(noisy_version)} resourceVersion change(s)) - k3s controllers, "
         f"leader election and Helm install/upgrade, excluded by name and "
-        f"counted here"
+        f"counted here; "
+        f"{len(control_plane_objects)} object(s) churned as per-namespace "
+        f"control-plane objects ({len(control_plane_created)} created, "
+        f"{len(control_plane_deleted)} deleted, "
+        f"{len(control_plane_generation)} generation change(s), "
+        f"{len(control_plane_version)} resourceVersion change(s)) - the default "
+        f"ServiceAccount and the root CA ConfigMap the apiserver publishes in "
+        f"every namespace asynchronously, excluded by kind and name and counted "
+        f"here"
     )
 
 

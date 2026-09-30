@@ -764,8 +764,48 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          # BOTH fixtures, in one step, because the Tier-2 box needs the
+          # CrashLoopBackOff pod running and a second apply step could be
+          # reordered, dropped, or land after the runner's window closed.
+          #
+          # deploy/chaos/crashloop.yaml already exists, is labelled
+          # `srek3s.io/chaos: crashloop`, runs busybox:1.36.1 and plants the same
+          # CHAOS-CRED credential set as the OOM fixture. It is applied for
+          # exactly that reason. A hand-rolled `exit 1` pod would be worse on
+          # three counts: it writes no credentials, so its logs are
+          # redaction-inert and the "a [REDACTED] marker is present" half of
+          # check_redaction would fail with "nothing was masked"; it would skip
+          # the restricted-PSA securityContext that
+          # agent/tests/test_chaos_fixtures.py enforces on every fixture; and
+          # it would duplicate an artefact that already does the job.
+          #
+          # WHY THE RUNNER'S SELECTOR IS STILL `srek3s.io/chaos=oom`, and this
+          # is the load-bearing decision rather than an oversight. The two
+          # pods share a label, and `kubectl get pods -l srek3s.io/chaos` (a
+          # bare existence selector) matches BOTH. `get_pod` returns items[0],
+          # and the apiserver lists pods by name, so `srek3s-chaos-crashloop-*`
+          # sorts ahead of `srek3s-chaos-oom-*` and the runner would sample the
+          # crashloop pod only - whose exit code is 1, never 137. That fails
+          # check_causal_chain ("never observed Terminated{exit_code: 137}")
+          # and check_detection_latency ("no termination with exit_code 137")
+          # on every run. Widening `get_pod` to return every matching pod would
+          # not fix it either: Observation carries no pod identity, so
+          # check_causal_chain would satisfy its two halves from two different
+          # containers, and sampler_restart_ceiling would become a cross-pod
+          # maximum that widens the tolerance for a fabricated detection. Both
+          # are false passes, which cost more than the box they would buy.
+          #
+          # The Tier-2 incident therefore arrives through the CAPTURE rather
+          # than through sampling. check_tier_two_dispatches derives its
+          # precondition from the capture (TIER_ONLY_POSSIBLE_REASONS: ARCH 5.3
+          # admits Tier-1 only for OOMKilled, so a captured CrashLoopBackOff
+          # incident *proves* a Tier-2 response must exist), and the proxy
+          # records every POST the Sentinel makes in the chaos namespace. One
+          # timeline for the sampler, the other fixture observed where it is
+          # actually adjudicated.
           kubectl apply -f deploy/chaos/oom-leak.yaml
-          kubectl -n "$CHAOS_NAMESPACE" get pods -l srek3s.io/chaos=oom -o wide
+          kubectl apply -f deploy/chaos/crashloop.yaml
+          kubectl -n "$CHAOS_NAMESPACE" get pods -l srek3s.io/chaos -o wide
 
       - name: Watch the pod reach its failure state
         # Bounded independently of the loop's own deadline, so a wedged
