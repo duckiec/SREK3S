@@ -564,9 +564,22 @@ jobs:
           # visibility into which incidents arrived, and a buffered stream means
           # the Actions console shows nothing until the job ends. The sentinel
           # writes to /tmp/sentinel.log separately, but the agent's does not.
+          #
+          # The two SREK3S_MANIFEST_* variables are separate and both are
+          # required. SREK3S_MANIFEST_ROOT is where the GitOps checkout is;
+          # without it the provider is `unreadable_manifest_provider()` and every
+          # incident escalates under I-B2. SREK3S_TARGET_MANIFEST is *which*
+          # file inside that checkout the patch targets - the default,
+          # deploy/payments/checkout-api.yaml, does not exist in this repository,
+          # so without this the agent reads a missing file and escalates anyway.
+          #
+          # Set here rather than by hardcoding a namespace->manifest map in
+          # triage.py: the routing belongs to the harness, and the production
+          # default is unchanged when the variable is absent.
           SREK3S_SANDBOX=1 \
           SREK3S_LOG_LEVEL=INFO \
           SREK3S_MANIFEST_ROOT="$PWD" \
+          SREK3S_TARGET_MANIFEST="deploy/chaos/oom-leak.yaml" \
           PYTHONUNBUFFERED=1 \
           PYTHONPATH="$PWD/agent" \
             nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \

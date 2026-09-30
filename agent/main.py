@@ -46,6 +46,7 @@ from pydantic import ValidationError
 
 import triage
 from budget import JobBudget, budget_from_env
+import classifier
 from classifier import ManifestProvider, manifest_provider_from_env
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner
 from models import IncidentPayload, TriageResponse
@@ -128,11 +129,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # itself. Wiring a GitOps checkout in would have made that line a lie, and a
     # log that misreports whether patches are possible is worse than no log:
     # an operator reads it to decide whether Tier-1 is reachable.
+    #
+    # The target manifest is logged for the same reason and one more. A run that
+    # escalates every incident with "target manifest is unreadable" is
+    # indistinguishable from a run whose target is simply the wrong file, and
+    # the only way to tell them apart from the outside is this line.
     logger.info(
         "srek3s agent starting: version=%s manifest_provider=%s "
-        "job_budget=%s max_active_jobs=%s",
+        "target_manifest=%s job_budget=%s max_active_jobs=%s",
         triage.AGENT_VERSION,
         type(provider).__name__ if provider is not None else "unset",
+        classifier.TARGET_MANIFEST,
         "configured" if provider is not None else "unconfigured",
         getattr(budget, "max_active", "unknown"),
     )

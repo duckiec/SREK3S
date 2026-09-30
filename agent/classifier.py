@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -54,8 +55,10 @@ from models import (
 )
 
 __all__ = [
+    "DEFAULT_TARGET_MANIFEST",
     "MANIFEST_ROOT_ENV",
     "TARGET_MANIFEST",
+    "TARGET_MANIFEST_ENV",
     "affected_scope",
     "classify",
     "FileManifestProvider",
@@ -67,6 +70,7 @@ __all__ = [
     "RoutingDecision",
     "StaticManifestProvider",
     "manifest_provider_from_env",
+    "resolve_target_manifest",
     "unreadable_manifest_provider",
     "route",
     "PRECONDITIONS",
@@ -76,11 +80,13 @@ logger = logging.getLogger("srek3s.agent")
 
 #: The single manifest Tier-1 remediation is permitted to target.
 #:
-#: Hard-coded rather than derived from the pod or container name. ARCH §5.3
-#: enumerates the permitted Tier-1 remedy shapes; deriving the patch target from
+#: Not derived from the pod or container name. ARCH §5.3 enumerates the
+#: permitted Tier-1 remedy shapes; deriving the patch target from
 #: incident-supplied data would let a payload choose which file this system is
-#: willing to propose a change to.
-TARGET_MANIFEST: Final[str] = "deploy/payments/checkout-api.yaml"
+#: willing to propose a change to. The *resolved* value this engine uses is
+#: :data:`TARGET_MANIFEST`, declared further down beside the environment
+#: handling it depends on; this is the shipped default.
+DEFAULT_TARGET_MANIFEST: Final[str] = "deploy/payments/checkout-api.yaml"
 
 #: Cluster events indicating node-level rather than container-level pressure.
 #:
@@ -178,6 +184,88 @@ MANIFEST_ROOT_ENV: Final[str] = "SREK3S_MANIFEST_ROOT"
 #: manifest extensions ARCH §5.1 already fixes for ``remediation.target_manifest``
 #: keeps a traversal bug from turning into a file-read primitive.
 _MANIFEST_SUFFIXES: Final[tuple[str, ...]] = (".yaml", ".yml", ".json")
+
+#: Environment variable that overrides which file Tier-1 remediation targets.
+#:
+#: **Read once, at import, and only as a deployment setting.** It exists so a
+#: harness can point the engine at the file its own fixture patches, without the
+#: test's knowledge of the engine leaking into the engine. What it deliberately
+#: does *not* accept is an incident-supplied value: the point of the target
+#: being a constant is that no payload can choose which file this system will
+#: propose a change to, and routing on ``incident.namespace`` would hand exactly
+#: that power to whatever wrote the payload.
+#:
+#: Unset means :data:`DEFAULT_TARGET_MANIFEST`, so the production default and
+#: the fail-closed path (no :data:`MANIFEST_ROOT_ENV`, hence no readable
+#: manifest, hence Tier-2 under I-B2) are both exactly as they were.
+TARGET_MANIFEST_ENV: Final[str] = "SREK3S_TARGET_MANIFEST"
+
+
+def _target_manifest_is_wellformed(path: str) -> bool:
+    """Whether ``path`` could name a repo-relative manifest at all.
+
+    The same shape rules :meth:`FileManifestProvider._resolve` enforces, applied
+    at resolution time rather than at read time so a **mistyped** setting is
+    named once at startup instead of escalating every incident with a vague
+    "target manifest is unreadable". It is deliberately not the security
+    boundary - the provider re-checks on every read, because a check made once
+    at startup can be outlived by a file that appears later. This one exists to
+    fail loudly and early, not to be trusted.
+    """
+    candidate = path.strip().replace("\\", "/")
+    if not candidate or candidate.startswith("/") or ":" in candidate:
+        return False
+    if any(segment in {"", ".", ".."} for segment in candidate.split("/")):
+        return False
+    return candidate.lower().endswith(_MANIFEST_SUFFIXES)
+
+
+def resolve_target_manifest(env: Mapping[str, str] | None = None) -> str:
+    """The target manifest this process will patch, from the environment.
+
+    Three outcomes, mirroring :func:`manifest_provider_from_env`:
+
+    * unset or blank -> :data:`DEFAULT_TARGET_MANIFEST`, so an operator who has
+      never heard of this variable gets the shipped behaviour.
+    * set to a well-formed repo-relative manifest path -> that path.
+    * set to something that could never be a manifest -> a logged warning and
+      the default. A typo must not become a target. Falling back is safe here
+      precisely because the default fails closed too when no checkout is
+      mounted, so a mis-set variable escalates rather than patching some other
+      file - which is the outcome that would be unrecoverable.
+
+    A mapping may be passed so this is testable without mutating the process
+    environment; the production call reads ``os.environ``.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get(TARGET_MANIFEST_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_TARGET_MANIFEST
+    if _target_manifest_is_wellformed(raw):
+        return raw
+    logger.warning(
+        "%s=%r is not a repo-relative manifest path, so the default %r is used "
+        "instead. A target that cannot exist would escalate every incident under "
+        "I-B2, and a target that resolves to something else would be worse.",
+        TARGET_MANIFEST_ENV,
+        raw,
+        DEFAULT_TARGET_MANIFEST,
+    )
+    return DEFAULT_TARGET_MANIFEST
+
+
+#: Resolved **once**, at import, because every consumer in the engine reads it
+#: as a constant: nine call sites in :mod:`triage` use this name. Making it a
+#: function of a request, or re-reading ``os.environ`` at each use, would either
+#: scatter the resolution or let one process answer two incidents with two
+#: different patch targets.
+#:
+#: Import time is the right moment for a uvicorn worker: the environment is
+#: fixed before the module is loaded, so there is no window in which the answer
+#: can change mid-run. Tests that need a different value call
+#: :func:`resolve_target_manifest` with an explicit mapping rather than
+#: mutating the process environment, so no test can depend on import order.
+TARGET_MANIFEST: Final[str] = resolve_target_manifest()
 
 
 class FileManifestProvider:

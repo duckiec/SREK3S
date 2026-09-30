@@ -18,6 +18,7 @@ let a P0 through 410 green tests.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -55,9 +56,12 @@ from runner import (  # noqa: E402
     check_tier_two_dispatches,
     declared_patch_path,
     git_apply,
+    injectable_restart_counts,
+    oom_restart_counts,
     percentile_nearest_rank,
     render,
     response_of,
+    sampler_restart_ceiling,
     semantic_change_paths,
     tier_of,
     verify,
@@ -212,6 +216,34 @@ def oom_at(*restarts: int) -> list[Observation]:
         )
         for index, restart in enumerate(restarts, start=1)
     ]
+
+
+def oom_then_restarted(*restarts: int) -> list[Observation]:
+    """A 137 at each of ``restarts``, then the pod already restarted again.
+
+    This is the shape a live run actually produces when the fixture crashes
+    faster than the ~1s sampler. The kubelet has already incremented the restart
+    count by the time the next poll lands, so the sampler sees
+    ``restartCount=2`` with the ``Terminated`` state cleared and the 137 only in
+    ``lastState`` - which ``read_observation`` files under
+    ``previous_exit_code``, not ``exit_code``. The sampler therefore *missed* a
+    real kill, and the final trailing sample is what proves the restart count
+    really did reach ``len(restarts)``.
+    """
+    history = oom_at(*restarts)
+    final = max(restarts) + 1 if restarts else 1
+    history.append(
+        Observation(
+            timestamp=float(len(history) + 1),
+            state="CrashLoopBackOff",
+            exit_code=None,
+            reason=None,
+            restart_count=final,
+            previous_exit_code=137,
+            previous_reason="OOMKilled",
+        )
+    )
+    return history
 
 
 def latency_record(restart: int, latency_ms: int = 120) -> dict[str, Any]:
@@ -386,6 +418,122 @@ def test_percentile_nearest_rank_is_the_strictest_reading() -> None:
         percentile_nearest_rank([], 0.99)
     with pytest.raises(VerificationError, match="outside"):
         percentile_nearest_rank([1], 0.0)
+
+
+# --- 4.2.3: the sampler's resolution, not a phantom detection ---------------
+#
+# The defect these cover: the fixture OOMs faster than the ~1s sampler can
+# resolve, so the Sentinel - which watches continuously - detects a restart the
+# runner's one-shot poll never saw. `detected != injected` on restart counts,
+# the ratio went above 1, and CI run 36715114506 failed 4.2.3 against a system
+# that had detected everything it was injected.
+
+
+def test_the_accepted_set_is_derived_from_the_pod_not_a_constant() -> None:
+    """The ceiling is read off the pod, not hardcoded.
+
+    Pinned because the alternative - a fixed range like ``{0..5}`` - would
+    silently stop matching the pod as soon as the fixture's backoff schedule or
+    the observation window changed, and would do so by getting *stricter*
+    without any visible edit. Two different histories must produce two
+    different ceilings, and a pod nothing was read from must produce 0 rather
+    than a number that lets anything through.
+    """
+    assert sampler_restart_ceiling(oom_at(1, 2, 3)) == 3
+    assert sampler_restart_ceiling(oom_at(1, 7)) == 7
+    assert sampler_restart_ceiling([]) == 0
+    assert injectable_restart_counts(oom_at(1, 2, 3)) == {0, 1, 2, 3}
+    assert injectable_restart_counts(oom_at(1, 7)) == set(range(8))
+    assert injectable_restart_counts([]) == {0}
+
+
+def test_a_detection_the_sampler_could_not_resolve_is_not_a_phantom() -> None:
+    """The positive case, reproducing the live failure.
+
+    The runner observed one 137 (at restart 1) and then saw the pod already on
+    restart 2. The Sentinel detected both. The old rule called the second a
+    phantom and failed; it is a resolution failure in the *sampler*, and the
+    accepted set now says so. The description has to name it, or the next
+    reader cannot tell a forgiven detection from an absent one.
+    """
+    observations = oom_then_restarted(1)
+    assert sampler_restart_ceiling(observations) == 2
+    incidents = [latency_record(1), latency_record(2)]
+    description = check_detection_latency(incidents, observations)
+    assert "2 OOMKilled detection(s)" in description
+    assert "sampler misses rather than phantoms" in description
+    assert "[2]" in description
+
+
+def test_control_a_detection_beyond_the_final_restart_count_still_fails() -> None:
+    """The defect: an incident for a restart the pod never reached.
+
+    The allowance is bounded by the pod's own final observed state, so it
+    forgives a *gap* in the sampler's record and nothing more. An incident at a
+    restart count above every one the runner read is not a gap - the pod was
+    never that far along - so it is a fabricated detection and must still fail.
+    Without this bound the fix would degrade the check into a no-op.
+    """
+    observations = oom_at(1, 2)
+    incidents = [latency_record(1), latency_record(2), latency_record(9)]
+    with pytest.raises(VerificationError) as error:
+        check_detection_latency(incidents, observations)
+    message = str(error.value)
+    assert "no observed injection" in message
+    assert "[9]" in message
+    assert "final observed restart count 2" in message
+
+
+def test_control_a_wide_ceiling_does_not_launder_a_real_miss() -> None:
+    """The defect: a 137 the runner saw, with no incident for it.
+
+    **The control that makes the allowance safe.** The accepted set grows with
+    the pod's restart count, so a fixture that restarts nine times accepts
+    detections anywhere in ``{0..9}``. If the missing-detection direction had
+    been relaxed at the same time, a high restart count would launder exactly
+    the defect 4.2.3 exists to catch. Here the ceiling is 9 and the incident is
+    absent for restart 3, and it must still fail.
+    """
+    observations = oom_then_restarted(1, 2, 3, 4, 5, 6, 7, 8)
+    assert sampler_restart_ceiling(observations) == 9
+    # Detections at 1, 2 and 9; the runner saw 137s at 1..8 and there is no
+    # incident for restart 3. Only the miss can be responsible for the failure.
+    incidents = [latency_record(1), latency_record(2), latency_record(9)]
+    with pytest.raises(VerificationError) as error:
+        check_detection_latency(incidents, observations)
+    message = str(error.value)
+    assert "Missed detection" in message
+    assert "[3, 4, 5, 6, 7, 8]" in message
+
+
+def test_a_faster_sampler_would_make_the_allowance_unnecessary() -> None:
+    """The rule is a resolution allowance, not a permanent loosening.
+
+    When every 137 the pod produced was also recorded by the sampler, the
+    accepted set and the observed set are the same set apart from restart 0 -
+    the container's first crash, which carries no ``Terminated`` state the
+    sampler can have missed because there is no previous instance to lose it -
+    so the rule contributes nothing to the verdict. That is the property which
+    says a higher-resolution sampler *retires* the allowance rather than
+    contradicting it. Asserted so a future edit that widens the accepted set
+    past the pod's own final restart count breaks here first.
+    """
+    observations = oom_at(1, 2, 3)
+    assert sampler_restart_ceiling(observations) == 3
+    assert oom_restart_counts(observations) == {1, 2, 3}
+    # The observed set is inside the accepted one, and the only member of the
+    # accepted set with no observed 137 is restart 0, which is the one restart
+    # count a sampler cannot miss: it is the first crash.
+    assert oom_restart_counts(observations) <= injectable_restart_counts(observations)
+    assert injectable_restart_counts(observations) - oom_restart_counts(
+        observations
+    ) == {0}
+
+    description = check_detection_latency(
+        [latency_record(1), latency_record(2), latency_record(3)], observations
+    )
+    # Nothing was forgiven, so the description carries no sampler-miss clause.
+    assert "sampler misses" not in description
 
 
 # ---------------------------------------------------------------------------
@@ -1081,8 +1229,10 @@ def test_an_unchanged_cluster_passes() -> None:
     assert "no mutation outside" in description
     # One *object* changed, not one field: the chaos Deployment moved both its
     # generation and its resourceVersion, and reporting that as two changes
-    # would misdescribe what the run did.
-    assert "1 object(s) changed inside the chaos namespace" in description
+    # would misdescribe what the run did. The tally also covers objects the
+    # fixture *created* in the chaos namespace, because a run that only mutated
+    # something already present is not what the harness does.
+    assert "1 object(s) appeared or changed inside the chaos namespace" in description
 
 
 # --- 4.2.8 negative controls ----------------------------------------------
@@ -1137,13 +1287,22 @@ def test_control_a_resource_version_change_outside_chaos_fails() -> None:
         check_no_cluster_mutation(before, after)
 
 
-def test_kube_system_resource_version_churn_is_excluded_but_counted() -> None:
+def test_kube_system_churn_is_excluded_but_counted() -> None:
     """The honest form of the exclusion: narrow, named, and visible.
 
     ``kube-system`` holds a leader-election lease every control-plane component
-    renews on a timer. Asserting resourceVersion stability there would fail
-    every run for reasons unrelated to the Sentinel. So it is excluded - but
-    **counted and reported**, and its ``generation`` is still asserted.
+    renews on a timer, and k3s's Helm controller installs and upgrades coredns
+    and traefik **asynchronously** - after any pre-flight baseline is taken. All
+    three sub-checks now exempt it, and every exempted change is **counted and
+    reported** rather than dropped.
+
+    The generation half is asserted as *excluded and counted* rather than
+    *still failing*. That is a real change in what this check can catch, and it
+    is the price of a check that runs at all on a live k3s: a control-plane
+    Deployment rolling under its own controller is indistinguishable from a spec
+    write by a component under test. The narrowing is stated here, and the
+    controls below pin the part that was not given up - every namespace outside
+    the exempt set is still asserted on all three sub-checks.
     """
     assert "kube-system" in NOISY_SYSTEM_NAMESPACES
     before, after = healthy_pair()
@@ -1151,15 +1310,152 @@ def test_kube_system_resource_version_churn_is_excluded_but_counted() -> None:
         "kube-system", resource_version="9999"
     )
     description = check_no_cluster_mutation(before, after)
-    assert "1 resourceVersion-only change(s) inside" in description
+    assert "1 object(s) churned inside the exempt system namespaces" in description
+    assert "1 resourceVersion change(s)" in description
 
-    # And the exclusion is not a blanket amnesty: a *spec* change there is still
-    # a failure, because a control-plane deployment rolling is not a
-    # resourceVersion refresh.
+    # A generation bump there is excluded too, and counted separately, so a
+    # reader can see that a control-plane roll happened rather than infer it.
     after["v1/Deployment/kube-system/coredns"] = snapshot_entry(
         "kube-system", generation=99, resource_version="9999"
     )
+    description = check_no_cluster_mutation(before, after)
+    assert "1 generation change(s)" in description
+
+
+def test_control_a_create_in_a_noisy_namespace_is_excluded_but_counted() -> None:
+    """The live failure, reproduced: coredns appears between the two images.
+
+    k3s installs coredns through a Helm controller that finishes after the
+    pre-flight snapshot, so its objects exist only in the after-image. Reported
+    as a *creation* by a component that structurally holds no write credential,
+    this failed 4.2.8 on CI run 36715114506. It is background noise, and the
+    check now says so - while counting it, so the exclusion stays visible.
+    """
+    before, after = healthy_pair()
+    after["apps/v1/Deployment/kube-system/coredns"] = snapshot_entry(
+        "kube-system", resource_version="1"
+    )
+    after["v1/ConfigMap/kube-system/coredns"] = snapshot_entry(
+        "kube-system", resource_version="1"
+    )
+    description = check_no_cluster_mutation(before, after)
+    assert "2 created" in description
+    assert "Helm install/upgrade" in description
+
+
+def test_control_a_create_outside_chaos_still_fails_after_the_exemption() -> None:
+    """**The control that makes the exemption safe.**
+
+    The defect: an object created outside both the chaos namespace and the
+    exempt set - a component under test using write authority it does not hold.
+    Every namespace in :data:`NOISY_SYSTEM_NAMESPACES` is checked here, because
+    the failure mode of a namespace-set exemption is a set that is one entry too
+    wide, and ``default`` is where a real agent or Sentinel write would land.
+
+    This is the box 4.2.8 exists to check, so it is asserted per namespace
+    rather than once: an exemption that silences the check defeats the box, and
+    the only defence is a control that fires after the exemption is in place.
+    """
+    for namespace in ("default", "srek3s-system", "payments"):
+        before, after = healthy_pair()
+        after[f"v1/Secret/{namespace}/stolen"] = snapshot_entry(
+            namespace, resource_version="1"
+        )
+        with pytest.raises(VerificationError, match="were created outside"):
+            check_no_cluster_mutation(before, after)
+
+
+def test_control_the_exemption_is_an_exact_namespace_match() -> None:
+    """The defect: a namespace that merely *looks* like an exempt one.
+
+    The printer this check replaced matched with a substring test, so
+    ``kube-system-staging`` and ``my-kube-system`` were silently treated as
+    control-plane namespaces. A prefix or substring exemption turns the one
+    check that catches an out-of-namespace write into a no-op over a whole
+    family of names, and it would have done so invisibly. Exact match only.
+    """
+    for namespace in ("kube-system-staging", "my-kube-system", "kube-systemx"):
+        assert namespace not in NOISY_SYSTEM_NAMESPACES
+        before, after = healthy_pair()
+        after[f"v1/Secret/{namespace}/stolen"] = snapshot_entry(
+            namespace, resource_version="1"
+        )
+        with pytest.raises(VerificationError, match="were created outside"):
+            check_no_cluster_mutation(before, after)
+    # And it must not be a one-way door: a spec write there fails too. Seeded
+    # into both images so the object-set check stays quiet and the generation
+    # check is the one under test.
+    before, after = healthy_pair()
+    before["v1/Deployment/kube-system-staging/web"] = snapshot_entry(
+        "kube-system-staging", generation=1, resource_version="1"
+    )
+    after["v1/Deployment/kube-system-staging/web"] = snapshot_entry(
+        "kube-system-staging", generation=2, resource_version="2"
+    )
     with pytest.raises(VerificationError, match="changed generation"):
+        check_no_cluster_mutation(before, after)
+
+
+def test_control_a_delete_outside_chaos_still_fails_after_the_exemption() -> None:
+    """The defect: an object removed, outside both exempt sets.
+
+    The reverse direction of the object-set check, and the one most likely to be
+    forgotten when an exemption is added: a create is caught by the "was it
+    there before" half and a delete by the "is it still there" half, and they
+    are separate predicates in separate lists.
+    """
+    before, after = healthy_pair()
+    del after["v1/Deployment/default/web"]
+    with pytest.raises(VerificationError, match="were deleted outside"):
+        check_no_cluster_mutation(before, after)
+
+    # And inside an exempt namespace, a delete is absorbed and counted rather
+    # than failed - the k3s control plane garbage-collects its own objects.
+    before, after = healthy_pair()
+    del after["v1/Deployment/kube-system/coredns"]
+    description = check_no_cluster_mutation(before, after)
+    assert "1 deleted" in description
+
+
+def test_the_chaos_namespace_exemption_is_preserved() -> None:
+    """Everything inside the chaos namespace is allowed, on all three checks.
+
+    The harness applies the fixture there itself, so the Deployment appears, its
+    generation moves and its pods churn. A check that asserted any of that
+    would fail every run against the harness's own hand.
+    """
+    before, after = healthy_pair()
+    after[f"apps/v1/ReplicaSet/{CHAOS_NAMESPACE}/srek3s-chaos-oom-abc"] = (
+        snapshot_entry(CHAOS_NAMESPACE, resource_version="1")
+    )
+    after[f"v1/Pod/{CHAOS_NAMESPACE}/srek3s-chaos-oom-abc-xyz"] = snapshot_entry(
+        CHAOS_NAMESPACE, resource_version="1"
+    )
+    after[f"v1/ConfigMap/{CHAOS_NAMESPACE}/chaos"] = snapshot_entry(
+        CHAOS_NAMESPACE, resource_version="1"
+    )
+    description = check_no_cluster_mutation(before, after)
+    assert "no mutation outside" in description
+    # Attributed to the chaos namespace, not to the control plane. The two are
+    # exempt for entirely different reasons and a report that merged them would
+    # make a reviewer read harness work as cluster noise.
+    assert "4 object(s) appeared or changed inside the chaos namespace" in description
+    assert "3 created" in description
+    assert "0 object(s) churned inside the exempt system namespaces" in description
+
+
+def test_a_chaos_namespace_that_is_only_a_prefix_is_not_exempt() -> None:
+    """The chaos exemption is exact too, and the same reason applies.
+
+    ``sentinel-chaos-evil`` is not the fixture namespace. A prefix match here
+    would exempt a second workload that no fixture describes, which is exactly
+    where a real write would hide.
+    """
+    before, after = healthy_pair()
+    after["v1/Secret/sentinel-chaos-evil/stolen"] = snapshot_entry(
+        "sentinel-chaos-evil", resource_version="1"
+    )
+    with pytest.raises(VerificationError, match="were created outside"):
         check_no_cluster_mutation(before, after)
 
 
@@ -1202,6 +1498,127 @@ def test_load_snapshot_reports_a_corrupt_file(tmp_path: pathlib.Path) -> None:
 
     with pytest.raises(VerificationError, match="could not be read"):
         _load_snapshot(str(tmp_path / "absent.json"))
+
+
+# --- 4.2.8: the printer and the verdict must not tell different stories ------
+
+
+def _write_snapshots(
+    tmp_path: pathlib.Path,
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> tuple[str, str]:
+    before_path = tmp_path / "before.json"
+    after_path = tmp_path / "after.json"
+    before_path.write_text(json.dumps(before, indent=2), encoding="utf-8")
+    after_path.write_text(json.dumps(after, indent=2), encoding="utf-8")
+    return str(before_path), str(after_path)
+
+
+def test_the_printer_prints_exactly_the_objects_that_fail_the_verdict(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The defect: a clean console beside a red exit code.
+
+    ``show_mutation.py`` carried its own ``SYSTEM_PREFIXES`` tuple and matched
+    with a substring test, so it excluded a *different* set of objects from the
+    one the verdict was computed over - and it did not know the chaos namespace
+    at all, so it printed the harness's own fixture under "CREATED". A reviewer
+    reading that section would see nothing wrong while the job failed on the
+    same objects. The printer is a diagnostic for the verdict, so a disagreement
+    between them is itself a defect, and this asserts the two agree.
+    """
+    # Function-local, and ignored for mypy: `tests/e2e` is a directory of
+    # standalone scripts rather than a package, so it is reachable through the
+    # `sys.path` entry at the top of this file. The gate invokes
+    # `mypy --strict agent/ tests/`, and passing `tests/` gives mypy those
+    # scripts as roots, so the module resolves and needs no ignore here.
+    #
+    # An earlier version carried `# type: ignore[import-not-found]` on the
+    # strength of "mypy reports an unresolved module once per file". That was
+    # reasoned from `mypy --strict agent/` alone - a narrower invocation than
+    # the gate - and under the real gate the ignore is unused, which
+    # --strict reports. Verified against the gate rather than against a guess
+    # about which invocation matters.
+    import show_mutation
+
+    before, after = healthy_pair()
+    after["apps/v1/Deployment/kube-system/coredns"] = snapshot_entry(
+        "kube-system", resource_version="1"
+    )
+    after[f"apps/v1/Deployment/{CHAOS_NAMESPACE}/srek3s-chaos-oom"] = snapshot_entry(
+        CHAOS_NAMESPACE, resource_version="1"
+    )
+    after["v1/Secret/default/stolen"] = snapshot_entry("default", resource_version="1")
+    before_path, after_path = _write_snapshots(tmp_path, before, after)
+
+    printed = show_mutation.main([before_path, after_path])
+    assert printed == 0
+    output = capsys.readouterr().out
+
+    # The verdict fails, and it must fail on exactly one object.
+    with pytest.raises(VerificationError) as error:
+        check_no_cluster_mutation(before, after)
+    offending = "v1/Secret/default/stolen"
+    assert offending in str(error.value)
+
+    # The printer lists that object, and its stated verdict is a failure. Both
+    # come from the runner, so neither can be quietly wrong.
+    assert offending in output
+    assert "VERDICT: FAIL" in output
+    assert offending in output.split("VERDICT: FAIL")[1]
+    # Neither exempt object is listed as offending.
+    listed = output.split("CREATED outside")[1].split("exempt churn")[0]
+    assert "kube-system/coredns" not in listed
+    assert "srek3s-chaos-oom" not in listed
+
+
+def test_control_the_printer_agrees_on_a_clean_run(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other direction: a run that passes prints nothing alarming.
+
+    A printer that lists an object the runner accepts would be its own kind of
+    lie, and it is the direction a reviewer is most likely to act on - a red
+    line in the artifacts step sends someone hunting for a write that did not
+    happen.
+    """
+    import show_mutation  # noqa: PLC0415 - see the note on the first import
+
+    before, after = healthy_pair()
+    after["apps/v1/Deployment/kube-system/coredns"] = snapshot_entry(
+        "kube-system", resource_version="1"
+    )
+    after[f"v1/Pod/{CHAOS_NAMESPACE}/srek3s-chaos-oom-abc-xyz"] = snapshot_entry(
+        CHAOS_NAMESPACE, resource_version="1"
+    )
+    before_path, after_path = _write_snapshots(tmp_path, before, after)
+
+    check_no_cluster_mutation(before, after)  # the verdict: clean
+    assert show_mutation.main([before_path, after_path]) == 0
+    output = capsys.readouterr().out
+    outside = output.split("CREATED outside")[1].split("exempt churn")[0]
+    assert "v1/Deployment/kube-system/coredns" not in outside
+    assert f"v1/Pod/{CHAOS_NAMESPACE}/srek3s-chaos-oom-abc-xyz" not in outside
+    # The printer states the verdict the runner reached, not its own.
+    assert "VERDICT: no mutation outside" in output
+    assert "VERDICT: FAIL" not in output
+
+
+def test_the_printer_and_the_runner_share_one_exemption_rule() -> None:
+    """Structural anti-drift, on top of the behavioural controls above.
+
+    The behavioural controls pin the two to today's namespaces. This pins them
+    to *each other*: a future edit that adds a namespace to
+    :data:`NOISY_SYSTEM_NAMESPACES` without the printer following is a failure
+    here rather than a divergence discovered in a CI log weeks later.
+    """
+    import show_mutation  # noqa: PLC0415 - see the note on the first import
+
+    for namespace in sorted(NOISY_SYSTEM_NAMESPACES | {CHAOS_NAMESPACE}):
+        assert show_mutation.is_exempt_namespace(namespace) is True
+    for namespace in ("default", "srek3s-system", "kube-system-staging"):
+        assert show_mutation.is_exempt_namespace(namespace) is False
 
 
 # ---------------------------------------------------------------------------

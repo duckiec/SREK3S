@@ -26,6 +26,8 @@ import pathlib
 import stat
 from typing import Any, Iterator
 
+import asyncio
+
 import pytest
 
 import classifier
@@ -33,13 +35,16 @@ import models
 import triage
 import warroom
 from classifier import (
+    DEFAULT_TARGET_MANIFEST,
     MANIFEST_ROOT_ENV,
     TARGET_MANIFEST,
+    TARGET_MANIFEST_ENV,
     FileManifestProvider,
     manifest_provider_from_env,
+    resolve_target_manifest,
     unreadable_manifest_provider,
 )
-from main import create_app
+from main import _lifespan, create_app
 from triage import triage_payload
 
 # ---------------------------------------------------------------------------
@@ -569,6 +574,170 @@ def test_the_default_provider_and_the_env_default_agree() -> None:
     unreadable = unreadable_manifest_provider()
     for path in (TARGET_MANIFEST, "nope.yaml", "../../etc/passwd", "/etc/passwd"):
         assert default.read_manifest(path) == unreadable.read_manifest(path) is None
+
+
+# ---------------------------------------------------------------------------
+# Which file Tier-1 is allowed to patch (SREK3S_TARGET_MANIFEST)
+#
+# `classifier.TARGET_MANIFEST` pointed at deploy/payments/checkout-api.yaml,
+# which does not exist in this repository. With SREK3S_MANIFEST_ROOT set,
+# read_manifest returned None and every incident escalated under I-B2, so no
+# Tier-1 patch could ever be produced and ROADMAP 4.2.6 was unreachable on a
+# live cluster. The fix is to make the target configurable and default it to the
+# existing constant, so the harness points the engine at its own fixture and
+# the production default is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_target_is_unchanged() -> None:
+    """The production behaviour is exactly what it was before the override.
+
+    Asserted because "unchanged by default" is the entire claim that makes this
+    a configuration knob rather than a semantic change to a constant, and a
+    silent edit to the default would leave the shipped engine patching a
+    different file with nothing in the diff to say so.
+    """
+    assert DEFAULT_TARGET_MANIFEST == "deploy/payments/checkout-api.yaml"
+    assert resolve_target_manifest({}) == DEFAULT_TARGET_MANIFEST
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: ""}) == DEFAULT_TARGET_MANIFEST
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: "   "}) == (
+        DEFAULT_TARGET_MANIFEST
+    )
+    # And the module-level value the engine actually reads is that default,
+    # because nothing set the variable in this process.
+    assert TARGET_MANIFEST == DEFAULT_TARGET_MANIFEST
+
+
+def test_the_override_is_honoured() -> None:
+    """The positive case: a harness points the engine at its own fixture.
+
+    This is what makes ROADMAP 4.2.6 reachable: the fixture the Sentinel
+    detonates is the file the agent must read, or the patch is derived against a
+    manifest that does not describe the running workload.
+    """
+    assert (
+        resolve_target_manifest({TARGET_MANIFEST_ENV: "deploy/chaos/oom-leak.yaml"})
+        == "deploy/chaos/oom-leak.yaml"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/passwd.yaml",
+        "C:\\secrets\\admin.yaml",
+        "../outside/manifest.yaml",
+        "deploy/../../etc/passwd.yaml",
+        "deploy/chaos/oom-leak.txt",
+        "notamanifest",
+    ],
+    ids=[
+        "absolute",
+        "drive-letter",
+        "leading-traversal",
+        "embedded-traversal",
+        "wrong-extension",
+        "bare-name",
+    ],
+)
+def test_control_a_malformed_override_falls_back_to_the_default(
+    value: str,
+) -> None:
+    """The defect: a mistyped target silently becomes the patch target.
+
+    Every value here is refused, because it could not name a repo-relative
+    manifest. The two dangerous outcomes of accepting one are: (a) a target that
+    cannot exist, which escalates every incident under I-B2 and presents as a
+    healthy system that never patches; and (b) a target that resolves to some
+    other file, which patches the wrong thing. Falling back to the default is
+    safe precisely because the default fails closed too when no checkout is
+    mounted, so the failure is a loud escalation rather than a wrong write.
+
+    This is the control that keeps the knob from being a way to smuggle a path
+    past :meth:`FileManifestProvider._resolve`, which is the real security
+    boundary and which re-checks on every read regardless.
+    """
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: value}) == (
+        DEFAULT_TARGET_MANIFEST
+    )
+
+
+def test_control_a_malformed_override_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected override must be **named**, or it is a silent correction.
+
+    Falling back quietly is how a misconfigured deployment ends up patching a
+    file nobody chose: the engine works, the patch is valid, and nothing in any
+    log says the operator's value was discarded. The warning carries both the
+    rejected value and the one used instead.
+    """
+    with caplog.at_level(logging.WARNING, logger="srek3s.agent"):
+        assert resolve_target_manifest({TARGET_MANIFEST_ENV: "/etc/passwd"}) == (
+            DEFAULT_TARGET_MANIFEST
+        )
+    assert TARGET_MANIFEST_ENV in caplog.text
+    assert "/etc/passwd" in caplog.text
+    assert DEFAULT_TARGET_MANIFEST in caplog.text
+
+
+def test_a_valid_override_is_not_logged_as_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A harness using the knob as intended must not look like a misconfiguration."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="srek3s.agent"):
+        resolve_target_manifest({TARGET_MANIFEST_ENV: "deploy/chaos/oom-leak.yaml"})
+    assert caplog.text == ""
+
+
+def test_the_override_still_cannot_escape_the_checkout(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The knob chooses a file; it does not widen where files may be read from.
+
+    The provider is the boundary, and it is unchanged: a target that resolves
+    outside the mounted root is still refused, so setting the variable cannot
+    turn the agent into a file-read primitive. Asserted because the new setting
+    is the first thing a reader would ask about.
+    """
+    checkout = tmp_path / "checkout"
+    (checkout / "deploy" / "chaos").mkdir(parents=True)
+    provider = FileManifestProvider(checkout)
+    for escape in ("../../etc/passwd.yaml", "/etc/passwd.yaml", "deploy/../../x.yaml"):
+        assert provider.read_manifest(escape) is None
+    # The legitimate case still works, which is what makes the refusals above
+    # a decision rather than a blanket rejection.
+    (checkout / "deploy" / "chaos" / "oom-leak.yaml").write_text(
+        MANIFEST, encoding="utf-8"
+    )
+    assert provider.read_manifest("deploy/chaos/oom-leak.yaml") == MANIFEST
+
+
+def test_the_startup_log_names_the_effective_target(
+    checkout: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A run that escalates every incident must say which file it wanted.
+
+    "target manifest is unreadable" is indistinguishable from "the target is the
+    wrong file", and the difference is one config key. The startup line is the
+    only place both facts are visible together, so it carries the target.
+
+    Driven through the real ``lifespan`` rather than by calling a logger
+    directly, because a log line is a claim about a running service and the
+    claim is only true if the running service emits it.
+    """
+
+    async def drive() -> None:
+        async with _lifespan(
+            create_app(manifest_provider=FileManifestProvider(checkout))
+        ):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="srek3s.agent"):
+        asyncio.run(drive())
+    assert "target_manifest=" in caplog.text
+    assert TARGET_MANIFEST in caplog.text
 
 
 # ---------------------------------------------------------------------------

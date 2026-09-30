@@ -7,10 +7,23 @@ from a CI log, because the runner's verdict is one line and the reasoning behind
 it is the interesting part.
 
 Purely a reader. It opens two files, prints, and returns. It takes no cluster
-action, writes nothing, and imports nothing from the agent or the runner, so it
-cannot drift from them.
+action and writes nothing.
 
-Usage: ``python tests/e2e/show_mutation.py before.json after.json``
+**It asks the runner for the verdict, rather than reimplementing it.** An
+earlier revision carried its own ``SYSTEM_PREFIXES`` tuple, matched with a
+substring test, and printed its own "excluding system namespaces" sections. That
+is the defect this import exists to remove: the printer excluded a *different*
+set of objects from the one the exit code was computed over, and it did not know
+the chaos namespace at all, so it printed the harness's own fixture under
+"CREATED". A CI log could therefore show a clean listing while the job failed on
+the very objects in it - and a reviewer reading that section would be looking at
+a tool that had already been told the answer and printed something else.
+
+So the verdict is not reimplemented here. The listing is for a human; the
+**verdict** is :func:`runner.check_no_cluster_mutation`'s, quoted verbatim, and
+the two cannot diverge because there is only one of them.
+
+Usage: ``python tests/e2e/show_mutation.py before.json after.json [namespace]``
 """
 
 from __future__ import annotations
@@ -20,16 +33,35 @@ import pathlib
 import sys
 from typing import Any
 
-# Namespaces whose churn is expected: the one under test, and the system
-# namespaces where controllers and leader election move resourceVersion on their
-# own. Excluded from the verdict, but still counted and shown - a large number
-# here is worth knowing about even though it proves nothing either way.
-SYSTEM_PREFIXES = (
-    "kube-system",
-    "kube-public",
-    "kube-node-lease",
-    "local-path-storage",
+# Imported, not duplicated. `runner` is a sibling script rather than a package,
+# so the directory holding this file goes on the path. Everything `runner`
+# imports at module scope is stdlib, so the import has no side effects and
+# cannot fail on a machine with no cluster tooling.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from runner import (  # noqa: E402
+    CHAOS_NAMESPACE,
+    VerificationError,
+    check_no_cluster_mutation,
+    is_exempt_namespace,
 )
+
+# Re-exported deliberately, and named here because `mypy --strict` implies
+# `no_implicit_reexport`: without it, `show_mutation.is_exempt_namespace` is an
+# attribute mypy refuses to let another module reach, even though the runtime
+# import above is real and the test suite uses it.
+#
+# The re-export is the point rather than an accident of the import list. The
+# printer and the runner must agree on which namespaces are exempt, and the
+# anti-drift test asserts they read the *same* function. Re-exporting makes that
+# a declared contract instead of an incidental side effect of import order.
+__all__ = [
+    "CHAOS_NAMESPACE",
+    "VerificationError",
+    "check_no_cluster_mutation",
+    "is_exempt_namespace",
+    "main",
+]
 
 
 def _load(path: str) -> dict[str, Any] | None:
@@ -50,8 +82,22 @@ def _version(entry: Any) -> Any:
     return None
 
 
-def _is_system(key: str) -> bool:
-    return any(part in key for part in SYSTEM_PREFIXES)
+def _namespace_of(key: str, entry: Any) -> str:
+    """The namespace of one snapshot entry, from the entry or from its key.
+
+    ``snapshot_cluster`` writes ``metadata.namespace`` into every entry, so the
+    first read is the normal path. The key fallback exists because a snapshot
+    is a file a reviewer may have edited or hand-built, and a printer that
+    silently treated the namespace as empty would classify every object as
+    out-of-namespace. The key is ``<apiVersion>/<kind>/<namespace>/<name>`` and
+    ``apiVersion`` itself contains a slash, so the split is from the right.
+    """
+    if isinstance(entry, dict):
+        value = entry.get("namespace")
+        if isinstance(value, str) and value:
+            return value
+    parts = key.rsplit("/", 2)
+    return parts[1] if len(parts) == 3 else ""
 
 
 def _show(label: str, keys: list[str], limit: int = 12) -> None:
@@ -64,9 +110,16 @@ def _show(label: str, keys: list[str], limit: int = 12) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 2:
-        print("usage: show_mutation.py <before.json> <after.json>", file=sys.stderr)
+    if len(args) not in (2, 3):
+        print(
+            "usage: show_mutation.py <before.json> <after.json> [chaos-namespace]",
+            file=sys.stderr,
+        )
         return 2
+    # Optional third argument, so the chaos namespace is stated rather than
+    # assumed by the printer. It defaults to the runner's own constant, which
+    # is the namespace the verdict was computed against in the first place.
+    chaos_namespace = args[2] if len(args) == 3 else CHAOS_NAMESPACE
 
     before = _load(args[0])
     after = _load(args[1])
@@ -87,23 +140,49 @@ def main(argv: list[str] | None = None) -> int:
         if _version(before[key]) != _version(after[key])
     )
 
-    interesting_created = [k for k in created if not _is_system(k)]
-    interesting_deleted = [k for k in deleted if not _is_system(k)]
-    interesting_changed = [k for k in changed if not _is_system(k)]
+    def is_exempt(key: str, snapshot: dict[str, Any]) -> bool:
+        return is_exempt_namespace(_namespace_of(key, snapshot[key]), chaos_namespace)
+
+    interesting_created = [k for k in created if not is_exempt(k, after)]
+    interesting_deleted = [k for k in deleted if not is_exempt(k, before)]
+    interesting_changed = [k for k in changed if not is_exempt(k, after)]
 
     print()
-    _show("CREATED (excluding system namespaces)", interesting_created)
-    _show("DELETED (excluding system namespaces)", interesting_deleted)
-    _show("CHANGED (excluding system namespaces)", interesting_changed)
+    print(
+        "  exempt from the verdict: the chaos namespace {!r} plus the k3s"
+        " system".format(chaos_namespace)
+    )
+    print(
+        "  namespaces (helm install/upgrade, leader election, local-path provisioner)."
+    )
+    print()
+    _show("CREATED outside the exempt namespaces", interesting_created)
+    _show("DELETED outside the exempt namespaces", interesting_deleted)
+    _show("CHANGED outside the exempt namespaces", interesting_changed)
     print()
     print(
-        "  system-namespace churn, counted and excluded: "
+        "  exempt churn, counted and excluded: "
         "{} created, {} deleted, {} changed".format(
             len(created) - len(interesting_created),
             len(deleted) - len(interesting_deleted),
             len(changed) - len(interesting_changed),
         )
     )
+
+    # The verdict, from the runner, quoted. Not reimplemented and not inferred
+    # from the lists above: the exit code this job reports comes from the same
+    # call, so a reader of this log is reading the decision rather than a
+    # reconstruction of it.
+    print()
+    try:
+        print(
+            "  VERDICT: {}".format(
+                check_no_cluster_mutation(before, after, chaos_namespace)
+            )
+        )
+    except VerificationError as error:
+        print("  VERDICT: FAIL - {}".format(error))
+        print("  (the runner's exit code is non-zero for this comparison)")
     return 0
 
 
