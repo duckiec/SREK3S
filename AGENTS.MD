@@ -110,3 +110,17 @@ Before marking any roadmap task or milestone complete, execute the corresponding
 3. **No Speculative Bloat:** Do not generate extra helper utilities, UI templates, or unrequested mock libraries unless explicitly directed by the active task.
 4. **Honest Gate Reporting:** If a gate cannot run due to missing host tooling (e.g., missing Docker daemon, missing `-race` support), report it as a **blocked dependency**. Never check off a gate based on an unverified assumption or a mock substitute.
 5. **Negative Control Verification:** When adding CI guards, regex boundary rules, or security checks, always validate with a negative control to prove the guard actually fails when a defect is present.
+6. **Continuous Post-Mortem Documentation:** Whenever a critical defect, pipeline trap, or architectural blind spot is discovered and resolved, the agent MUST append a structured post-mortem to `docs/lessons-learned.md` before transitioning phases. Use the format: `### [Trap Name] (Milestone X)`, followed by `- **What happened:**`, `- **Why it is a problem:**`, and `- **How we fixed it:**`. Never leave a hard-won lesson undocumented.
+
+   Two constraints on this rule that are not optional, because both have been
+   violated in this repository and both defeat the purpose of the document:
+
+   - **Record controls that were invalid, not only the ones that worked.** A
+     negative control that failed for the wrong reason — a mis-anchored plant, an
+     uninstalled module erroring at collection instead of tripping the guard — is
+     the most dangerous kind of evidence, because it reads as a pass. If a control
+     was rebuilt before it became informative, that belongs in the post-mortem.
+   - **Distinguish verbatim record from reconstruction.** Where an account is
+     assembled from a mechanism plus an inference rather than from an observation,
+     say so in place. A later reader who cannot tell the two apart will cite a
+     reconstruction as a quotation.

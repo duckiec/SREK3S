@@ -587,3 +587,106 @@ log that a maintainer could read.
   in comments that they must be kept in step. The generalisable form: **a file one
   ignore list protects is still shipped by every other channel that reads the
   working tree.**
+
+---
+
+## 19. A Unified Diff Hunk Header Counts Each Side Separately (Milestone 4.3.4)
+
+### `git apply` exited 0 and changed nothing
+
+- **What happened:** The Tier-1 patch was generated in the test rather than
+  written by hand, and the hunk header was built as
+  `@@ -{start},{len(body)} +{start},{len(body)} @@`. That counts the hunk body
+  once and applies the number to both sides. It is wrong: a `-` line counts
+  toward the old file and a `+` line toward the new one, and they are not the
+  same line. For a three-lines-of-context change it declared 8 per side where the
+  old side has 4, and git answered `corrupt patch at line 13`.
+- **Why it is a problem:** The header is arithmetic that looks exactly as
+  plausible whether or not it is right, and nothing about reading the code
+  reveals the error. Worse, the diagnostic is opaque — "corrupt patch" at a line
+  number, with no hint that the counts are at fault. Hand-written diffs get
+  reviewed; generated ones get trusted, which is precisely backwards.
+- **How we fixed it:** Each side is counted from its own constituents —
+  `old_count = context + removed`, `new_count = context + added`. More
+  importantly the patch is now assembled *and applied by real git* in a test
+  rather than generated and trusted: `git apply --check` and `git apply` both
+  run, in a scratch tree, on every local test run. No cluster required.
+
+### The scratch tree was inside the repository
+
+- **What happened:** The scratch copy lived at `tests/e2e/.verify-scratch`,
+  inside the working tree. `git apply` walks up to find the repository root and
+  resolves the patch's paths against *that*, not against the working directory —
+  so it targeted the repository's own copy of the manifest (untracked, so git
+  declined to write it) and left the scratch copy untouched. The command
+  **exited 0**.
+- **Why it is a problem:** The worst outcome available: a green command that
+  applied nothing. A test reading the scratch file would have examined an
+  unpatched manifest while every status it checked reported success. This is
+  §8's failure mode in a different hat — a check that cannot fail — and it is
+  worse than a missing check, because it manufactures a false proof.
+- **How we fixed it:** Two defences, both load-bearing. The scratch tree moved
+  **outside** the repository, so there is no repository for git to resolve
+  against and no second file that could be written by mistake. And the exit status
+  is now *necessary and not sufficient*: the helper re-reads the result and
+  raises if the limit did not actually change. A patch that applies without
+  changing anything now fails loudly instead of yielding a plausible file.
+
+---
+
+## 20. `Path.write_text` Silently Produced a CRLF Patch (Milestone 4.3.4)
+
+- **What happened:** The patch was written with
+  `patch_path.write_text(patch, encoding="utf-8")`. On Windows, text mode
+  performs newline *translation*, so every `\n` became `\r\n`. The manifest it
+  must match is pure LF. Git compared the hunk's context byte for byte, found a
+  trailing carriage return on every line, and reported `patch does not apply` at
+  a line whose context was otherwise identical. The same code on Linux writes LF
+  and passes.
+- **Why it is a problem:** The third host/CI divergence in this project with an
+  identical signature — see §3 and §15 — and the property that makes each one
+  expensive is the same: **the local machine is not running the configuration
+  that will be graded**, so a passing local run stops being evidence. Here the
+  failure also points in the wrong direction, blaming the patch's *content* when
+  the defect is its *encoding* and the content is provably correct.
+- **How we fixed it:** `newline="\n"` is passed explicitly, with a comment
+  saying why it is load-bearing rather than decorative. A regression test asserts
+  that the generated patch contains no `\r`, that a patch written through text
+  mode on this host contains none either, and that the manifest is LF — so the
+  next person to drop the argument gets a failing test rather than a confusing
+  git error on a platform that happens not to have the problem.
+
+---
+
+## 21. Controls That Fail For The Wrong Reason Are Worse Than No Controls (Milestone 4.3)
+
+- **What happened:** Four negative controls across this milestone were invalid
+  before they were informative, and every one *looked* like a result. A guard was
+  "proved" by planting `import kubernetes`, which is not installed — so pytest
+  errored at collection instead of tripping the guard. A second was proved by
+  planting a dead `def apply_patch`, which a check inspecting call targets and
+  attribute names is *right* not to flag. A third missed on CRLF anchors against
+  an LF file. A fourth anchored on the test file when the defect lived in the
+  fixture, so the plant never landed. All four were, at the moment, reported as
+  controls run.
+- **Why it is a problem:** A control that fails for the wrong reason produces
+  exactly the false confidence it exists to prevent, and it is worse than
+  omitting the control, because the record then claims a proof that was never
+  obtained. This is the mechanism behind §8's third instance and behind every
+  green-then-red cycle in §12.
+- **How we fixed it:** AGENTS.md §5 rule 6 now requires invalid controls to be
+  recorded alongside working ones, stated in the file the next agent reads before
+  writing one. Three habits did the practical work: **assert the plant is present
+  before running the test**; **read the whole test output rather than filtering to
+  the line that looks like a verdict**; and **check the anchor against the file
+  the defect is actually in**. The controls that count are the sixteen run with a
+  verified plant — ten against the fixture, two against the diff mechanics, and
+  the four from the zero-writes guard — all of which failed their guard as they
+  should.
+- **Provenance note.** The count above is the controls that fired. The four
+  earlier attempts are named here as failures rather than omitted, and each is
+  described in the commit message for `1a8ad96` with the specific reason it was
+  invalid. Nothing in this section is a quotation from a run that produced the
+  result; the fixture arithmetic, the diff mechanics and the PSA-surface drift
+  were all measured, and the *reasons* the invalid controls were invalid are
+  reconstructions from the failure output rather than from a log that was kept.
