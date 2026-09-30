@@ -1259,14 +1259,52 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
 ### 4.3 Post-remediation health verification loop
 
-- [ ] `4.3.1` Create `agent/verify.py` implementing the `verification_policy` evaluation
+- [x] `4.3.1` Create `agent/verify.py` implementing the `verification_policy` evaluation
       (ARCH §5.2) against a bounded `watch_duration_seconds`.
-- [ ] `4.3.2` Emit the three verdicts: `Verified`, `Unresolved` (recurrence ⇒
+      **Ratified on the existing implementation** (commit `a28bf48`, 741 lines,
+      architect-ratified). The window is bounded **twice over**: by a monotonic
+      `time.perf_counter` deadline so the window means `watch_duration_seconds`
+      rather than `polls x interval`, and by a fixed iteration count so
+      termination is unconditional — a frozen or stepped clock cannot extend it.
+      AGENTS.md §3 rule 5 forbids a wall clock here for the same reason.
+- [x] `4.3.2` Emit the three verdicts: `Verified`, `Unresolved` (recurrence ⇒
       `PROMOTE_TO_TIER_2`), `Indeterminate` (`REQUEUE_BOUNDED`).
-- [ ] `4.3.3` Enforce `max_requeue_attempts` — no infinite requeue loop.
+      **Proven by 60 tests** across `agent/tests/test_verify.py` (54) and
+      `test_verify_wiring_controls.py` (6). `action` is a **derived property**,
+      read from the policy embedded in the verdict through one
+      kind-to-field table — not a stored string and not one of three hardcoded
+      literals. There is therefore no input through which a caller can put
+      `PROMOTE_TO_TIER_2` on a `VERIFIED` verdict, which is what makes the
+      guarantee structural rather than a review convention. `VerifiedVerdict`
+      additionally refuses construction without an observation, so a closure
+      verdict cannot be fabricated.
+- [x] `4.3.3` Enforce `max_requeue_attempts` — no infinite requeue loop.
+      **Proven by 17 tests** (`TestRequeueChainTerminates` 12,
+      `TestRequeueBudgetArithmetic` 5). The bound is a value the module owns, not
+      a counter in the caller's hands: `RequeueBudget` exposes no setter and no
+      `reset`, its `__setattr__` refuses to rewind, and `spend()` raises rather
+      than going negative. Exhaustion is checked **before any read is issued**,
+      so the bound holds on observation calls and not merely on returns. A
+      further guard rejects a caller that presents a `prior` verdict recording N
+      requeues alongside a budget reporting 0, which is the rewind this design
+      exists to prevent. There is no `while` loop in the module, and a test
+      asserts that too.
 - [ ] `4.3.4` Integration test: apply a correct Tier-1 diff via GitOps and assert a `Verified`
       verdict; re-inject the same fault and assert `Unresolved` + promotion to Tier-2.
-- [ ] `4.3.5` Assert the loop observes only — it performs no write of its own.
+- [x] `4.3.5` Assert the loop observes only — it performs no write of its own.
+      **Proven twice, statically and at runtime.** `TestZeroWrites` (5 tests)
+      introspects the module's AST: no import that could reach a cluster, and no
+      mutating verb in any call-target or attribute position. `TestRuntimeTripwire`
+      (3 tests) goes further and arms a real `sys.addaudithook` around an actual
+      verification run, catching a write that static analysis could not see.
+      `TestAsyncBoundary` (3) proves the single blocking read leaves the event
+      loop via `run_in_threadpool`, so a 1800-second window cannot stall
+      `/healthz`. **Negative-controlled:** planting `import socket` fails the
+      guard, and planting a real `client.create(...)` call fails it. Two earlier
+      control attempts were invalid and are recorded in `docs/lessons-learned.md`
+      §1's spirit — a dead `def apply_patch` is invisible to a check that only
+      sees call targets, and an uninstalled module produces a collection error
+      rather than a guard trip.
 
 ### 4.4 Regression golden files
 

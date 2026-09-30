@@ -381,6 +381,49 @@ a new failure mode degrades to human escalation, never to speculative cluster ch
 6. **I-B6** Every string in the response is passed through the agent-side defensive
    re-scan before serialization (defence in depth: the Go node is the primary control).
 
+### 5.5 Known MVP Boundaries
+
+Recorded here because each is a decision rather than an oversight, and because a
+reader who discovers one without this note will re-derive it as a bug.
+
+**Single-Shot Workloads.** Workloads configured with `restartPolicy: Never` (e.g.,
+batch Jobs) that terminate non-zero without entering backoff are explicitly out of
+scope for the MVP. To protect the deduplication cache against event floods, the
+Sentinel drops generic `Terminated` states at the watcher level. Therefore, a
+container that exits non-zero and never restarts will not emit an incident.
+
+The mechanism this defends against is concrete, and it was measured rather than
+assumed. The dedup key is `<podUID>/<containerName>:<restartCount>` and carries no
+failure kind, so for one restart count a crash-looping container produces a
+transient `Terminated{exit 1}` and then a `Waiting{CrashLoopBackOff}`. The
+transient state claims the key first and the state carrying the evidence is
+rejected as a duplicate — the incident is detected and then never reported.
+Dropping the un-serialisable state before a record is constructed prevents that.
+
+The cost is the boundary above. A `restartPolicy: Never` container that exits
+non-zero is neither an OOM kill nor a backoff, so no record is built and no
+incident is emitted. It is invisible to the Sentinel.
+
+**What was rejected, and why.** Two alternatives were considered. Adding
+`Terminated` to the Contract A `reason` enum was rejected by ruling: the schema
+must not be widened. Mapping `Terminated` to `CrashLoopBackOff` was rejected on
+the merits — it would report the kubelet asserting a state the Sentinel has not
+observed, and because an OOM assertion is what unlocks a memory-limit diff, it
+would also risk emitting a remediation for a fault that did not occur. The
+watcher filter is the only option of the three that neither widens the contract
+nor asserts an unobserved state.
+
+**The generalisable form.** A filter placed upstream of a cache can protect the
+cache and lose evidence at the same time. That is a legitimate trade only when
+the lost class is named, scoped and written down — which is the purpose of this
+section. An unnamed gap of this shape is indistinguishable from a defect, and
+will be reported as one.
+
+**Consequence for §5.2.** `verification_policy` (§5.2) evaluates *long-running*
+workloads, because only those produce the `Waiting{CrashLoopBackOff}` /
+`OOMKilled` states the criteria are written against. A single-shot Job cannot be
+verified by this loop, because it will never emit an incident to verify.
+
 ---
 
 ## 6. Secret Masking Regex Manifest
