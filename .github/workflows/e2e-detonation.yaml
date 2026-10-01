@@ -1564,6 +1564,107 @@ jobs:
             }
           echo "in-cluster DNS resolved srek3s-agent and the agent answered /healthz"
 
+      - name: "E2E-IN: build and import the Sentinel image into k3s containerd"
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+
+          # deploy/sentinel.yaml references registry.internal/srek3s-sentinel:0.1.0
+          # and execs /bin/sentinel -version, and until cmd/sentinel/Dockerfile
+          # existed nothing in this repository could produce either. The tag must
+          # match the manifest exactly; a mismatch is ImagePullBackOff, which
+          # reads like a network fault rather than the configuration error it is.
+          SENTINEL_IMAGE="registry.internal/srek3s-sentinel:0.1.0"
+
+          # Repository-root context, not cmd/sentinel/. go.mod and the packages
+          # being compiled live outside that directory, so a narrower context
+          # fails at the COPY with an error that does not mention the context.
+          docker build \
+            --build-arg "VERSION=0.1.0-e2e" \
+            -t "$SENTINEL_IMAGE" \
+            -f cmd/sentinel/Dockerfile .
+
+          docker save "$SENTINEL_IMAGE" -o /tmp/srek3s-sentinel.tar
+
+          sudo k3s ctr --timeout 120s --namespace k8s.io images import \
+            /tmp/srek3s-sentinel.tar --namespace k8s.io
+
+          # The effect, not the exit status. An import that lands outside k8s.io
+          # exits 0 and presents as ImagePullBackOff with no other symptom, so
+          # the tag is confirmed present where kubelet actually looks.
+          if ! sudo k3s ctr --timeout 30s --namespace k8s.io images list \
+               | grep -qF "$SENTINEL_IMAGE"; then
+            echo "::error::$SENTINEL_IMAGE is not present in the k8s.io namespace"
+            sudo k3s ctr --timeout 30s --namespace k8s.io images list || true
+            exit 1
+          fi
+          echo "sentinel image registered in k8s.io as $SENTINEL_IMAGE"
+
+      - name: "E2E-IN: deploy the Sentinel and assert it is scoped and read-only"
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          # The Sentinel is now deployable, so the overlay's chaos-namespace Role
+          # has a consumer. `kubectl apply -k` already created the Role and the
+          # binding; this asserts the pod actually starts, which is the part that
+          # needs an image and could not be asserted before.
+          #
+          # Scoped to the chaos namespace, exactly as the runbook instructs. That
+          # is only authorised because extra-resources.yaml grants the Sentinel's
+          # ServiceAccount a read-only Role there - deploy/rbac.yaml grants one in
+          # srek3s-system only, which is the gap the runbook now documents.
+          kubectl -n sentinel-chaos patch deployment srek3s-sentinel --type=strategic -p '{
+            "spec": {"template": {"spec": {"containers": [
+              {"name": "sentinel", "env": [
+                {"name": "SREK3S_AGENT_URL", "value": "http://srek3s-capture:8000"}
+              ]}
+            ]}}}
+          }' >/dev/null
+
+          if ! kubectl -n srek3s-system rollout status deployment/srek3s-sentinel \
+               --timeout=300s; then
+            echo "::error::the Sentinel did not become ready in-cluster"
+            kubectl -n srek3s-system describe deployment srek3s-sentinel || true
+            kubectl -n srek3s-system logs deployment/srek3s-sentinel --tail=60 || true
+            kubectl -n srek3s-system get events --sort-by=.lastTimestamp | tail -20 || true
+            exit 1
+          fi
+
+          echo "--- the Sentinel's own startup log ---"
+          kubectl -n srek3s-system logs deployment/srek3s-sentinel --tail=20
+
+          # The startup line, not the flag. The Milestone 4 preflight found
+          # `-namespace` decorative - read and logged, then ignored by an informer
+          # watching every namespace - so the log asserted a scoping that was not
+          # in effect and nothing failed. Asserting the flag would pass against a
+          # cluster-wide watch; asserting the line the watcher reports back is the
+          # observation that can distinguish them.
+          kubectl -n srek3s-system logs deployment/srek3s-sentinel \
+            | grep -q "watching one namespace" || {
+              echo "::error::the in-cluster Sentinel did not report a namespace scope"
+              kubectl -n srek3s-system logs deployment/srek3s-sentinel --tail=30 || true
+              exit 1
+            }
+
+          # And the UID, observed from inside the container rather than from the
+          # manifest. deploy/sentinel.yaml and cmd/sentinel/Dockerfile both declare
+          # 10001 and a test asserts they agree; this asserts the running process
+          # agrees with both.
+          uid="$(kubectl -n srek3s-system exec deploy/srek3s-sentinel -- id -u 2>/dev/null || echo unknown)"
+          echo "  in-container uid: $uid"
+          if [ "$uid" != "10001" ]; then
+            echo "::error::the in-cluster Sentinel runs as uid $uid, not 10001"
+            exit 1
+          fi
+          echo "  ok: the in-cluster Sentinel runs as UID 10001"
+
+          # The -version exec that the liveness probe depends on. Asserted through
+          # a rollout already, but explicitly here so a failure names the probe
+          # rather than the rollout.
+          kubectl -n srek3s-system exec deploy/srek3s-sentinel -- /bin/sentinel -version \
+            || { echo "::error::/bin/sentinel -version did not exit 0; the exec liveness probe cannot pass"; exit 1; }
+
       - name: "E2E-IN: assert the Sentinel's in-cluster RBAC is read-only"
         timeout-minutes: 5
         run: |

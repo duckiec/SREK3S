@@ -85,7 +85,8 @@ SREK3S/
 │
 ├── cmd/
 │   └── sentinel/                 # Go entrypoint; wiring, flags, signal handling
-│       └── main.go
+│       ├── main.go
+│       └── Dockerfile          # distroless/static image; CGO off, UID 10001
 │
 ├── internal/
 │   ├── scrubber/                 # DETERMINISTIC SECRET/PII MASKING ENGINE

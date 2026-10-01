@@ -930,3 +930,93 @@ The second half is the one to keep. **A green end-to-end run means the paths tha
 ran are covered. It says nothing about the paths that were substituted out, and
 the substitution is usually invisible in the passing direction.** "End-to-end" is
 a claim about the ends. It is not a claim about the middle.
+
+
+## 25. The Gate That Reported 68 False Failures And Was Believed (v1.0.1 follow-on)
+
+Adding shell steps to the E2E workflow made `scripts/audit_workflow.py` go from
+`FAIL: 0` to `FAIL: 68` in one run. The steps it named included ones in
+`ci.yaml`, which that audit had never touched and which had passed every previous
+run. Sixty-eight findings, on a change that could not possibly have broken the
+shell in `Show toolchain` or `G2 - gofmt`.
+
+The instrument was broken, not the workflows.
+
+### What was wrong
+
+`find_bash()` returned the first candidate it found without asking whether the
+candidate worked:
+
+```python
+for candidate in ("bash", "sh"):
+    found = shutil.which(candidate)
+    if found:
+        return found          # <- returned, never tested
+```
+
+On Windows, `shutil.which("bash")` resolves to
+`C:\Users\<you>\AppData\Local\Microsoft\WindowsApps\bash.exe` - the Windows
+Subsystem for Linux **launcher stub**. With WSL not installed, that binary prints
+an install prompt to stderr and exits 1. Every `bash -n` the audit ran therefore
+failed, and every step carrying a `run:` block was reported as a syntax error.
+
+Git ships a working bash at two known paths, listed in the same function, and
+they were never reached because the PATH lookup came first.
+
+### Why this one is worth the space
+
+The findings were false. That is the ordinary kind of instrument failure and it
+would have been caught by reading one line of output.
+
+The expensive part is the second thing: the false findings were **indistinguishable
+in kind** from a real one. `BASH_SYNTAX: G2 - gofmt` means the same thing
+whether gofmt's step has a genuine quoting error or the auditor cannot start its
+own shell. A reader - including me - has no way to tell from the finding alone,
+so the only available response is to go and look. Sixty-eight steps' worth of
+looking, at a change that broke none of them.
+
+And the trigger is the uncomfortable direction. The audit went green-to-red on
+the same commit that *added* the shell steps. So the most natural reading of the
+result - "my new steps broke shell syntax, loudly, everywhere" - is exactly
+backwards, and the plausible one. A gate that is wrong in the direction that
+*confirms* your worst suspicion is more dangerous than one that is wrong in the
+other direction, because it is the failure you are least likely to investigate.
+
+### The fix
+
+`--version` against every candidate, requiring exit 0 and `GNU bash` on stdout,
+and the Git paths tried before PATH on Windows so the known-good interpreter is
+not behind a known trap. With that, the same audit reports `FAIL: 0` - on the
+same steps it had just condemned, and on the new ones.
+
+`_bash_works` is now covered by `agent/tests/test_audit_workflow_tool.py`, which
+also asserts the candidate *ordering* by reading the source, so moving the PATH
+lookup back to the front fails a test on any Windows host with both. Shelling out
+to the audit could only ever assert its exit code; importing it is what allows a
+test to ask `find_bash()` what it picked and require that it runs.
+
+### A smaller instance, same shape
+
+`mypy --strict` failed on the new test with `import-not-found` for
+`audit_workflow`, while `pytest` ran the same file green. Both tools were
+correct: the test does a runtime `sys.path.insert`, which mypy never executes
+because it resolves imports statically. The fix was one line in `setup.cfg`
+(`mypy_path = agent, scripts`).
+
+Worth recording because the symptom is alarming and the cause is mundane - and
+because the tempting fix is a `# type: ignore`, which would have silenced the
+error and left `audit_workflow.py` **completely unchecked by G6** while
+appearing to resolve it.
+
+### The generalisable form
+
+*Before believing a gate, confirm the gate ran.* A finding that appears
+immediately after a change, names files the change did not touch, and scales with
+the size of the repository rather than the size of the change, is describing the
+instrument. Those three properties together are the signature, and checking them
+takes ten seconds against an afternoon of reading 68 correct-looking errors.
+
+The narrower form, worth more: **a gate must be able to report that it could not
+measure.** This one could not - it had no way to say "I never successfully
+invoked bash" as distinct from "your shell is broken", so it answered a question
+nobody asked with a confidence nobody had earned.

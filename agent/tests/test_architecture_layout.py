@@ -264,6 +264,7 @@ def test_the_tree_names_a_meaningful_number_of_paths() -> None:
     assert len(tree) >= 40, f"only {len(tree)} paths parsed from the layout tree"
     for required in (
         "cmd/sentinel/main.go",
+        "cmd/sentinel/Dockerfile",
         "internal/scrubber/manifest.go",
         "internal/k8s/watcher.go",
         "internal/worker",

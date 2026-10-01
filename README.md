@@ -5,7 +5,7 @@ analysis, and — when the cause is unambiguous and the fix is a one-line resour
 change — emits a verified unified `git diff` for a human to merge. It never
 writes to the cluster. That is enforced by the cluster, not by convention.
 
-**Status:** MVP sealed — 749 Python tests + 178 Go test functions green, all CI
+**Status:** MVP sealed — 767 Python tests + 178 Go test functions green, all CI
 gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
 [`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
 along the way, including the ones a passing gate failed to catch.
@@ -28,12 +28,23 @@ along the way, including the ones a passing gate failed to catch.
 
 ```bash
 go build -o bin/sentinel ./cmd/sentinel
-docker build -t srek3s-agent:0.1.0 -f agent/Dockerfile .
+docker build -t registry.internal/srek3s-agent:0.1.0    -f agent/Dockerfile .
+docker build -t registry.internal/srek3s-sentinel:0.1.0 -f cmd/sentinel/Dockerfile .
 ```
 
-The agent image's build context is the **repository root**, not `agent/` — the
-Dockerfile needs `agent/` and its config, and assumes nothing outside its own
-subtree.
+Both images take the **repository root** as their build context — a context of
+`agent/` or `cmd/sentinel/` fails at the `COPY`, because the module and the
+packages being compiled live outside those directories. The Sentinel's image is
+`gcr.io/distroless/static` rather than `scratch`: no shell, no libc, no package
+manager, but it does carry CA certificates, which `scratch` does not — without
+them an `https://` agent endpoint fails certificate verification and presents as
+a network fault.
+
+Running the binary directly is enough for development:
+
+```bash
+./bin/sentinel -agent-url http://127.0.0.1:8001 -namespace default
+```
 
 ### Deploy
 
@@ -51,6 +62,20 @@ manifest created, on a port nothing listened to. It applied cleanly, every
 manifest test passed, and the two pods could not talk. The E2E never caught it
 either: it port-forwards around name resolution entirely.
 
+**RBAC is namespace-scoped by design.** `deploy/rbac.yaml` grants the Sentinel a
+`Role` in `srek3s-system` and nowhere else — no `ClusterRole`, no
+`ClusterRoleBinding`. Monitoring any other namespace means applying the same
+read-only `Role` plus a `RoleBinding` **into that namespace**, pointing at the
+ServiceAccount in `srek3s-system`. The runbook has the commands and the
+verification.
+
+**The agent's manifest root ships empty.** `deploy/agent.yaml` mounts
+`/manifests` and points `SREK3S_MANIFEST_ROOT` at it, but the volume is an empty
+`emptyDir`, so every incident escalates to Tier-2 and no patch is ever proposed
+unverified. That is the fail-closed design working, not a fault — but it looks
+exactly like a working setup, so the manifest and the runbook both say so in
+those words. Populate it with your real GitOps checkout to enable Tier-1.
+
 The manifests reference `registry.internal/srek3s-{agent,sentinel}:0.1.0`.
 Those tags are placeholders the release pipeline rewrites in the committed file,
 so applying the set against a cluster that cannot pull them yields
@@ -63,7 +88,7 @@ None of this needs a cluster.
 
 ```bash
 go test ./...                     # Go units. Add -race; CI-only where TSan is absent.
-pytest agent/tests/ -q            # 749 passed, 2 skipped
+pytest agent/tests/ -q            # 767 passed, 2 skipped
 black --check agent/ tests/
 flake8 agent/ tests/
 mypy --strict agent/ tests/
@@ -428,7 +453,7 @@ with a read-only root and no mounted token. It does not detonate anything; that
 chain is the detonation leg's job, and duplicating it would re-prove a layer that
 is not in question to cover one that is.
 
-Two of the 749 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+Two of the 767 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. `go test -race` and the container build are
 likewise CI-only on hosts without ThreadSanitizer or a Docker daemon; this is
 reported as blocked rather than checked off.

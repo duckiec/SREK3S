@@ -426,18 +426,37 @@ def test_the_chaos_namespace_exists_in_the_fixtures() -> None:
 def test_the_patch_supplies_exactly_what_the_manifest_provider_reads(
     patch: list[dict[str, Any]], agent_deployment: dict[str, Any]
 ) -> None:
-    """MANIFEST_ROOT and TARGET_MANIFEST must be set, and TARGET_MANIFEST must
-    name a file the staged ConfigMap actually provides.
+    """MANIFEST_ROOT must be set, and TARGET_MANIFEST must name a real manifest.
 
-    The provider fails closed when MANIFEST_ROOT is unset, so a missing variable
-    does not crash the leg - it escalates every incident to Tier-2, which is a
-    *correct* outcome and therefore a silent one. This test is the only thing
+    SREK3S_MANIFEST_ROOT is asserted on the *shipped* manifest, not the patch.
+    deploy/agent.yaml owns it - the patch deliberately does not restate it,
+    because a value repeated in two files is a second place for them to disagree,
+    and this overlay's whole purpose is to observe the shipped manifest rather
+    than a variant of it.
+
+    The provider fails closed when the root is absent or empty, so a missing
+    variable does not crash the leg - it escalates every incident to Tier-2, which
+    is a *correct* outcome and therefore a silent one. This test is the only thing
     standing between "the agent had a manifest root" and "the agent escalated
     everything and the run still passed".
     """
+    shipped_env = {
+        entry["name"]: entry["value"]
+        for entry in agent_deployment["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+    }
+    assert shipped_env.get("SREK3S_MANIFEST_ROOT"), (
+        "deploy/agent.yaml no longer sets SREK3S_MANIFEST_ROOT; the patch must "
+        "not become the only place it is declared"
+    )
+
     container = one(patch, "Deployment")["spec"]["template"]["spec"]["containers"][0]
     env = {entry["name"]: entry["value"] for entry in container["env"]}
-    assert env.get("SREK3S_MANIFEST_ROOT"), "SREK3S_MANIFEST_ROOT is not set"
+    assert "SREK3S_MANIFEST_ROOT" not in env, (
+        "the patch restates SREK3S_MANIFEST_ROOT; it belongs to deploy/agent.yaml "
+        "alone, and a second declaration is a second thing to keep in sync"
+    )
     target = env.get("SREK3S_TARGET_MANIFEST", "")
     assert target.endswith((".yaml", ".yml", ".json")), (
         f"SREK3S_TARGET_MANIFEST={target!r} is not a manifest extension; "
@@ -447,22 +466,42 @@ def test_the_patch_supplies_exactly_what_the_manifest_provider_reads(
     assert (
         not target.startswith("/") and ":" not in target
     ), "SREK3S_TARGET_MANIFEST must be repo-relative"
-    # The staged file is the chaos manifest, because that is the workload the
-    # leg detonates and therefore the one a patch must apply to.
     assert (REPO_ROOT / target).is_file(), (
         f"SREK3S_TARGET_MANIFEST names {target}, which does not exist in this "
         "repository; the provider would read a missing file and escalate"
     )
-    # TMPDIR must be set: the root filesystem is read-only and both the sandbox
-    # and the I-B2 git check create a temporary directory.
-    assert env.get("TMPDIR") == "/tmp"
-    # And the agent's own mount of the manifest root must be read-only, so a
-    # compromised triage path cannot rewrite the file it is patching.
-    gitops = [mount for mount in container["volumeMounts"] if mount["name"] == "gitops"]
-    assert gitops, "the agent does not mount the staged manifest root"
-    assert gitops[0].get("readOnly") is True, (
-        "the agent's manifest root is writable; the triage path could rewrite "
-        "the manifest it is about to produce a patch against"
+    # The patch target must be the manifest the detonation actually applies. A
+    # valid diff against the wrong fixture is worse than no diff: it applies
+    # cleanly, satisfies I-B2, and addresses a workload that was never deployed.
+    assert target == "deploy/chaos/oom-leak.yaml", (
+        f"SREK3S_TARGET_MANIFEST is {target!r}; the detonation applies "
+        "deploy/chaos/oom-leak.yaml, and a patch must target the manifest the "
+        "incident came from. tests/fixtures/bounded-leak.yaml is the 4.3.4 "
+        "live-verification fixture and is deliberately NOT a patch target."
+    )
+    # TMPDIR: the root filesystem is read-only and both the sandbox and the I-B2
+    # git check create a temporary directory. deploy/agent.yaml owns it.
+    assert shipped_env.get("TMPDIR") == "/tmp"
+    # The agent's own mount of the manifest root is declared by the shipped
+    # manifest and must be read-only, so a compromised triage path cannot
+    # rewrite the file it is patching. It is asserted here rather than in
+    # test_deploy_manifests.py because the reason it must be read-only *here* is
+    # the patch: the init container writes into the same volume.
+    shipped_mounts = {
+        mount["name"]: mount
+        for mount in agent_deployment["spec"]["template"]["spec"]["containers"][0][
+            "volumeMounts"
+        ]
+    }
+    root_mount = shipped_mounts.get(shipped_env["SREK3S_MANIFEST_ROOT"].lstrip("/"))
+    assert root_mount is not None, (
+        f"deploy/agent.yaml sets SREK3S_MANIFEST_ROOT="
+        f"{shipped_env['SREK3S_MANIFEST_ROOT']!r} but mounts no volume there"
+    )
+    assert root_mount.get("readOnly") is True, (
+        "the agent's manifest root is writable; the triage path could rewrite the "
+        "manifest it is about to produce a patch against, and the init container "
+        "that stages it needs a different mount for its own write"
     )
 
 
@@ -485,10 +524,41 @@ def test_the_patch_adds_an_init_container_held_to_the_same_standard(
     assert security["allowPrivilegeEscalation"] is False
     assert security["readOnlyRootFilesystem"] is True
     assert security["capabilities"]["drop"] == ["ALL"]
-    # It writes, so it needs the writable temp volume the agent already has.
-    mounts = {mount["name"] for mount in init["volumeMounts"]}
-    assert "gitops" in mounts, "the init container cannot write the manifest root"
-    assert "manifest-source" in mounts, "the init container has nothing to stage from"
+    # It writes, so it needs the manifest root writable and the staged source
+    # read-only.
+    by_name = {mount["name"]: mount for mount in init["volumeMounts"]}
+    assert "manifests" in by_name, "the init container cannot write the manifest root"
+    assert by_name["manifests"].get("readOnly") is not True, (
+        "the init container mounts the manifest root read-only, so it cannot "
+        "stage into it; the agent's own mount of the same volume is read-only, "
+        "and the two must differ"
+    )
+    assert "manifest-source" in by_name, "the init container has nothing to stage from"
+    assert by_name["manifest-source"].get("readOnly") is True
+
+    # The volume list must not redeclare what the shipped manifest declares. A
+    # strategic merge of two emptyDir definitions for one name is a second place
+    # for the two files to disagree about size and medium.
+    pod_spec = one(patch, "Deployment")["spec"]["template"]["spec"]
+    redeclared = {volume["name"] for volume in pod_spec.get("volumes", [])}
+    shipped_volumes = {
+        volume["name"]
+        for volume in agent_deployment["spec"]["template"]["spec"].get("volumes", [])
+    }
+    assert not (redeclared & shipped_volumes), (
+        f"the patch redeclares shipped volumes {sorted(redeclared & shipped_volumes)}; "
+        "one volume should have one definition"
+    )
+    # And it must create the nested path the target manifest implies, rather than
+    # copying the file flat. The provider resolves the target relative to the
+    # root, so a flat copy is a file the provider cannot find.
+    args = init["args"][0]
+    assert "manifests" in args
+    assert "deploy/chaos" in args, (
+        "the init container does not create the nested path SREK3S_TARGET_MANIFEST "
+        "implies; the provider resolves the target relative to the root, so a flat "
+        "copy is a file it can never find"
+    )
 
 
 def test_the_patch_does_not_weaken_the_agent_container(
@@ -712,7 +782,7 @@ def test_control_the_hardening_assertion_fails_on_a_relaxed_field(
 
 
 def test_control_the_manifest_root_assertion_fails_on_an_unset_variable(
-    patch: list[dict[str, Any]],
+    agent_deployment: dict[str, Any], patch: list[dict[str, Any]]
 ) -> None:
     """Proves the manifest-root assertion can fail.
 
@@ -720,11 +790,27 @@ def test_control_the_manifest_root_assertion_fails_on_an_unset_variable(
     provider fails closed, every incident escalates to Tier-2, and a Tier-2
     escalation is a correct result. So the leg would pass. The control confirms
     the test is looking at the variable at all.
+
+    The root is read from the shipped manifest and the target from the patch,
+    which is the split the design settled on - and the first draft of this
+    control asserted the opposite, checking the manifest for a variable the
+    patch owns. A control that names the wrong document proves nothing about
+    either.
     """
-    container = one(patch, "Deployment")["spec"]["template"]["spec"]["containers"][0]
+    container = agent_deployment["spec"]["template"]["spec"]["containers"][0]
     env = {entry["name"]: entry["value"] for entry in container["env"]}
     assert "SREK3S_MANIFEST_ROOT" in env
     without = {
         name: value for name, value in env.items() if name != "SREK3S_MANIFEST_ROOT"
     }
     assert "SREK3S_MANIFEST_ROOT" not in without
+
+    patched = one(patch, "Deployment")["spec"]["template"]["spec"]["containers"][0]
+    patch_env = {entry["name"]: entry["value"] for entry in patched["env"]}
+    assert (
+        "SREK3S_TARGET_MANIFEST" in patch_env
+    ), "the target manifest is declared by the patch, not by deploy/agent.yaml"
+    assert "SREK3S_MANIFEST_ROOT" not in patch_env, (
+        "the patch restates the manifest root; that would make the shipped "
+        "manifest's value decorative"
+    )

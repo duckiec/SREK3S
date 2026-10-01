@@ -324,24 +324,67 @@ def audit_job(job_name: str, job: dict[str, Any], audit: Audit) -> None:
             )
 
 
-def find_bash() -> str | None:
-    """Locate a bash, including the one Git ships on Windows.
+def _bash_works(candidate: str) -> bool:
+    """Whether ``candidate`` is a bash that actually runs.
 
-    Returns None when none is found, which is a *reported* skip rather than a
-    silent pass: see :func:`check_bash_syntax`.
+    The trap this exists for: on Windows, ``shutil.which("bash")`` commonly
+    resolves to ``...\\Microsoft\\WindowsApps\\bash.exe``, which is the Windows
+    Subsystem for Linux *launcher stub*. With WSL not installed, that binary
+    prints an install prompt and exits 1. The previous version of this function
+    returned the first candidate it found without asking whether it worked, so
+    every ``bash -n`` in the audit failed and the audit reported 68 BASH_SYNTAX
+    findings against steps that are syntactically fine - including steps in
+    ci.yaml, which this audit had never touched.
+
+    That is the failure mode this file exists to catch, aimed at the auditor: a
+    check that cannot tell "the thing is broken" from "the instrument is broken",
+    reporting the first with the confidence of the second.
+
+    ``--version`` is the cheapest question that separates a working bash from a
+    stub, and it is asked of every candidate rather than assumed of the first.
     """
-    for candidate in ("bash", "sh"):
-        found = shutil.which(candidate)
-        if found:
-            return found
+    try:
+        probe = subprocess.run(
+            [candidate, "--version"],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and b"GNU bash" in probe.stdout
+
+
+def find_bash() -> str | None:
+    """Locate a bash that actually runs, including the one Git ships on Windows.
+
+    Returns None when none works, which is a *reported* skip rather than a silent
+    pass: see :func:`check_bash_syntax`.
+
+    The Git paths are tried before PATH on Windows, not after. ``which("bash")``
+    landing on the WSL stub is the common case, and putting the known-good
+    interpreter ahead of it is cheaper than validating the stub on every run -
+    though :func:`_bash_works` still validates whatever is returned, so a broken
+    Git install degrades to a reported skip rather than to 68 false findings.
+    """
+    candidates: list[str] = []
     if os.name == "nt":
-        for relative in (
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files\Git\usr\bin\bash.exe",
-            r"C:\Program Files (x86)\Git\bin\bash.exe",
-        ):
-            if os.path.exists(relative):
-                return relative
+        candidates.extend(
+            relative
+            for relative in (
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+                r"C:\Program Files (x86)\Git\bin\bash.exe",
+            )
+            if os.path.exists(relative)
+        )
+    for name in ("bash", "sh"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    for candidate in candidates:
+        if _bash_works(candidate):
+            return candidate
     return None
 
 

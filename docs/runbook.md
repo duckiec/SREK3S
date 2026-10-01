@@ -36,12 +36,94 @@ mode is opaque enough to be worth repeating.
 | `deploy/rbac.yaml` | The ServiceAccount and a read-only `Role` — see [§5](#5-the-no-autofix-guarantee) |
 | `deploy/sentinel.yaml` | The Go watcher (pods, events) |
 | `deploy/agent.yaml` | The Python triage service |
+| `deploy/service.yaml` | The agent's ClusterIP, `srek3s-agent:8000` - the Sentinel's default `-agent-url` |
 
 The image tags in the manifests are the placeholders
 `registry.internal/...:0.1.0`. There is deliberately **no kustomize `images:`
 block**: an override there would hide the tag that is actually deployed from the
 manifest the hardening tests parse. The release pipeline rewrites the tag in the
 committed file, so what is tested is what ships.
+
+Build them with:
+
+```bash
+docker build -t registry.internal/srek3s-agent:0.1.0    -f agent/Dockerfile .
+docker build -t registry.internal/srek3s-sentinel:0.1.0 -f cmd/sentinel/Dockerfile .
+```
+
+Both take the **repository root** as their build context. A context of
+`agent/` or `cmd/sentinel/` fails at the `COPY`, because the module and the
+packages being compiled live outside those directories.
+
+### RBAC is namespace-scoped, and that is deliberate
+
+**`deploy/rbac.yaml` grants the Sentinel a `Role` in `srek3s-system` and
+nowhere else.** A `Role` is namespaced by definition, and a `RoleBinding` in
+`srek3s-system` can only reference a `Role` in `srek3s-system`. There is no
+`ClusterRole` and no `ClusterRoleBinding` in this set, and adding one would be
+the single highest-severity change available to this codebase.
+
+The reason is blast radius. A watcher's entire authority is the set of things it
+can read, and a cluster-wide grant reads every namespace, including the ones that
+hold other people's secrets. Scoping the grant to one namespace makes the blast
+radius of a compromised Sentinel equal to that namespace rather than the cluster.
+
+**The consequence you must act on:** the Sentinel is authorised to read only
+`srek3s-system`. If you set `-namespace` to anything else — `default`,
+`payments`, your application's namespace — **it will be refused**, and the
+failure looks like a hang rather than an error: the informer retries an
+unauthorised `LIST`, and the symptom is no incidents rather than a permission
+message.
+
+To monitor a namespace, apply the same `Role` and a `RoleBinding` into **that**
+namespace, referring to the ServiceAccount in `srek3s-system`:
+
+```bash
+NS=payments   # the namespace you actually want to watch
+
+kubectl -n "$NS" create role srek3s-sentinel \
+  --verb=get,list,watch --resource=pods,pods/log,events
+kubectl -n "$NS" create role srek3s-sentinel \
+  --verb=get,list,watch --api-group=apps --resource=deployments,replicasets
+
+kubectl -n "$NS" create rolebinding srek3s-sentinel \
+  --role=srek3s-sentinel \
+  --serviceaccount=srek3s-system:srek3s-sentinel
+```
+
+Then confirm it before trusting it:
+
+```bash
+kubectl auth can-i list pods -n "$NS" \
+  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: yes
+kubectl auth can-i create pods -n "$NS" \
+  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: no
+```
+
+Two things to keep straight. First, **read only**: the verbs above are
+`get,list,watch` and nothing else, and the second command is the one that
+matters — it is the difference between a watcher and an actor. Second, **the
+RoleBinding lives in the target namespace and points back at `srek3s-system`**:
+that keeps a single ServiceAccount, and a single identity to audit, while the
+grant itself stays narrow. Covering many namespaces means many narrow Roles to
+review, not one wide Role.
+
+Do this once per namespace you want watched. There is no wildcard form, and that
+is the intended shape: every namespace in the grant is one somebody chose to put
+this thing in.
+
+### The agent's manifest root ships empty
+
+`deploy/agent.yaml` sets `SREK3S_MANIFEST_ROOT=/manifests` and mounts a volume
+there, and **as deployed that volume is an empty `emptyDir`**. The agent therefore
+cannot read a target manifest, every incident escalates to Tier-2 under I-B2, and
+no patch is ever proposed unverified.
+
+That is the intended safe state, not a fault — but it looks exactly like a
+working setup. To get Tier-1 patches, replace the `manifests` volume with the
+GitOps checkout your pipeline actually applies (a PVC, or an init container that
+clones the repository) and set `SREK3S_TARGET_MANIFEST` to a repo-relative path
+inside it. Until you do, 100% Tier-2 is the design working.
 
 ### Configuration
 

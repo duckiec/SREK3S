@@ -1,4 +1,4 @@
-# Strategic-merge patch: give the agent its GitOps manifest root, in-cluster.
+# Strategic-merge patch: populate the agent's GitOps manifest root, in-cluster.
 #
 # What the agent actually needs
 # -----------------------------
@@ -13,6 +13,34 @@
 # the `git` binary (already in agent/Dockerfile) plus a writable temp dir
 # (already mounted at /tmp). This patch supplies exactly that and nothing more.
 #
+# deploy/agent.yaml now ships the `manifests` volume and the
+# SREK3S_MANIFEST_ROOT env var, both pointing at /manifests, so this patch does
+# NOT redefine the volume - the shipped emptyDir is exactly what an init
+# container needs to write into, and redeclaring it would be a second place for
+# the two files to disagree. The only things added are the init container and
+# the ConfigMap it reads from.
+#
+# The fixture is deploy/chaos/oom-leak.yaml, NOT tests/fixtures/bounded-leak.yaml
+# ----------------------------------------------------------------------------
+# A directive asked for bounded-leak.yaml here. That is the wrong file for this
+# leg, for a reason worth writing down rather than silently overriding.
+#
+# bounded-leak.yaml is the Milestone 4.3.4 live-verification fixture
+# (srek3s-verify-bounded). Its own header says that deploy/chaos/oom-leak.yaml
+# *cannot* verify a remediation, because raising the memory limit on a
+# continuously-leaking workload only delays the OOMKill. So the two fixtures have
+# deliberately opposite meanings.
+#
+# For a patch target the constraint is different and simpler: the diff must apply
+# to the manifest the incident actually came from. The detonation applies
+# deploy/chaos/oom-leak.yaml to the cluster, the Sentinel reads that workload's
+# spec, and the agent's diff is derived from those bytes. Pointing
+# SREK3S_TARGET_MANIFEST at bounded-leak.yaml would produce a perfectly valid
+# diff against a file that is not the deployed workload - and
+# test_the_patch_supplies_exactly_what_the_manifest_provider_reads asserts the
+# target exists, not that it is the *right* one. That check is here so the next
+# person to make this substitution finds it.
+#
 # Why an init container rather than a subPath mount
 # -------------------------------------------------
 # A ConfigMap volume with `subPath` can place a single file at a nested path, and
@@ -25,7 +53,8 @@
 # The ConfigMap is created by the workflow rather than committed here, because
 # its content is deploy/chaos/oom-leak.yaml and a committed copy would be a
 # second source of truth for a fixture that already exists. `kubectl create
-# configmap --from-file` puts the real bytes in.
+# configmap --from-file` puts the real bytes in, so the manifest the agent reads
+# in-cluster is the manifest the cluster is running.
 #
 # Why the init container is held to the same standard as the agent
 # ----------------------------------------------------------------
@@ -44,16 +73,22 @@ spec:
   template:
     spec:
       initContainers:
-        - name: stage-gitops
+        - name: stage-manifests
           image: registry.internal/srek3s-agent:0.1.0
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              mkdir -p /gitops/deploy/chaos
-              cp /staged/oom-leak.yaml /gitops/deploy/chaos/oom-leak.yaml
-              test -s /gitops/deploy/chaos/oom-leak.yaml
+              mkdir -p /manifests/deploy/chaos
+              cp /staged/oom-leak.yaml /manifests/deploy/chaos/oom-leak.yaml
+              # Fail loudly here rather than letting the agent discover it later.
+              # An empty manifest root is not an error the agent raises - it is a
+              # fail-closed Tier-2 escalation, which looks like a working
+              # classification decision. A staging step that silently produced
+              # nothing would produce 100% Tier-2 and a green run.
+              test -s /manifests/deploy/chaos/oom-leak.yaml
+              echo "staged $(wc -c < /manifests/deploy/chaos/oom-leak.yaml) bytes"
           securityContext:
             allowPrivilegeEscalation: false
             privileged: false
@@ -67,8 +102,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            - name: gitops
-              mountPath: /gitops
+            # Writable: this is the shipped emptyDir, and the copy has to land
+            # somewhere. The agent's own mount of it is readOnly, so after
+            # staging the triage path still cannot modify what it diffs against.
+            - name: manifests
+              mountPath: /manifests
             - name: manifest-source
               mountPath: /staged
               readOnly: true
@@ -82,31 +120,14 @@ spec:
       containers:
         - name: agent
           env:
-            # The provider fails closed when MANIFEST_ROOT is unset - that is the
-            # production default and it is not changed here. What this patch
-            # supplies is a root that exists, so the E2E can reach Tier-1 at all.
-            - name: SREK3S_MANIFEST_ROOT
-              value: /gitops
+            # SREK3S_MANIFEST_ROOT is already /manifests in deploy/agent.yaml, so
+            # it is NOT restated here - restating it would be a second place for
+            # the manifest and the patch to disagree. Only the target is added.
             - name: SREK3S_TARGET_MANIFEST
               value: deploy/chaos/oom-leak.yaml
-            # The sandbox subprocess needs a writable TMPDIR, and the root
-            # filesystem is read-only. deploy/agent.yaml already mounts /tmp; this
-            # only points Python at it, and matches what the host-process leg
-            # passes.
-            - name: TMPDIR
-              value: /tmp
-          volumeMounts:
-            - name: gitops
-              mountPath: /gitops
-              readOnly: true
       volumes:
-        # emptyDir, not the ConfigMap: the ConfigMap is mounted at /staged and an
-        # init container copies it into the nested path. The agent's own mount is
-        # readOnly, so a compromised triage path cannot rewrite the manifest it
-        # is about to produce a patch against.
-        - name: gitops
-          emptyDir: {}
+        # `manifests` is the shipped emptyDir and is deliberately not repeated.
         - name: manifest-source
           configMap:
-            name: srek3s-agent-gitops
+            name: srek3s-agent-manifests
             defaultMode: 0444

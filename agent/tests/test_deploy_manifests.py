@@ -234,10 +234,22 @@ def test_pod_level_security_context_is_complete(manifest: str) -> None:
 
 @pytest.mark.parametrize("manifest", ["sentinel.yaml", "agent.yaml"])
 def test_tmp_is_the_only_writable_volume(manifest: str) -> None:
-    """3.6.3: ``emptyDir`` at ``/tmp`` only.
+    """3.6.3: ``emptyDir`` at ``/tmp`` is the only writable mount.
 
-    A second writable mount is a second writable path, and under a read-only root
-    filesystem each one is a place a process could stash something.
+    A second *writable* mount is a second writable path, and under a read-only
+    root filesystem each one is a place a process could stash something.
+
+    The first version of this asserted that every mount was at ``/tmp``, which is
+    broader than the invariant it is named for. That was not wrong when the
+    agent had exactly one mount, but it made read-only mounts impossible, and a
+    read-only mount is not a writable path: the agent's ``/manifests`` GitOps root
+    is mounted ``readOnly: true`` precisely so the triage path cannot modify the
+    manifest it is about to diff.
+
+    So the test now checks what it claims, and pays for the loosening by
+    asserting that every non-``/tmp`` mount is *explicitly* read-only. A mount
+    with the key absent defaults to writable, so the assertion is that the key is
+    present and true - not merely that the path is not /tmp.
     """
     spec = one(load(manifest), "Deployment")["spec"]["template"]["spec"]
     containers = spec["containers"]
@@ -245,10 +257,20 @@ def test_tmp_is_the_only_writable_volume(manifest: str) -> None:
 
     for container in containers:
         for mount in container.get("volumeMounts", []):
-            assert mount["mountPath"] == "/tmp", (
-                f"{manifest}/{container['name']}: mountPath "
-                f"{mount['mountPath']!r} is not /tmp"
-            )
+            writable = mount.get("readOnly") is not True
+            if mount["mountPath"] == "/tmp":
+                assert writable, (
+                    f"{manifest}/{container['name']}: /tmp is mounted read-only, "
+                    "but a read-only root filesystem leaves the interpreter and "
+                    "the I-B2 git check nowhere to write"
+                )
+            else:
+                assert not writable, (
+                    f"{manifest}/{container['name']}: mountPath "
+                    f"{mount['mountPath']!r} is writable. /tmp is the only "
+                    "writable path under a read-only root filesystem; every "
+                    "other mount must declare readOnly: true explicitly"
+                )
             volume = volumes[mount["name"]]
             assert "emptyDir" in volume, (
                 f"{manifest}: volume {mount['name']} is {list(volume)}, not an "
@@ -583,6 +605,37 @@ def test_control_service_routing_check_fails_on_each_broken_coupling() -> None:
     # And the real, unmutated values still satisfy every assertion, so the
     # controls above are not passing because the checks are trivially true.
     assert good_selector and good_port == good_target
+
+
+def test_control_the_writable_mount_check_fails_on_a_writable_extra_mount() -> None:
+    """Proves the loosened writability check can still fail.
+
+    The /tmp-only rule was relaxed from "every mount is at /tmp" to "every mount
+    that is not /tmp declares readOnly: true". A relaxation is only defensible
+    with a control, because the failure it now has to catch is a single missing
+    key - and a mount with the key absent is writable, which is the default.
+
+    So: remove readOnly from the agent's /manifests mount and require the check
+    to notice. This is the exact edit someone makes to make a ConfigMap-backed
+    manifest root work, and it is the one that must not pass silently.
+    """
+    spec = one(load("agent.yaml"), "Deployment")["spec"]["template"]["spec"]
+    container = spec["containers"][0]
+    extra = [
+        mount for mount in container["volumeMounts"] if mount["mountPath"] != "/tmp"
+    ]
+    assert extra, "control is vacuous: the agent has no non-/tmp mount to relax"
+    assert all(
+        mount.get("readOnly") is True for mount in extra
+    ), "control is vacuous: a non-/tmp mount is already writable"
+    for mount in extra:
+        relaxed = {**mount}
+        relaxed.pop("readOnly", None)
+        assert relaxed.get("readOnly") is not True, (
+            f"dropping readOnly from {mount['mountPath']} left it read-only; the "
+            "writability check is not testing writability"
+        )
+        assert relaxed["mountPath"] != "/tmp"
 
 
 def test_control_rbac_check_fails_on_an_injected_write_verb() -> None:

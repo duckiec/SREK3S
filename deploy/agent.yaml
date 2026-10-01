@@ -73,6 +73,24 @@ spec:
               value: "4"
             - name: SREK3S_LOG_LEVEL
               value: INFO
+            # The agent's GitOps target root. Points at the `manifests` volume
+            # mounted above.
+            #
+            # READ THIS BEFORE ENABLING TIER-1. The volume ships as an emptyDir,
+            # so as deployed this directory is empty and the manifest provider
+            # cannot resolve a target file. Every incident therefore escalates to
+            # Tier-2 under I-B2, and no patch is ever proposed unverified. That is
+            # the intended safe state, not a misconfiguration - but it looks
+            # exactly like a working setup, so it is stated here rather than left
+            # to be discovered.
+            #
+            # To produce Tier-1 patches, populate this root with the checkout
+            # your GitOps pipeline actually applies (see the volume's comment),
+            # and set SREK3S_TARGET_MANIFEST to a repo-relative path inside it.
+            # Until then, expect 100% Tier-2 and treat that as the design working,
+            # not as the agent failing.
+            - name: SREK3S_MANIFEST_ROOT
+              value: /manifests
 
           # ARCH §8: read-only root, no privilege escalation, every capability
           # dropped. The agent needs none of them, so all are dropped rather than
@@ -91,9 +109,18 @@ spec:
           # The only writable path. /tmp is required because a read-only root
           # filesystem leaves the interpreter nowhere to put a temporary file,
           # and the sandbox and the I-B2 git check both create one.
+          #
+          # /manifests is read-only to the agent. It is the agent's GitOps target
+          # root, and a triage path that could rewrite the manifest it is about to
+          # propose a diff against could make that diff apply to something other
+          # than what it was derived from - which is the failure I-B2 exists to
+          # prevent, reached from the other direction.
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: manifests
+              mountPath: /manifests
+              readOnly: true
 
           resources:
             requests:
@@ -140,6 +167,31 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+        # The agent's GitOps target root. See the SREK3S_MANIFEST_ROOT note below:
+        # this ships EMPTY, and that is deliberate.
+        #
+        # An emptyDir is the right default for a mount whose contents are an
+        # operator's choice, and it is the fail-closed choice as well - an empty
+        # root means the manifest provider cannot resolve the target file, so
+        # every incident escalates to Tier-2 under I-B2 and no patch is ever
+        # proposed unverified. That is the same outcome as leaving
+        # SREK3S_MANIFEST_ROOT unset, which is what the code did until this
+        # mount existed.
+        #
+        # What it is NOT is a working GitOps checkout. To enable Tier-1, replace
+        # this volume with the real checkout - a PersistentVolumeClaim, or an
+        # init container that clones the repository - and set
+        # SREK3S_TARGET_MANIFEST to a path within it. The runbook says so in the
+        # same words, because a mount that exists and is empty is exactly the
+        # kind of thing an operator reads as "already configured".
+        #
+        # medium: Memory is deliberately NOT used here, unlike /tmp. This holds
+        # manifests that are read on the triage path; tmpfs counts against the
+        # container's memory limit, and a large checkout would then be a
+        # foot-gun that OOMs the agent while triaging someone else's OOMKill.
+        - name: manifests
+          emptyDir:
+            sizeLimit: 256Mi
 
 ---
 # NetworkPolicy: the agent's only permitted egress is the Sentinel's model call.
