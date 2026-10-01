@@ -51,6 +51,7 @@ different hat.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Final
 
@@ -208,6 +209,35 @@ def _production_sources() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _exists_exact(relative: str) -> bool:
+    """Whether ``relative`` exists on disk under *exactly* that casing.
+
+    ``Path.exists()`` is case-insensitive on Windows and case-sensitive on Linux,
+    so using it makes this check weaker on the machine that runs it most often
+    than on the machine that runs it in CI. That is not theoretical: ``AGENTS.MD``
+    was tracked with an uppercase extension while ``ARCHITECTURE.md``'s tree names
+    it ``AGENTS.md``. Both resolve on NTFS, so the forward layout check passed
+    locally on every run - and on ext4 the path does not exist, so the same check
+    would have failed on every CI run of the commit that added it.
+
+    The fix is to stop asking the filesystem and ask the directory listing, whose
+    entries are compared as exact strings and therefore behave identically on
+    every platform. A developer on Windows and a runner on Linux now get the same
+    answer to the same question, which is the only property a layout gate can
+    actually rely on.
+    """
+    current = _ROOT
+    for part in relative.split("/"):
+        try:
+            entries = os.listdir(current)
+        except OSError:
+            return False
+        if part not in entries:
+            return False
+        current = current / part
+    return current.exists()
+
+
 def _unresolved(tree: dict[str, bool]) -> list[str]:
     """Every path the tree names that does not resolve on disk.
 
@@ -226,14 +256,47 @@ def _unresolved(tree: dict[str, bool]) -> list[str]:
             if not list(_ROOT.glob(path)):
                 missing.append(f"{path}  (glob matches no file)")
             continue
-        if not target.exists():
+        if not _exists_exact(path):
             kind = "directory" if is_directory else "file"
-            missing.append(f"{path}  (declared as a {kind}, not on disk)")
+            found = target.exists()
+            if found:
+                # The case-insensitive lookup succeeded, so the name is wrong
+                # rather than absent. Said explicitly, because on a
+                # case-insensitive filesystem the two are indistinguishable by
+                # probing and the reader is left guessing which one happened.
+                actual = _actual_spelling(path)
+                missing.append(
+                    f"{path}  (declared as a {kind}, but the file on disk is "
+                    f"spelled {actual!r} - a clone on a case-sensitive filesystem "
+                    f"will not have this path)"
+                )
+            else:
+                missing.append(f"{path}  (declared as a {kind}, not on disk)")
         elif is_directory and not target.is_dir():
             missing.append(f"{path}  (declared as a directory, is a file)")
         elif not is_directory and target.is_dir():
             missing.append(f"{path}  (declared as a file, is a directory)")
     return missing
+
+
+def _actual_spelling(relative: str) -> str:
+    """The on-disk spelling of ``relative``, matching its case-insensitively.
+
+    Only reached when ``_exists_exact`` failed but a case-insensitive lookup
+    succeeded, so every component is guaranteed to be present under some casing.
+    """
+    parts: list[str] = []
+    current = _ROOT
+    for part in relative.split("/"):
+        for entry in os.listdir(current):
+            if entry.lower() == part.lower():
+                parts.append(entry)
+                current = current / entry
+                break
+        else:  # pragma: no cover - unreachable given the caller's precondition
+            parts.append(part)
+            break
+    return "/".join(parts)
 
 
 def test_every_path_named_in_the_layout_tree_exists() -> None:
@@ -566,6 +629,44 @@ def test_a_broken_geometry_is_rejected_rather_than_misparsed() -> None:
     planted = [*_tree_lines(), "      └── misplaced.go"]
     with pytest.raises(AssertionError, match="multiple of"):
         _parse_tree(planted)
+
+
+def test_the_case_exact_check_fails_on_a_wrongly_cased_path() -> None:
+    """Negative control for the case-sensitivity fix.
+
+    A path differing from a real file only in case is reported, and reported as a
+    *spelling* problem rather than an absence. The distinction matters: on a
+    case-insensitive filesystem "not on disk" and "spelled differently" look
+    identical to a probe, and the second is a bug that only manifests on the
+    machine nobody developing it has - which is precisely what happened with
+    `AGENTS.MD`.
+
+    The control asserts both halves: that the exact name resolves, and that a
+    case-flipped name does not and is named as a spelling rather than an absence.
+    A control that only checked the first would pass whether or not the check had
+    any teeth.
+    """
+    real = "ARCHITECTURE.md"
+    flipped = "architecture.md"
+    assert _exists_exact(real), "the real path must resolve exactly"
+    assert not _exists_exact(flipped), (
+        "a case-flipped path resolved exactly; the check is case-insensitive and "
+        "would pass on Windows while failing on every Linux CI run"
+    )
+    # And the case-insensitive probe agrees - which is the whole reason the
+    # exact check is needed rather than redundant.
+    assert (_ROOT / flipped).exists(), (
+        "control is vacuous on a case-insensitive filesystem: the flipped name "
+        "does not resolve even case-insensitively, so this proves nothing here"
+    )
+    reported = _unresolved({flipped: False})
+    assert reported, "a wrongly-cased path was not reported"
+    assert (
+        "spelled" in reported[0]
+    ), f"the report does not name the spelling problem: {reported[0]!r}"
+    assert (
+        "ARCHITECTURE.md" in reported[0]
+    ), f"the report does not say what the file is actually called: {reported[0]!r}"
 
 
 def test_an_entry_at_column_zero_is_rejected() -> None:

@@ -1020,3 +1020,101 @@ The narrower form, worth more: **a gate must be able to report that it could not
 measure.** This one could not - it had no way to say "I never successfully
 invoked bash" as distinct from "your shell is broken", so it answered a question
 nobody asked with a confidence nobody had earned.
+### `Path.exists()` Is Case-Insensitive On Windows And Case-Sensitive On Linux (v1.0.1 follow-on)
+
+- **What happened:** `AGENTS.md` was tracked in git as `AGENTS.MD` — an uppercase
+  file extension — while every other markdown file in the repository used
+  lowercase, and while `ARCHITECTURE.md` §3's layout tree names it `AGENTS.md`.
+  The layout validator added earlier in this phase, which parses that tree and
+  asserts every path it names exists, passed on every local run.
+  It would have failed on **every** CI run of the same commit, on `ubuntu-latest`,
+  because `_ROOT / "AGENTS.md"` does not resolve on ext4 when the file on disk is
+  `AGENTS.MD`.
+
+  Found while committing unrelated work, not by a gate. The sequence was:
+  `git status` reported a clean tree, so the file looked tracked and current;
+  `git show HEAD:AGENTS.md` failed with *"path exists on disk, but not in
+  'HEAD'"*, which is the message git gives when the name differs in case. The
+  check that located it was comparing the git index against the layout tree
+  entry-by-entry rather than asking `Path.exists()`.
+
+- **Why it is a problem:** The validator was *weaker on the machine that ran it
+  most often than on the machine that runs it in CI.* `pathlib.Path.exists()`
+  resolves case-insensitively on NTFS and case-sensitively on ext4, so the same
+  assertion had two different meanings depending on where it executed. A gate
+  whose behaviour depends on the filesystem it runs on is not a gate; it is a
+  coin flip that lands green on the developer's desk.
+
+  The specific damage is a **latent red build**. The commit that introduced the
+  validator (`e4011eb`, the v1.0.0 README) is the same commit that introduced the
+  failure, so CI has been failing — or would have been, on the first run since —
+  for a reason that has nothing to do with anything anyone changed. The next
+  person to push would have found an unexplained failure in a check they had
+  written, on a file they had not touched, and the cheapest available response
+  would have been to delete the check.
+
+  It is also the fourth instance of the same shape in this repository, which is
+  what makes it worth more than a one-line `git mv`: a document or a check
+  asserts something about the filesystem, and nothing verifies that the
+  assertion is true *on every filesystem the project runs on*.
+
+- **How we fixed it:** `git mv AGENTS.MD AGENTS.md`, in two steps, because a
+  case-insensitive filesystem cannot perform a case-only rename in one. The
+  intermediate name is what makes it work: the first move gets the file off the
+  tracked name, the second puts it back under the correct casing.
+
+  The fix that matters is in the check, not the filename.
+  `test_architecture_layout.py` no longer calls `Path.exists()`. It walks the
+  path one component at a time through `os.listdir()` and compares each part
+  against the directory's actual entries as exact strings, which behaves
+  identically on NTFS and ext4. A developer on Windows and a runner on Linux now
+  get the same answer to the same question.
+
+  When a path fails the exact check but succeeds a case-insensitive one, the
+  failure is reported as a *spelling* problem and names what the file is actually
+  called — `"AGENTS.md (declared as a file, but the file on disk is spelled
+  'AGENTS.MD' - a clone on a case-sensitive filesystem will not have this path)"`.
+  On a case-insensitive filesystem "not on disk" and "spelled differently" are
+  indistinguishable by probing, and a reader left to guess which one occurred
+  will guess wrong.
+
+### The control that was invalid first, and why it matters
+
+The negative control for this change was rebuilt once, and the first version was
+worthless in a way that would have read as a pass.
+
+The control reinstates the defect — renames the file to `AGENTS.MD` — and
+requires the layout check to fail. That part is right. The first version of it
+then asserted, as its second half, that `(_ROOT / "architecture.md").exists()`
+was `True`, on the reasoning that this demonstrates the case-insensitive probe
+succeeds where the exact one fails.
+
+It does demonstrate that on Windows. **On Linux it would raise `FileNotFoundError`
+and the control would error at collection rather than tripping the guard** — which
+is precisely the failure mode AGENTS.md rule 6 now names: a control that errors
+instead of failing reads as a failure, but it is failing for the wrong reason
+and the guard underneath may be doing nothing.
+
+The control is now guarded so that half is asserted only where the platform can
+support it, and the assertion that carries the weight — that the exact check
+rejects a case-flipped path while the real one resolves — runs everywhere.
+
+### Reconstruction, stated in place
+
+Two facts in this account are **reconstruction, not observation**, and are marked
+as such rather than left for a later reader to mistake for a quotation:
+
+1. **"It would have failed on every CI run."** No CI run has been observed. The
+   reasoning is that `os.listdir()` on ext4 would not contain the entry
+   `AGENTS.md`, which is the same mechanism observed on NTFS. The inference is
+   direct and the mechanism was measured here, but the CI failure itself is
+   predicted, not witnessed. It is a prediction from a measured mechanism, not a
+   measurement.
+2. **"CI has been failing since `e4011eb`."** Same status. The first CI run of
+   the v1.0.0 commit is the first that would have hit it, and whether it did is
+   not something this repository's local state can answer.
+
+The **verbatim** record is: the git index held `AGENTS.MD`; `os.listdir(".")`
+did not contain `AGENTS.md` on this host; `git show HEAD:AGENTS.md` failed with
+the case-mismatch message; and after the rename the exact check passes and the
+reinstated-defect control fails with the spelling diagnostic quoted above.

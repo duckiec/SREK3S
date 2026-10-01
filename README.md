@@ -5,7 +5,7 @@ analysis, and — when the cause is unambiguous and the fix is a one-line resour
 change — emits a verified unified `git diff` for a human to merge. It never
 writes to the cluster. That is enforced by the cluster, not by convention.
 
-**Status:** MVP sealed — 767 Python tests + 178 Go test functions green, all CI
+**Status:** MVP sealed — 768 Python tests + 178 Go test functions green, all CI
 gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
 [`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
 along the way, including the ones a passing gate failed to catch.
@@ -88,7 +88,7 @@ None of this needs a cluster.
 
 ```bash
 go test ./...                     # Go units. Add -race; CI-only where TSan is absent.
-pytest agent/tests/ -q            # 767 passed, 2 skipped
+pytest agent/tests/ -q            # 768 passed, 2 skipped
 black --check agent/ tests/
 flake8 agent/ tests/
 mypy --strict agent/ tests/
@@ -453,7 +453,7 @@ with a read-only root and no mounted token. It does not detonate anything; that
 chain is the detonation leg's job, and duplicating it would re-prove a layer that
 is not in question to cover one that is.
 
-Two of the 767 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+Two of the 768 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. `go test -race` and the container build are
 likewise CI-only on hosts without ThreadSanitizer or a Docker daemon; this is
 reported as blocked rather than checked off.
