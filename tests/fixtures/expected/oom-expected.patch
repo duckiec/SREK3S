@@ -1,0 +1,11 @@
+--- a/tests/fixtures/bounded-leak.yaml
++++ b/tests/fixtures/bounded-leak.yaml
+@@ -249,7 +249,7 @@
+               # resource.Quantity.String() unchanged as "64Mi", which matters
+               # because the Tier-1 diff must round-trip this exact spelling
+               # through `git apply` and back out of the manifest.
+-              memory: 64Mi
++              memory: 128Mi
+               # No `requests` block, deliberately and for the same reason as
+               # deploy/chaos/oom-leak.yaml: a request would let the scheduler
+               # reserve memory and refuse to place the pod on a small node,

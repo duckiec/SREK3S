@@ -1340,12 +1340,65 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
 ### 4.4 Regression golden files
 
-- [ ] `4.4.1` Store `tests/fixtures/expected/oom-expected.patch` as the golden Tier-1 diff.
-- [ ] `4.4.2` Assert the generated diff matches the golden diff within an explicitly documented
+- [x] `4.4.1` Store `tests/fixtures/expected/oom-expected.patch` as the golden Tier-1 diff.
+      **Generated, not authored.** The file is byte-identical to
+      `patch.build_diff(find_container_memory_limit(...), "128Mi",
+      "tests/fixtures/bounded-leak.yaml")` on the real fixture, so the golden pins
+      the engine's output rather than a transcription of it. Verified to apply
+      with real `git apply --check` and real `git apply`, and the patched manifest
+      to parse at `128Mi`. Note the engine emits `--- a/` / `+++ b/` with **no**
+      `diff --git` header, and the golden asserts that absence: a golden with a
+      header would bless an artifact the agent never produces.
+- [x] `4.4.2` Assert the generated diff matches the golden diff within an explicitly documented
       tolerance (exact for manifests, normalized for context lines).
-- [ ] `4.4.3` Add a golden RCA with an assertion on required sections, so RCA regressions are
+      **16 tests in `agent/tests/test_golden.py`.** The tolerance is one
+      substitution and it is documented in `_normalise_header`: the `@@` header's
+      **start line** is normalised to `<START>`, because it moves whenever an
+      unrelated comment is edited above the limit, which says nothing about
+      whether the patch is right. The hunk's **line count** is compared exactly,
+      as is every context line, the removed line and the added line — so a patch
+      that grew, lost context, or changed a different key all fail. Three
+      further assertions state what the patch is *for* independently of the byte
+      comparison: exactly one removed line, exactly one added line, exactly one
+      line differing when applied, and every context line present verbatim in the
+      fixture.
+- [x] `4.4.3` Add a golden RCA with an assertion on required sections, so RCA regressions are
       caught without brittle full-text equality.
-- [ ] `4.4.4` Ensure every golden file itself contains zero plaintext secrets.
+      **Structural, never textual.** `test_generated_rca_structure` asserts the
+      generator's actual headings (`# RCA:` is h1 — there is no `## RCA:`, and no
+      `**Root cause:**` field; the root-cause statement is the `## Summary`
+      paragraph) and asserts the *absence* of both wrong shapes, because a
+      maintainer writing a golden by hand reaches for exactly those two. Evidence
+      markers (exit 137, pod name, configured limit, classification, tier, reason)
+      are required.
+
+      Rot cannot go unnoticed: `test_the_golden_rca_matches_the_generator` re-runs
+      `prompt.rca_markdown` and fails if the stored file no longer matches, and
+      `test_this_file_never_compares_an_rca_by_whole_text_equality` walks this
+      file's AST to stop anyone reintroducing exact-match on model-produced text.
+
+      **The peak-versus-payload lesson is recorded, and deliberately not as agent
+      output.** CI run `36786601947` proved that `$(head -c N /dev/zero | tr ...)`
+      buffers the whole result before assignment, so a 90 MiB payload peaked above
+      128 MiB and the container was OOMKilled under a 128Mi limit. Contract A
+      carries `exit_code`, `resource_limits` and `restart_count` — **no peak RSS** —
+      so an RCA asserting the peak would state something the telemetry does not
+      contain. That is the error `emitter.mapReason` refuses to make when it
+      declines to map an unmappable kind. The lesson therefore lives below a `---`
+      separator as annotation, and both halves are enforced: present in the
+      annotation, **absent from the agent's output**.
+- [x] `4.4.4` Ensure every golden file itself contains zero plaintext secrets.
+      **Both goldens scanned against `tests/fixtures/incident_corpus.json`** — the
+      corpus the Go scrubber tests and the E2E masking assertions already consume,
+      so this joins an existing guarantee rather than creating a parallel one. (The
+      ROADMAP text names `secrets_corpus.txt`; no such file exists, and inventing
+      one would create a second competing answer to "what counts as a secret".)
+      The scan asserts the corpus yielded secrets first, so it cannot pass on an
+      empty result set; `test_the_scan_is_against_the_corpus_and_not_a_decoration`
+      plants a real corpus secret and requires it to be reported. Negative-control
+      fragments are checked separately — finding one means the golden was assembled
+      from a scrubber fixture rather than from real output. Absolute paths are
+      also rejected, per ARCH §2.5.4.
 
 ### 4.5 Documentation and final gates
 
