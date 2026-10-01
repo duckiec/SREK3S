@@ -97,13 +97,18 @@ SREK3S/
 │   ├── k8s/                      # READ-ONLY CLUSTER OBSERVABILITY
 │   │   ├── client.go             # client-go config; read-only clientset
 │   │   ├── watcher.go            # Informers: pods + events, resync policy
-│   │   ├── classify.go           # OOMKilled / CrashLoopBackOff extraction
+│   │   ├── readonly.go           # read-only clientset wrapper; Get/List/Watch only
+│   │   ├── telemetry.go          # log + event extraction; PreviousLogsFor
 │   │   ├── guard.go              # defensive pointer helpers (nil-safe accessors)
 │   │   └── *_test.go
 │   │
+│   ├── worker/                   # BOUNDED CONCURRENCY
+│   │   └── pool.go               # fixed-size pool; sends selected against ctx.Done()
 │   └── emitter/                  # EGRESS BOUNDARY
 │       ├── emitter.go            # ctx-bounded HTTP POST to agent
 │       ├── payload.go            # Go-side IncidentPayload structs (wire types)
+│       ├── ulid.go               # ULID incident-id generation (Contract A 4.1)
+│       ├── validate.go           # wire-payload validation; invariants I-A2, I-A3
 │       └── emitter_test.go
 │
 ├── agent/                        # PYTHON ANALYSIS ENGINE (FastAPI + Pydantic v2)
@@ -115,6 +120,11 @@ SREK3S/
 │   ├── sandbox.py                # ephemeral worker, cgroup budget, monotonic deadline
 │   ├── warroom.py                # Tier-2 dispatch payload
 │   ├── verify.py                 # post-remediation health verification loop
+│   ├── rescan.py                 # outbound secret re-scan; invariant I-B6
+│   ├── prompt.py                 # constrained-decoding prompt + RCA rationale
+│   ├── budget.py                 # active-job budget; HTTP 429 sandbox_busy
+│   ├── sandbox_worker.py         # disposable analysis worker entrypoint
+│   ├── triage.py                 # HTTP surface: classify, route, remediate
 │   ├── pyproject.toml
 │   └── requirements.txt          # no torch, no cuda, no gpu extras (asserted in CI)
 │
