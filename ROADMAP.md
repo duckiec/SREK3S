@@ -1,10 +1,10 @@
-# ROADMAP â€” Autonomous Reliability Firewall & Incident Sentinel
+# ROADMAP Ã¢â‚¬â€ Autonomous Reliability Firewall & Incident Sentinel
 
 | Field | Value |
 |---|---|
 | Document ID | `ROAD-0001` |
 | Version | `0.1.0` |
-| Status | Draft â€” all work unstarted |
+| Status | Draft Ã¢â‚¬â€ all work unstarted |
 | Requirements | `PRD.md` |
 | Schemas & layout | `ARCHITECTURE.md` (single source of truth) |
 
@@ -15,11 +15,11 @@
 These rules are binding on every task below.
 
 1. **One checkbox at a time.** Execute strictly in order; do not begin item *N+1* until item
-   *N* is `[x]` (AGENTS.md Â§5).
+   *N* is `[x]` (AGENTS.md Ã‚Â§5).
 2. **No speculative bloat.** Do not add helper utilities, mock libraries, UI templates, or
    abstractions not named by the active task.
 3. **No schema or layout invention.** Field names and directories come from
-   `ARCHITECTURE.md` Â§3/Â§4/Â§5. If a task seems to require a new one, stop and amend the
+   `ARCHITECTURE.md` Ã‚Â§3/Ã‚Â§4/Ã‚Â§5. If a task seems to require a new one, stop and amend the
    architecture document first.
 4. **Quality gates are part of the task.** The milestone's gate command must exit `0` before
    the milestone's terminal test may be run. A green terminal test on a red gate is not done.
@@ -42,38 +42,38 @@ mypy --strict agent/
 
 ---
 
-## Milestone 1 â€” Go Secret Scrubber & PII Masking Engine
+## Milestone 1 Ã¢â‚¬â€ Go Secret Scrubber & PII Masking Engine
 
 **Goal:** a deterministic, in-memory masking engine that makes PRD AC-2 provably satisfiable.
-**Delivers:** `internal/scrubber`. **Satisfies:** PRD F1, AC-2; ARCH Â§6.
-**No cluster or network dependency** â€” this milestone is pure, hermetic, and testable offline.
+**Delivers:** `internal/scrubber`. **Satisfies:** PRD F1, AC-2; ARCH Ã‚Â§6.
+**No cluster or network dependency** Ã¢â‚¬â€ this milestone is pure, hermetic, and testable offline.
 
 ### 1.1 Manifest and compilation
 
 - [x] `1.1.1` Create `internal/scrubber/` with `manifest.go`, `scrubber.go`, `account.go`.
-- [x] `1.1.2` Define `RuleID` typed constants for all 11 rules in ARCH Â§6 (`pem_private_key`,
+- [x] `1.1.2` Define `RuleID` typed constants for all 11 rules in ARCH Ã‚Â§6 (`pem_private_key`,
       `aws_access_key_id`, `aws_secret_access_key`, `jwt`, `bearer_token`, `basic_auth_url`,
       `generic_secret_kv`, `uuid`, `ipv4_address`, `k8s_secret_mount`,
       `private_key_pem_body`).
-- [x] `1.1.3` Encode each rule's regex **verbatim** from the ARCH Â§6 manifest table. No
-      deviation, no added or dropped rules. **Caveat: three verbatim rules leak â€” see below.**
+- [x] `1.1.3` Encode each rule's regex **verbatim** from the ARCH Ã‚Â§6 manifest table. No
+      deviation, no added or dropped rules. **Caveat: three verbatim rules leak Ã¢â‚¬â€ see below.**
 - [x] `1.1.4` Define `Rule{ID RuleID, RE *regexp.Regexp}` and an ordered `var Manifest []Rule`
-      whose order matches the Â§6 table exactly.
+      whose order matches the Ã‚Â§6 table exactly.
 - [x] `1.1.5` Compile the manifest at package `init()`; on compile error, `panic` with the
       offending rule ID. A silently skipped rule is a security defect, not a warning.
 - [x] `1.1.6` Add a test that re-compiles every rule and asserts zero errors, and asserts
-      `len(Manifest) == 11` and that rule order is unchanged from Â§6.
+      `len(Manifest) == 11` and that rule order is unchanged from Ã‚Â§6.
 
 ### 1.2 Scrub pipeline
 
 - [x] `1.2.1` Define `const RedactionSentinel = "[REDACTED]"` as an **unexported, unconfigurable**
-      constant â€” no env var, flag, or config path may alter it.
+      constant Ã¢â‚¬â€ no env var, flag, or config path may alter it.
 - [x] `1.2.2` Implement `ScrubString(ctx context.Context, s string) string` applying all rules
       in manifest order.
 - [x] `1.2.3` Implement `ScrubLines(ctx context.Context, lines []string) ([]string, RedactionReport)`.
 - [x] `1.2.4` Implement the cross-line safety pass (rule M3): join masked lines, re-scan once
       with the full manifest, redistribute. Catches secrets split across a line boundary.
-- [x] `1.2.5` Enforce idempotence â€” `ScrubString(ScrubString(x)) == ScrubString(x)`.
+- [x] `1.2.5` Enforce idempotence Ã¢â‚¬â€ `ScrubString(ScrubString(x)) == ScrubString(x)`.
 - [x] `1.2.6` Add `nil`-context handling: a `nil` ctx is replaced with
       `context.Background()` rather than panicking.
 - [x] `1.2.7` Thread `ctx` through every entry point and abort mid-pipeline on cancellation,
@@ -90,23 +90,23 @@ mypy --strict agent/
 
 ### 1.4 Fixtures and unit tests
 
-- [x] `1.4.1` Create `tests/fixtures/secrets_corpus.txt` with â‰¥ 1 realistic sample per rule,
+- [x] `1.4.1` Create `tests/fixtures/secrets_corpus.txt` with Ã¢â€°Â¥ 1 realistic sample per rule,
       including a multi-line PEM key block and a `key: value` YAML secret.
-- [x] `1.4.2` `TestScrubCorpusTotalMasking` â€” **100%** of corpus lines contain `[REDACTED]`
+- [x] `1.4.2` `TestScrubCorpusTotalMasking` Ã¢â‚¬â€ **100%** of corpus lines contain `[REDACTED]`
       after scrubbing.
-- [x] `1.4.3` `TestNoPlaintextSecretSurvives` â€” for each known plaintext secret in the
+- [x] `1.4.3` `TestNoPlaintextSecretSurvives` Ã¢â‚¬â€ for each known plaintext secret in the
       corpus, a substring scan of the scrubbed output returns **zero** matches (AC-2).
-- [x] `1.4.4` `TestIdempotence` â€” double-scrub equals single-scrub for the whole corpus.
-- [x] `1.4.5` `TestContextPreserved` â€” diagnostic text around a masked token survives
+- [x] `1.4.4` `TestIdempotence` Ã¢â‚¬â€ double-scrub equals single-scrub for the whole corpus.
+- [x] `1.4.5` `TestContextPreserved` Ã¢â‚¬â€ diagnostic text around a masked token survives
       (timestamps, log levels, messages remain legible), guarding against over-masking.
-- [x] `1.4.6` `TestCrossLineSecret` â€” a secret split across two lines is still masked.
-- [x] `1.4.7` `TestRuleOrdering` â€” a PEM block is masked as one span, not shredded by the
+- [x] `1.4.6` `TestCrossLineSecret` Ã¢â‚¬â€ a secret split across two lines is still masked.
+- [x] `1.4.7` `TestRuleOrdering` Ã¢â‚¬â€ a PEM block is masked as one span, not shredded by the
       generic rule.
-- [x] `1.4.8` `TestEmptyAndEdgeInputs` â€” `""`, whitespace-only, 1 MiB single line, invalid
+- [x] `1.4.8` `TestEmptyAndEdgeInputs` Ã¢â‚¬â€ `""`, whitespace-only, 1 MiB single line, invalid
       UTF-8 bytes, and a nil `[]string` all handled without panic.
-- [x] `1.4.9` `BenchmarkScrubThroughput` â€” full pipeline sustains **â‰¥ 20,000 lines/sec/core**
-      (ARCH Â§6.2). Record the number in the PR description.
-- [x] `1.4.10` `TestNoDiskArtifacts` â€” assert the package imports no `os`, `io/ioutil`, or
+- [x] `1.4.9` `BenchmarkScrubThroughput` Ã¢â‚¬â€ full pipeline sustains **Ã¢â€°Â¥ 20,000 lines/sec/core**
+      (ARCH Ã‚Â§6.2). Record the number in the PR description.
+- [x] `1.4.10` `TestNoDiskArtifacts` Ã¢â‚¬â€ assert the package imports no `os`, `io/ioutil`, or
       temp-file API; scrubbing leaves nothing on disk.
 
 ### 1.5 Milestone 1 quality gate
@@ -116,18 +116,18 @@ mypy --strict agent/
 - [x] `1.5.3` `go test -race -timeout 30s ./internal/scrubber/...` exits `0` with **no** data
       races and **no** skipped tests.
 
-### 1.6 Defects found in the ratified spec â€” RESOLVED
+### 1.6 Defects found in the ratified spec Ã¢â‚¬â€ RESOLVED
 
 All five were found while implementing Milestone 1 and have since been **ratified and fixed**.
-`ARCHITECTURE.md` Â§6.4 and Â§6.5 carry the amendments; each is covered by a live conformance test.
+`ARCHITECTURE.md` Ã‚Â§6.4 and Ã‚Â§6.5 carry the amendments; each is covered by a live conformance test.
 
 | # | Defect | Evidence | Severity |
 |---|---|---|---|
-| **D-1** | **Rule 7 `generic_secret_kv` misses JSON-form secrets.** The alternation is followed by `\s*[:=]\s*`, so a `"` between the key and the colon defeats it. `\b` also fails on `_`, so `auth_token=â€¦` is missed entirely. | `{"password":"hunter2"}` â†’ **unchanged**<br>`{"api_key":"sk-live-abcdef123456"}` â†’ **unchanged**<br>`auth_token=abc123xyz789` â†’ **unchanged** | **High â€” leak** |
-| **D-2** | **Rule 10 `k8s_secret_mount` only matches one word order.** It requires `token`/`secret`/`ca.crt` *after* `kube-system`, but the canonical log form puts the path first. | `reading /var/run/secrets/kubernetes.io/serviceaccount/token for kube-system` â†’ **unchanged** | **High â€” leak** |
-| **D-3** | **Rule 11 pre-empts rule 1 across the M3 join.** The per-line pass redacts the `-----BEGIN` marker, so by the time the cross-line pass runs, rule 1 has no BEGINâ€¦END pair and the **base64 key body survives**. | 4-line PEM block â†’ body `MIIEowIBAAKCAQEAy8Dbv8â€¦` emitted verbatim | **Medium â€” leak** |
-| **D-4** | **1.2.7 is self-contradictory.** "partially-masked buffer â€¦ never raw" cannot both hold for an ordered manifest: aborting after rule 6 leaves every rule 7 secret in the buffer. An implementation following the text literally leaks. | Reproduced during implementation: `password=secretNumber16` returned unmasked beside a masked URI on the same line | **High â€” leak** |
-| **D-5** | **ARCH Â§6.2 budget not met on any measured platform.** 11 rules Ã— 2 passes (per-line + M3) measures **~7,900 lines/sec** on `windows/arm64`, against a 20,000 target. | `BenchmarkScrubThroughput`, 128-line representative slice | Medium |
+| **D-1** | **Rule 7 `generic_secret_kv` misses JSON-form secrets.** The alternation is followed by `\s*[:=]\s*`, so a `"` between the key and the colon defeats it. `\b` also fails on `_`, so `auth_token=Ã¢â‚¬Â¦` is missed entirely. | `{"password":"hunter2"}` Ã¢â€ â€™ **unchanged**<br>`{"api_key":"sk-live-abcdef123456"}` Ã¢â€ â€™ **unchanged**<br>`auth_token=abc123xyz789` Ã¢â€ â€™ **unchanged** | **High Ã¢â‚¬â€ leak** |
+| **D-2** | **Rule 10 `k8s_secret_mount` only matches one word order.** It requires `token`/`secret`/`ca.crt` *after* `kube-system`, but the canonical log form puts the path first. | `reading /var/run/secrets/kubernetes.io/serviceaccount/token for kube-system` Ã¢â€ â€™ **unchanged** | **High Ã¢â‚¬â€ leak** |
+| **D-3** | **Rule 11 pre-empts rule 1 across the M3 join.** The per-line pass redacts the `-----BEGIN` marker, so by the time the cross-line pass runs, rule 1 has no BEGINÃ¢â‚¬Â¦END pair and the **base64 key body survives**. | 4-line PEM block Ã¢â€ â€™ body `MIIEowIBAAKCAQEAy8Dbv8Ã¢â‚¬Â¦` emitted verbatim | **Medium Ã¢â‚¬â€ leak** |
+| **D-4** | **1.2.7 is self-contradictory.** "partially-masked buffer Ã¢â‚¬Â¦ never raw" cannot both hold for an ordered manifest: aborting after rule 6 leaves every rule 7 secret in the buffer. An implementation following the text literally leaks. | Reproduced during implementation: `password=secretNumber16` returned unmasked beside a masked URI on the same line | **High Ã¢â‚¬â€ leak** |
+| **D-5** | **ARCH Ã‚Â§6.2 budget not met on any measured platform.** 11 rules Ãƒâ€” 2 passes (per-line + M3) measures **~7,900 lines/sec** on `windows/arm64`, against a 20,000 target. | `BenchmarkScrubThroughput`, 128-line representative slice | Medium |
 
 **Resolution taken for D-4 (already implemented).** Cancellation is observed at **line boundaries
 only**; a line is masked to completion or not returned. Rationale is in the `scrub` doc comment:
@@ -137,77 +137,77 @@ contradiction.
 
 **Resolutions applied** (all ratified, all covered by live conformance tests):
 
-- **D-1 â†’ fixed** in `ARCHITECTURE.md` Â§6.4: optional quote before the separator, `[\w-]{0,20}` key
+- **D-1 Ã¢â€ â€™ fixed** in `ARCHITECTURE.md` Ã‚Â§6.4: optional quote before the separator, `[\w-]{0,20}` key
   prefix so `auth_token` matches, and capture groups so only the value is replaced and the
   surrounding JSON survives. Tests: `TestCorpusTotalMasking` (`kv-json-object`, `kv-json-nested`),
   `TestCorpusPreservesDiagnostics`.
-- **D-2 â†’ fixed** in Â§6.4: both word orders accepted, gap still bounded to 80 non-newline
+- **D-2 Ã¢â€ â€™ fixed** in Ã‚Â§6.4: both word orders accepted, gap still bounded to 80 non-newline
   characters. Tests: `TestRuleByRule` (`k8s_secret_mount`), corpus group `k8s_service_accounts`.
-- **D-3 â†’ fixed** in Â§6.5: the cross-line pass runs before the per-line pass, so multi-line rules
+- **D-3 Ã¢â€ â€™ fixed** in Ã‚Â§6.5: the cross-line pass runs before the per-line pass, so multi-line rules
   evaluate ahead of the single-line `private_key_pem_body` fallback and the PEM body no longer
   survives. Test: `TestD3_CrossLinePEMBlockIsRemovedAsOneSpan` (was a skipped defect test; now a
   live conformance test).
-- **D-4 â†’ fixed** as described above.
-- **D-5 â†’ fixed** in Â§6.5: `Rule.IsMultiLine` added, derived by probe and asserted in both
+- **D-4 Ã¢â€ â€™ fixed** as described above.
+- **D-5 Ã¢â€ â€™ fixed** in Ã‚Â§6.5: `Rule.IsMultiLine` added, derived by probe and asserted in both
   directions by `TestMultiLineFlagMatchesCapability`. The cross-line pass now runs **1 of 11**
   patterns. Rule 7's value class deliberately excludes `\n`, which keeps the pass cheap and
   correct. Tests: `TestMultiLineFlagMatchesCapability`, `TestCrossLinePassRestrictedToMultiLineRules`.
 
 **Throughput after the fixes** (`windows/arm64`, corpus-driven, 13,056-line slice):
-**~187,000 lines/sec**, against the ARCH Â§6.2 budget of 20,000. CI on `ubuntu-latest` remains the
+**~187,000 lines/sec**, against the ARCH Ã‚Â§6.2 budget of 20,000. CI on `ubuntu-latest` remains the
 authoritative measurement.
 
 **Deferred, recorded not dropped:** a `key=value` secret split across a newline is no longer caught
 by the cross-line pass, since rule 7 is now single-line by design. A future `secret_continuation`
-rule may address it (`ARCHITECTURE.md` Â§6.5).
+rule may address it (`ARCHITECTURE.md` Ã‚Â§6.5).
 
-### âœ… MILESTONE 1 â€” COMPLETE AND RATIFIED
+### Ã¢Å“â€¦ MILESTONE 1 Ã¢â‚¬â€ COMPLETE AND RATIFIED
 
 **Ratified by the Architect. Closed at CI run `36483537879`** (`ubuntu-latest`, Go 1.23, commit
-`2827e90`) â€” job "Go quality gates" **success**, `G3 - go test -race` **success**, no data race
+`2827e90`) Ã¢â‚¬â€ job "Go quality gates" **success**, `G3 - go test -race` **success**, no data race
 reported. Re-confirmed green on the following documentation commit.
 
 | Gate | Result |
 |---|---|
-| G1 `go vet ./...` | âœ… exit 0 |
-| G2 `test -z "$(gofmt -l .)"` | âœ… clean |
-| G3 `go test -v -race -timeout 30s ./...` | âœ… **exit 0 on linux/amd64** |
-| `go vet -tags race ./...` (added) | âœ… exit 0 |
+| G1 `go vet ./...` | Ã¢Å“â€¦ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | Ã¢Å“â€¦ clean |
+| G3 `go test -v -race -timeout 30s ./...` | Ã¢Å“â€¦ **exit 0 on linux/amd64** |
+| `go vet -tags race ./...` (added) | Ã¢Å“â€¦ exit 0 |
 | Local suite (windows/arm64, no `-race`) | 25 top-level + 28 subtests, 0 failures, 0 skips |
-| Throughput | ~187,000 lines/sec vs the Â§6.2 budget of 20,000 |
+| Throughput | ~187,000 lines/sec vs the Ã‚Â§6.2 budget of 20,000 |
 
-Defects D-1 â€¦ D-5 are all closed with live conformance tests (see Â§1.6). Milestone 2 is
+Defects D-1 Ã¢â‚¬Â¦ D-5 are all closed with live conformance tests (see Ã‚Â§1.6). Milestone 2 is
 unblocked.
 
 **Standing constraint carried forward:** `-race` is unavailable on `windows/arm64` (a platform
-limitation, not configuration). G3 is never verified locally and is never waived â€” the CI run is its
+limitation, not configuration). G3 is never verified locally and is never waived Ã¢â‚¬â€ the CI run is its
 only authority.
 
-### â–¶ TERMINAL VALIDATION TEST â€” Milestone 1
+### Ã¢â€“Â¶ TERMINAL VALIDATION TEST Ã¢â‚¬â€ Milestone 1
 
 > **Command:** `go test -race -timeout 30s -run 'TestScrubCorpusTotalMasking|TestNoPlaintextSecretSurvives|TestIdempotence' -v ./internal/scrubber/...`
 >
 > **Pass condition:** exit code `0`; the corpus masking rate is **100%**; the plaintext
 > substring scan returns **zero** matches; idempotence holds byte-for-byte.
 >
-> **Maps to:** PRD AC-2, ARCH Â§6, invariants I-A1 and I-A5.
+> **Maps to:** PRD AC-2, ARCH Ã‚Â§6, invariants I-A1 and I-A5.
 >
-> **Done when:** all boxes in Milestone 1 are `[x]`, Â§1.5 is green, and this command exits `0`.
+> **Done when:** all boxes in Milestone 1 are `[x]`, Ã‚Â§1.5 is green, and this command exits `0`.
 
-#### âœ… Milestone 1 status: COMPLETE
+#### Ã¢Å“â€¦ Milestone 1 status: COMPLETE
 
-**G3 evidence.** CI run **36483324256**, `ubuntu-latest`, Go 1.23, commit `a48ac34` â€” job
+**G3 evidence.** CI run **36483324256**, `ubuntu-latest`, Go 1.23, commit `a48ac34` Ã¢â‚¬â€ job
 "Go quality gates" **success**, with `G3 - go test -race` **success** and no data race reported.
 This is the first and only run in which G3 executed rather than failing to build.
 
 | Gate | Result |
 |---|---|
-| G1 `go vet ./...` | âœ… exit 0 |
-| G2 `test -z "$(gofmt -l .)"` | âœ… clean |
-| G3 `go test -v -race -timeout 30s ./...` | âœ… **exit 0 on linux/amd64** |
-| `go vet -tags race ./...` (added) | âœ… exit 0 |
+| G1 `go vet ./...` | Ã¢Å“â€¦ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | Ã¢Å“â€¦ clean |
+| G3 `go test -v -race -timeout 30s ./...` | Ã¢Å“â€¦ **exit 0 on linux/amd64** |
+| `go vet -tags race ./...` (added) | Ã¢Å“â€¦ exit 0 |
 | Local suite (windows/arm64, no `-race`) | 25 top-level + 28 subtests, 0 failures, 0 skips |
-| Throughput (windows/arm64) | ~187,000 lines/sec vs the Â§6.2 budget of 20,000 |
+| Throughput (windows/arm64) | ~187,000 lines/sec vs the Ã‚Â§6.2 budget of 20,000 |
 
 **Three corrections made during the G3 push, recorded so they are not repeated:**
 
@@ -217,42 +217,42 @@ This is the first and only run in which G3 executed rather than failing to build
    `benchmark_test.go` (untagged) called them, so the `-race` build failed to link. G1 and G2
    could not see it because they typecheck the opposite variant. Corrected in `73ef836`.
 2. **The diagnostic step I added to surface the error broke the workflow.** Runs `36482677704`
-   and `36483065331` report **zero jobs** â€” the signature of a workflow that fails to parse, as
+   and `36483065331` report **zero jobs** Ã¢â‚¬â€ the signature of a workflow that fails to parse, as
    opposed to a step that fails. Two CI cycles lost to my own instrumentation. Reverted.
 3. **Prevention added:** `go vet -tags race ./...` in CI. It typechecks the exact file set G3
    compiles, needs no race runtime, and turns this class of defect into a cheap red step before
    G3 rather than an opaque link error.
 
 **Standing constraint:** `-race` is unavailable on `windows/arm64` (a platform limitation, not a
-configuration error). G3 is therefore never verified locally and is *never waived* â€” the CI run is
+configuration error). G3 is therefore never verified locally and is *never waived* Ã¢â‚¬â€ the CI run is
 its only authority. Any future change to build tags or platform-dependent test helpers must be
 checked against the `-race` file set, not just the default one.
 
 ---
 
-## Milestone 2 â€” Python Triage Agent & GitOps Diff Generator
+## Milestone 2 Ã¢â‚¬â€ Python Triage Agent & GitOps Diff Generator
 
 **Goal:** a schema-enforcing analysis service that turns a scrubbed Incident Payload into
 either a Tier-1 GitOps diff or a Tier-2 War-Room dispatch. **Delivers:** `agent/`.
-**Satisfies:** PRD F2, F3, AC-3; ARCH Â§4, Â§5.
+**Satisfies:** PRD F2, F3, AC-3; ARCH Ã‚Â§4, Ã‚Â§5.
 
 ### 2.1 Schemas (Pydantic v2)
 
-- [x] `2.1.1` Create `agent/models.py` as the schema source of truth, matching ARCH Â§4.1 and
-      Â§5.1 field-for-field â€” names, types, nullability, enums.
+- [x] `2.1.1` Create `agent/models.py` as the schema source of truth, matching ARCH Ã‚Â§4.1 and
+      Ã‚Â§5.1 field-for-field Ã¢â‚¬â€ names, types, nullability, enums.
 - [x] `2.1.2` Define `IncidentPayload`, `ResourceLimits`, `ClusterEvent`, `RedactionReport`,
       `TriageResponse`, `RootCause`, `AffectedScope`, `Remediation`, `VerificationPolicy`,
       `SuccessCriteria`.
       > **Ratified naming decision:** the response model is `TriageResponse`, not `RCAResponse`
       > (2.2.2). It carries a transport-level `status` (`TRIAGED` / `ESCALATED` / `UNKNOWN` /
       > `REJECTED`) that is distinct from the RCA content, so one name covering both is more
-      > accurate. ARCH Â§5 is otherwise followed literally.
+      > accurate. ARCH Ã‚Â§5 is otherwise followed literally.
 - [x] `2.1.3` Define closed enums `Reason`, `Classification`, `Severity`, and
-      `BlastRadiusTier` with exactly the ARCH Â§5 values.
+      `BlastRadiusTier` with exactly the ARCH Ã‚Â§5 values.
 - [x] `2.1.4` Pin `schema_version` as `1.0.0` and reject mismatched majors with a `422`.
 - [x] `2.1.5` Validate `tests/fixtures/sample-incident.json` against `IncidentPayload` in a
-      test â€” contract drift fails the build, not production.
-- [x] `2.1.6` Assert `exit_code` is nullable and that `reason == OOMKilled` â‡’ `exit_code == 137`
+      test Ã¢â‚¬â€ contract drift fails the build, not production.
+- [x] `2.1.6` Assert `exit_code` is nullable and that `reason == OOMKilled` Ã¢â€¡â€™ `exit_code == 137`
       and a non-null `memory_limit` (invariant I-A2).
 
 #### 2.1 status: COMPLETE
@@ -263,15 +263,15 @@ the same run, so nothing regressed.
 
 | Gate | Local | CI (run 36485670189) |
 |---|---|---|
-| G1 `go vet ./...` | âœ… exit 0 | âœ… success |
-| G2 `test -z "$(gofmt -l .)"` | âœ… clean | âœ… success |
-| G3 `go test -race -timeout 30s ./...` | n/a (unsupported on windows/arm64) | âœ… success |
-| G4 `black --check agent/` | âœ… exit 0 | âœ… success |
-| G5 `flake8 agent/` | âœ… exit 0 | âœ… success |
-| G6 `mypy --strict agent/` | âœ… 3 source files clean | âœ… success on **Python 3.11** |
-| â€” `pytest agent/tests/ -q` | âœ… 87 passed | âœ… success |
-| â€” GPU-dependency guard (ARCH Â§2) | âœ… verified | âœ… success |
-| â€” I-B5 mutation-verb guard (ARCH Â§5.4) | âœ… verified with negative control | âœ… success |
+| G1 `go vet ./...` | Ã¢Å“â€¦ exit 0 | Ã¢Å“â€¦ success |
+| G2 `test -z "$(gofmt -l .)"` | Ã¢Å“â€¦ clean | Ã¢Å“â€¦ success |
+| G3 `go test -race -timeout 30s ./...` | n/a (unsupported on windows/arm64) | Ã¢Å“â€¦ success |
+| G4 `black --check agent/` | Ã¢Å“â€¦ exit 0 | Ã¢Å“â€¦ success |
+| G5 `flake8 agent/` | Ã¢Å“â€¦ exit 0 | Ã¢Å“â€¦ success |
+| G6 `mypy --strict agent/` | Ã¢Å“â€¦ 3 source files clean | Ã¢Å“â€¦ success on **Python 3.11** |
+| Ã¢â‚¬â€ `pytest agent/tests/ -q` | Ã¢Å“â€¦ 87 passed | Ã¢Å“â€¦ success |
+| Ã¢â‚¬â€ GPU-dependency guard (ARCH Ã‚Â§2) | Ã¢Å“â€¦ verified | Ã¢Å“â€¦ success |
+| Ã¢â‚¬â€ I-B5 mutation-verb guard (ARCH Ã‚Â§5.4) | Ã¢Å“â€¦ verified with negative control | Ã¢Å“â€¦ success |
 
 The CI run of G6 on a genuine 3.11 with only `agent/requirements.txt` installed confirms the host
 caveat below was a local artifact and not a schema problem.
@@ -279,7 +279,7 @@ caveat below was a local artifact and not a schema problem.
 **Tooling config lives at the repository root, not in `agent/`.** The charter's commands
 (`flake8 agent/`, `mypy --strict agent/`) run from the root, and both tools resolve configuration
 relative to the working directory. A `setup.cfg` inside `agent/` is therefore invisible to those
-exact invocations â€” the first version of this work put it there and it silently did nothing, leaving
+exact invocations Ã¢â‚¬â€ the first version of this work put it there and it silently did nothing, leaving
 G5 reporting 79-column violations against black-formatted code.
 
 **Host caveat on G6.** The local interpreter is Python 3.14 and has `numpy` 2.5.3 installed
@@ -291,26 +291,26 @@ numpy, so it is unaffected. Locally the gate is run as
 
 **Also implemented, beyond the 2.1 checklist:**
 
-- `agent/requirements.txt` â€” pinned, GPU-free (ARCH Â§2), with the gate tools included so local and
+- `agent/requirements.txt` Ã¢â‚¬â€ pinned, GPU-free (ARCH Ã‚Â§2), with the gate tools included so local and
   CI install identical versions.
-- `agent/Dockerfile` â€” `python:3.11-slim`, UID/GID 10001, `/app` owned by the runtime user,
+- `agent/Dockerfile` Ã¢â‚¬â€ `python:3.11-slim`, UID/GID 10001, `/app` owned by the runtime user,
   `PYTHONUNBUFFERED=1` / `PYTHONDONTWRITEBYTECODE=1` / `TMPDIR=/tmp`, `USER 10001:10001` before any
   runtime step, exec-form uvicorn entrypoint.
-- `agent/conftest.py` â€” puts `agent/` on `sys.path` so `pytest agent/tests/` works from the root.
-  ARCH Â§3 describes a flat module, not a package, so `import models` does not otherwise resolve
+- `agent/conftest.py` Ã¢â‚¬â€ puts `agent/` on `sys.path` so `pytest agent/tests/` works from the root.
+  ARCH Ã‚Â§3 describes a flat module, not a package, so `import models` does not otherwise resolve
   from the root.
-- `tests/fixtures/sample-incident.json` â€” the canonical Contract A payload (2.1.5).
+- `tests/fixtures/sample-incident.json` Ã¢â‚¬â€ the canonical Contract A payload (2.1.5).
 - Two new CI guards, both **verified with a negative control** so they are known to fire:
   GPU-dependency rejection (scoped to non-comment lines, because the requirements file's own
   header explains the prohibition in prose and a naive grep matched its own documentation), and
-  an `ast`-based scan of `agent/models.py` for mutating-verb field names enforcing ARCH Â§5.4 I-B5.
+  an `ast`-based scan of `agent/models.py` for mutating-verb field names enforcing ARCH Ã‚Â§5.4 I-B5.
   The earlier grep-based version of the I-B5 guard required quoted field names, which Python never
   uses, so it could not have failed.
 
 **The git-patch validator rejects markdown-fenced diffs.** `I-B4` forbids scraping a diff out of
 markdown, so ``` ```diff ``` fences are refused rather than unwrapped. Accepting a fenced diff would
 mean a model that wrapped its answer produced a review artifact while a byte-identical unfenced
-response was rejected â€” incoherent, and the strict direction is the safe one. There is a paired test
+response was rejected Ã¢â‚¬â€ incoherent, and the strict direction is the safe one. There is a paired test
 proving the unfenced equivalent is still accepted.
 
 ### 2.2 FastAPI service
@@ -318,15 +318,15 @@ proving the unfenced equivalent is still accepted.
 - [x] `2.2.1` Create `agent/main.py` with an app factory, lifespan context, and
       `GET /healthz`.
 - [x] `2.2.2` `POST /v1/incidents` accepts `IncidentPayload`, returns `TriageResponse`.
-      **Both paths are served, one handler.** `/v1/incidents` is the canonical contract (ARCH Â§4,
+      **Both paths are served, one handler.** `/v1/incidents` is the canonical contract (ARCH Ã‚Â§4,
       and ROADMAP 3.4.4 has the Go emitter POST there in Milestone 3); `/api/v1/triage` is the
-      versioned-prefix form this task specified. The mistake is not symmetric â€” serving only the
-      alias would leave M3's emitter posting to a 404, surfacing only at integration â€” so both are
+      versioned-prefix form this task specified. The mistake is not symmetric Ã¢â‚¬â€ serving only the
+      alias would leave M3's emitter posting to a 404, surfacing only at integration Ã¢â‚¬â€ so both are
       mounted on a single handler and `TestBothTriagePaths` asserts they cannot diverge. **Worth
-      ratifying:** if only one path is wanted, remove the other and update ARCH Â§4 plus 3.4.4 in the
+      ratifying:** if only one path is wanted, remove the other and update ARCH Ã‚Â§4 plus 3.4.4 in the
       same change.
-- [x] `2.2.3` Return `422` with Pydantic errors on schema violation â€” **never** coerce into a
-      Tier-2 dispatch (ARCH Â§4.3).
+- [x] `2.2.3` Return `422` with Pydantic errors on schema violation Ã¢â‚¬â€ **never** coerce into a
+      Tier-2 dispatch (ARCH Ã‚Â§4.3).
 - [x] `2.2.4` Return `400 {"error":"malformed_json"}` for unparseable bodies.
 - [x] `2.2.5` `429 {"error":"sandbox_busy"}` when the sandbox budget is exhausted.
       **Implemented as a concurrency budget, not a cgroup sandbox.** `agent/budget.py` bounds
@@ -347,20 +347,20 @@ step green on real CPython 3.11, and G3 `go test -race` green (never waived, ARC
 
 | Gate | Result |
 |---|---|
-| G4 `black --check agent/` | âœ… exit 0, 8 files unchanged |
-| G5 `flake8 agent/` | âœ… exit 0, 0 findings |
-| G6 `mypy --strict agent/` | âœ… no issues in 8 source files |
-| `pytest agent/tests/ -q` | âœ… **148 passed**, 0 failed |
-| G1/G2/G3 (Go) | âœ… unregressed; G3 green on CI |
-| Dockerfile static audit | âœ… **20/20** checks |
-| `docker build` | âŒ **BLOCKED â€” no container runtime on this host** |
+| G4 `black --check agent/` | Ã¢Å“â€¦ exit 0, 8 files unchanged |
+| G5 `flake8 agent/` | Ã¢Å“â€¦ exit 0, 0 findings |
+| G6 `mypy --strict agent/` | Ã¢Å“â€¦ no issues in 8 source files |
+| `pytest agent/tests/ -q` | Ã¢Å“â€¦ **148 passed**, 0 failed |
+| G1/G2/G3 (Go) | Ã¢Å“â€¦ unregressed; G3 green on CI |
+| Dockerfile static audit | Ã¢Å“â€¦ **20/20** checks |
+| `docker build` | Ã¢ÂÅ’ **BLOCKED Ã¢â‚¬â€ no container runtime on this host** |
 
 **The first 2.2 commit passed every local gate and still failed CI's G5.** Worth recording because the
 signature was misleading: G4 *passed* and G5 *failed*, which reads like a formatting disagreement but
 was actually the interpreter.
 
-`agent/tests/test_api.py:692` contained an f-string with a backslash inside its expression part â€” PEP
-701, valid from Python 3.12. The dev host runs 3.14, where it parses; CI pins 3.11 (AGENTS.md Â§2),
+`agent/tests/test_api.py:692` contained an f-string with a backslash inside its expression part Ã¢â‚¬â€ PEP
+701, valid from Python 3.12. The dev host runs 3.14, where it parses; CI pins 3.11 (AGENTS.md Ã‚Â§2),
 where it is a hard `SyntaxError`, so flake8 reported **E999** remotely while black, mypy and pytest
 were all green locally. Confirmed by compiling every source with a real CPython 3.11.16:
 `f-string expression part cannot include a backslash`.
@@ -381,21 +381,21 @@ Three gaps this exposed, all now closed:
 
 The new guard was validated with a negative control: planting the exact construct fails it on **both**
 3.14 and 3.11, and real 3.11 rejects the plant. (A first control attempt planted `chr(92)` instead of
-a literal backslash and passed â€” the guard was right and the control was wrong.)
+a literal backslash and passed Ã¢â‚¬â€ the guard was right and the control was wrong.)
 
 **Triage behaviour.** `OOMKilled` with a readable manifest and a container-local fault produces
-`TIER_1_TOIL` with a one-line unified diff raising `256Mi â†’ 512Mi`. Everything else escalates:
+`TIER_1_TOIL` with a one-line unified diff raising `256Mi Ã¢â€ â€™ 512Mi`. Everything else escalates:
 node pressure, a restart count above the policy ceiling, a crash loop, a dependency fault, an
 unparseable quantity, an unreadable manifest, or a manifest without the target line.
 
 **The running service escalates by default.** It is wired to `unreadable_manifest_provider()`, so
 with no GitOps checkout it cannot satisfy I-B2 and emits no patch. Fail-closed is the *normal* path
-until Milestone 2.5 provides a real checkout â€” not a corner case.
+until Milestone 2.5 provides a real checkout Ã¢â‚¬â€ not a corner case.
 
 **Three real bugs caught by the tests, all now fixed:**
 
 1. **Byte formatter iterated suffixes smallest-first**, so any multiple of 1024 rendered as `Ki`.
-   A 256Mi limit doubled to `524288Ki` instead of `512Mi` â€” numerically correct, but a form no
+   A 256Mi limit doubled to `524288Ki` instead of `512Mi` Ã¢â‚¬â€ numerically correct, but a form no
    engineer writes and a reviewer has to stop and decode.
 2. **The replacement line lost its indentation.** The diff emitted `+memory: "512Mi"` at column 0,
    which would produce an invalid manifest. A patch that breaks the file it claims to fix is worse
@@ -408,8 +408,8 @@ until Milestone 2.5 provides a real checkout â€” not a corner case.
 
 **Sibling health is an inference, and is labelled as one.** Contract A carries no observation of
 sibling containers, so `_siblings_healthy` infers containment from the fact that a *container-local*
-`OOMKilled` means the kernel enforced that container's cgroup limit â€” and returns `False` whenever a
-node-level signal (`Evicted`, `MemoryPressure`, â€¦) is present. Without this predicate the Tier-1 path
+`OOMKilled` means the kernel enforced that container's cgroup limit Ã¢â‚¬â€ and returns `False` whenever a
+node-level signal (`Evicted`, `MemoryPressure`, Ã¢â‚¬Â¦) is present. Without this predicate the Tier-1 path
 would be unreachable; with it, a node-wide memory shortage cannot be "fixed" by raising a limit that
 was never the problem. Milestone 2.4's sandbox replaces the inference with a direct observation.
 
@@ -425,7 +425,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 
 ### 2.3 Deterministic classifier
 - [x] `2.3.1` Create `agent/classifier.py` implementing the deny-by-default routing rule from
-      ARCH Â§5.3 exactly.
+      ARCH Ã‚Â§5.3 exactly.
 - [x] `2.3.2` Implement all six Tier-1 preconditions: `OOMKilled`, `restart_count <=
       policy.max_restarts` (default 5), single affected replica, healthy siblings, remedy shape
       in the `MEMORY_LIMIT_RECALIBRATION` allow-list, `risk_level != HIGH`.
@@ -451,7 +451,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       rlimits are exercised on CI's `ubuntu-latest`; on Windows they are not available and the deadline
       plus the kill are the enforcement mechanisms, which `resource_limits_supported()` reports.
 - [x] `2.4.3` Bound every investigation with a **monotonic** deadline via
-      `time.perf_counter()` â€” never wall-clock (AGENTS Â§3.3).
+      `time.perf_counter()` Ã¢â‚¬â€ never wall-clock (AGENTS Ã‚Â§3.3).
 - [x] `2.4.4` Tear the worker down on timeout/cancel; assert no state survives into the next
       investigation.
 - [x] `2.4.5` Assert the sandbox holds no cluster credential and no egress other than the one
@@ -467,7 +467,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 
 - [x] `2.5.1` Create `agent/llm.py` enforcing Pydantic-constrained decoding against
       `RCAResponse`.
-- [x] `2.5.2` Treat freeform markdown or non-JSON output as a **fatal** validation failure â€”
+- [x] `2.5.2` Treat freeform markdown or non-JSON output as a **fatal** validation failure Ã¢â‚¬â€
       no regex scrape, no best-effort parse, no partial response (invariant I-B4).
 - [x] `2.5.3` Produce both deliverables: human-readable `rca_markdown` **and** machine-parsable
       Both `rca_markdown` and `remediation.git_patch` are populated on every response and asserted
@@ -476,7 +476,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 - [x] `2.5.4` Create `agent/patch.py` to synthesize a unified diff with `---`/`+++`/`@@`
       headers, repo-relative paths, no absolute paths, and no binary hunks.
 - [x] `2.5.5` Validate every patch with `git apply --check --whitespace=nowarn` against the
-      **Three layers, all required** (AGENTS.md Â§1 "Dual-Layer Patch Verification", Â§3.3): the
+      **Three layers, all required** (AGENTS.md Ã‚Â§1 "Dual-Layer Patch Verification", Ã‚Â§3.3): the
       positional round-trip, a **YAML AST** check that both documents parse and differ at exactly one
       semantic field (`resources.limits.memory` of the named container, located structurally), and
       `git apply --check --whitespace=nowarn` against those same bytes in a throwaway repository. Each
@@ -486,7 +486,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       `patch_validated` is set after an in-process round-trip: the diff is applied back against
       the real manifest text and asserted to change exactly the resolved line and no other. That
       is a genuine verification of *applies to this manifest*, but it is not the `git apply
-      --check` that ARCH Â§5.4 I-B2 names and this checkbox requires - there is no GitOps checkout
+      --check` that ARCH Ã‚Â§5.4 I-B2 names and this checkbox requires - there is no GitOps checkout
       to run it against. **I-B2 is therefore only partially satisfied, and this needs a
       decision:** either wire a real `git apply --check` in, or amend I-B2 to say that
       positional round-trip verification satisfies it.
@@ -499,8 +499,8 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
       Not done: the downgrade path is real and tested, but it triggers on the positional
       verification, not on the `git apply --check` failure this checkbox names.
       unvalidated diff (PRD R2).
-- [x] `2.5.7` Enforce Tier-2 â‡’ `git_patch == ""` and `patch_validated == false` (invariant I-B1).
-- [x] `2.5.8` Apply the ARCH Â§6 rule set as a defence-in-depth re-scan to every outbound string
+- [x] `2.5.7` Enforce Tier-2 Ã¢â€¡â€™ `git_patch == ""` and `patch_validated == false` (invariant I-B1).
+- [x] `2.5.8` Apply the ARCH Ã‚Â§6 rule set as a defence-in-depth re-scan to every outbound string
       (invariant I-B6), using the same rule IDs.
 
 ### 2.6 War-Room dispatch (Tier-2)
@@ -516,7 +516,7 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 - [x] `2.7.1` Create `agent/requirements.txt` and `agent/pyproject.toml` with Pydantic v2 and
       FastAPI.
 - [x] `2.7.2` Add a CI assertion that **no** `torch`, `nvidia-*`, `cuda*`, or `tensorflow`
-      package is present in the dependency tree (AGENTS Â§2).
+      package is present in the dependency tree (AGENTS Ã‚Â§2).
 - [x] `2.7.3` Add `deploy/agent.yaml` with `runAsUser/Group: 10001`, `readOnlyRootFilesystem:
       `deploy/agent.yaml` carries UID/GID 10001, `readOnlyRootFilesystem: true`, `capabilities.drop:
       ["ALL"]`, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, a writable
@@ -542,22 +542,22 @@ resolving on linux/amd64, and the read-only-rootfs runtime.
 
 **All quality gates pass, and all 42 Milestone 2 checkboxes are now ticked and individually evidenced.**
 
-**Authoritative record: CI run `36519511237`, commit `f41a91f`, conclusion `success`** â€” all 13 Go
+**Authoritative record: CI run `36519511237`, commit `f41a91f`, conclusion `success`** Ã¢â‚¬â€ all 13 Go
 steps and all 15 Python steps green, including G3 `go test -race` (never waived, ARCH AD-10), the
 container build, and the runtime assertion that the effective uid is `10001` and `main:app` imports.
 
 | Gate | Result |
 |---|---|
-| G1 `go vet ./...` | âœ… exit 0 |
-| G2 `test -z "$(gofmt -l .)"` | âœ… clean |
-| G3 `go test -v -race -timeout 30s ./...` | âœ… green on CI |
-| G4 `black --check agent/` | âœ… exit 0 |
-| G5 `flake8 agent/` | âœ… exit 0 |
-| G6 `mypy --strict agent/` | âœ… no issues in 20 source files |
-| `pytest agent/tests/ -q` | âœ… **327 passed**, 0 failed |
-| Container build | âœ… green on `ubuntu-latest` |
-| Container runtime smoke | âœ… `main:app` imports; effective uid `10001` |
-| Terminal validation test | âœ… **318 passed** |
+| G1 `go vet ./...` | Ã¢Å“â€¦ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | Ã¢Å“â€¦ clean |
+| G3 `go test -v -race -timeout 30s ./...` | Ã¢Å“â€¦ green on CI |
+| G4 `black --check agent/` | Ã¢Å“â€¦ exit 0 |
+| G5 `flake8 agent/` | Ã¢Å“â€¦ exit 0 |
+| G6 `mypy --strict agent/` | Ã¢Å“â€¦ no issues in 20 source files |
+| `pytest agent/tests/ -q` | Ã¢Å“â€¦ **327 passed**, 0 failed |
+| Container build | Ã¢Å“â€¦ green on `ubuntu-latest` |
+| Container runtime smoke | Ã¢Å“â€¦ `main:app` imports; effective uid `10001` |
+| Terminal validation test | Ã¢Å“â€¦ **318 passed** |
 
 **Two places where the implementation is narrower than the checkbox, recorded so nobody has to
 rediscover them:**
@@ -570,16 +570,16 @@ rediscover them:**
    otherwise. The rlimits are exercised on CI's `ubuntu-latest`; on Windows they do not exist and the
    monotonic deadline plus the kill are the enforcement.
 2. **`2.5.5` is three layers, not two.** The positional round-trip and `git apply --check` that the
-   checkbox names, plus a YAML AST check, because AGENTS.md Â§1 and Â§3.3 require structural YAML
+   checkbox names, plus a YAML AST check, because AGENTS.md Ã‚Â§1 and Ã‚Â§3.3 require structural YAML
    validation and the positional check is not that. Each layer catches something the others cannot.
 
-**Bugs the tests caught while building this, all fixed** â€” recorded because each was invisible to the
+**Bugs the tests caught while building this, all fixed** Ã¢â‚¬â€ recorded because each was invisible to the
 layer that existed before it:
 
 - Every `- name:` sequence entry was read as a container name. Kubernetes manifests are full of those
   that are not containers (named ports, named volume mounts), so a realistic Deployment silently
   switched the target off and every Tier-1 patch against it failed to locate its target. It failed
-  closed â€” no wrong patch was ever emitted â€” but it escalated incidents that were cleanly remediable,
+  closed Ã¢â‚¬â€ no wrong patch was ever emitted Ã¢â‚¬â€ but it escalated incidents that were cleanly remediable,
   which is the other half of being wrong.
 - The first fix for that was itself wrong: gating the `- name:` test on `containers` being in scope,
   while `containers` was only recorded *after* a container had been found, made the guard
@@ -592,12 +592,12 @@ layer that existed before it:
 - `llm.reconcile` wrote `git_patch`/`risk_level` at the top level of `TriageResponse` when they live
   under `remediation`; the strict model rejected the document. Only a real validation surfaced it.
 - The `llm` error message quoted the offending output, which put model-echoed incident content into
-  logs verbatim â€” a disclosure bug in the safety path itself.
+  logs verbatim Ã¢â‚¬â€ a disclosure bug in the safety path itself.
 
 **A third host/CI divergence, same signature as the two before it.** G6 passed on the
 windows/arm64 development host and failed on `ubuntu-latest`, with no other signal. Cause:
 `os.setsid()  # type: ignore[attr-defined]` in `sandbox.py`. `setsid` is absent from typeshed on
-Windows and present on Linux, so the ignore was **used** locally and **dead** on CI â€” and
+Windows and present on Linux, so the ignore was **used** locally and **dead** on CI Ã¢â‚¬â€ and
 `setup.cfg` sets `warn_unused_ignores = True`. Fixed with `getattr(os, "setsid", None)`, which
 type-checks identically on both. `agent/tests/test_compat_platform.py` now fails the build if an
 ignore ever sits on a platform-sensitive line again, and it carries a negative control so the
@@ -608,37 +608,37 @@ the structural check catches what git forgives and git catches what a line diff 
 own tests asserted the opposite and failed; both are now corrected and one pins the tolerance
 deliberately.
 
-### â–¶ TERMINAL VALIDATION TEST â€” Milestone 2
+### Ã¢â€“Â¶ TERMINAL VALIDATION TEST Ã¢â‚¬â€ Milestone 2
 
 > **Command:** `pytest agent/tests/test_schemas.py agent/tests/test_triage.py agent/tests/test_ib2.py agent/tests/test_milestone2.py agent/tests/test_api.py -v`
 >
 > **Pass condition:** exit code `0`, asserting all of:
-> 1. `sample-incident.json` validates against `IncidentPayload`; every field in ARCH Â§4.1 is
+> 1. `sample-incident.json` validates against `IncidentPayload`; every field in ARCH Ã‚Â§4.1 is
 >    present with the specified nullability.
 > 2. The generated `git_patch` passes `git apply --check` against
 >    `tests/fixtures/oom-restartloop.yaml` (exit `0`), passes the YAML AST check, and
 >    increases `resources.limits.memory`.
-> 3. Freeform non-JSON model output raises a fatal error â€” no partial response is returned.
+> 3. Freeform non-JSON model output raises a fatal error Ã¢â‚¬â€ no partial response is returned.
 > 4. Tier-2 classification yields `git_patch == ""` and `patch_validated == false`.
 > 5. The sandbox tears down on timeout and leaks no state between investigations.
 > 6. No forbidden GPU dependency appears in `requirements.txt`.
 >
-> **Maps to:** PRD AC-3, ARCH Â§4/Â§5, invariants I-A2, I-B1, I-B2, I-B4, I-B5, I-B6.
+> **Maps to:** PRD AC-3, ARCH Ã‚Â§4/Ã‚Â§5, invariants I-A2, I-B1, I-B2, I-B4, I-B5, I-B6.
 >
-> **Done when:** all boxes in Milestone 2 are `[x]`, Â§2.8 is green, and this command exits `0`.
+> **Done when:** all boxes in Milestone 2 are `[x]`, Ã‚Â§2.8 is green, and this command exits `0`.
 
 ---
 
-## Milestone 3 â€” Go Sentinel Event Watcher
+## Milestone 3 Ã¢â‚¬â€ Go Sentinel Event Watcher
 
 **Goal:** read-only, defensive cluster observation producing contract-valid Incident Payloads
 within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/emitter`,
-`deploy/`. **Satisfies:** PRD G1, AC-1, AC-4; ARCH Â§3, Â§7, Â§8.
+`deploy/`. **Satisfies:** PRD G1, AC-1, AC-4; ARCH Ã‚Â§3, Ã‚Â§7, Ã‚Â§8.
 
 ### 3.1 Read-only client
 
 - [x] `3.1.1` Create `internal/k8s/client.go` using official `k8s.io/client-go`,
-      `k8s.io/api`, `k8s.io/apimachinery` (AGENTS Â§2).
+      `k8s.io/api`, `k8s.io/apimachinery` (AGENTS Ã‚Â§2).
 - [x] `3.1.2` Build the clientset from in-cluster config with an explicit, context-bounded
       `DefaultCallTimeout` (10s) is applied in one place, `BoundTimeout`, so the bound is uniform
       and greppable rather than restated per call site. **One honest limitation:**
@@ -647,7 +647,7 @@ within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/em
       calls, which is where `WaitForCacheSync` and the informer's List/Watch are stopped by the stop
       channel instead.
       timeout; no `context.Background()` on any blocking call.
-- [x] `3.1.3` Handle and log (safely) the in-cluster config failure path â€” no credential
+- [x] `3.1.3` Handle and log (safely) the in-cluster config failure path Ã¢â‚¬â€ no credential
       `SentinelConfigError` wraps the cause with a redacted `Reason`, and `RedactError` masks
       credential-shaped substrings before they reach a log. In-cluster config failures routinely carry
       a service-account token path, and a token path in a log is half a credential.
@@ -663,21 +663,21 @@ within the 2s budget. **Delivers:** `cmd/sentinel`, `internal/k8s`, `internal/em
 
 #### 3.1 status: COMPLETE
 
-**CI run `36521373896`, commit `e6a40d1`, conclusion `success`** â€” all 13 Go steps green, including
+**CI run `36521373896`, commit `e6a40d1`, conclusion `success`** Ã¢â‚¬â€ all 13 Go steps green, including
 G3 `go test -v -race -timeout 30s ./...`.
 
 | Gate | Result |
 |---|---|
-| G1 `go vet ./...` | âœ… exit 0 |
-| G1 `go vet -tags race ./...` | âœ… exit 0 |
-| G2 `test -z "$(gofmt -l .)"` | âœ… clean |
-| `go test -timeout 30s ./internal/k8s/...` | âœ… **28 tests**, package time 3.1s |
-| G3 `go test -race -timeout 30s ./...` | âœ… green on CI |
+| G1 `go vet ./...` | Ã¢Å“â€¦ exit 0 |
+| G1 `go vet -tags race ./...` | Ã¢Å“â€¦ exit 0 |
+| G2 `test -z "$(gofmt -l .)"` | Ã¢Å“â€¦ clean |
+| `go test -timeout 30s ./internal/k8s/...` | Ã¢Å“â€¦ **28 tests**, package time 3.1s |
+| G3 `go test -race -timeout 30s ./...` | Ã¢Å“â€¦ green on CI |
 
 **Dependency audit.** Three direct requires, all official, all `v0.31.0`: `k8s.io/api`,
 `k8s.io/apimachinery`, `k8s.io/client-go`. The *linked* package set (what actually compiles into the
 binary, as distinct from what `go list -m all` shows in the module graph) contains no logging
-framework, no ORM, no web framework and no APM â€” it is the upstream client-go closure. `internal/scrubber`
+framework, no ORM, no web framework and no APM Ã¢â‚¬â€ it is the upstream client-go closure. `internal/scrubber`
 still imports only `context`, `fmt`, `regexp`, `sort`, `strings`; the stdlib-only property survived the
 new module requirements.
 
@@ -685,16 +685,16 @@ new module requirements.
 
 1. **A deny-list of write verbs was the wrong instrument.** Reaching `Pods().Create()` needs four
    levels of return-type recursion, and at the depth where `Create` becomes visible it also matches
-   `Evictions`, `RoleBindings` and `ValidatingAdmissionPolicyBindings` â€” accessor names containing
+   `Evictions`, `RoleBindings` and `ValidatingAdmissionPolicyBindings` Ã¢â‚¬â€ accessor names containing
    "Evict" and "Bind". Replaced with an exact **allow-list** of eight observational methods: it cannot
    false-positive, and adding any unlisted method fails the build whatever it is called.
-2. **The negative control for that check was vacuous three times over** â€” an empty struct with no
+2. **The negative control for that check was vacuous three times over** Ã¢â‚¬â€ an empty struct with no
    methods, then a struct holding the clientset in a *field* rather than returning it from a method.
    Neither exposes a method, so the walk correctly found nothing and the test passed for the wrong
    reason. It is now a real leaky facade with a `Client()` method, plus a second control using an
    innocuous name (`Exec`) that a deny-list would miss.
 3. **The healthy-pod test asserted an absence after a fixed 2s sleep.** Slow when it passes, still
-   racy when it does not â€” it cannot distinguish "the handler saw nothing" from "the handler has not
+   racy when it does not Ã¢â‚¬â€ it cannot distinguish "the handler saw nothing" from "the handler has not
    run yet". It now waits for the informer's own store to hold the updated object, then asserts the
    channel is empty. 0.03s, and deterministic.
 
@@ -703,7 +703,7 @@ new module requirements.
 - `3.3.2` asks for `internal/k8s/classify.go`. Classification is implemented but lives in
   `watcher.go` beside the filter that calls it, since the filter *is* the classifier and splitting them
   would separate a rule from the evidence it reads. Left unticked rather than ticked for a file that
-  does not exist â€” worth ratifying either way.
+  does not exist Ã¢â‚¬â€ worth ratifying either way.
 - `3.3.4` (event joining by `involvedObject.uid`) and `3.3.5` (SIGINT/SIGTERM wiring) are out of this
   task's scope. `Run(stop)` already closes the egress channel so a consumer ranging over it
   terminates; the signal wiring belongs with `cmd/sentinel`, which does not exist yet.
@@ -714,12 +714,12 @@ new module requirements.
       `guard.go` holds every nil-safe accessor: `TerminationOf`, `WaitingOf`, `LastTerminationOf`,
       `RunningOf`, `RestartCount`, `StatusForContainer`, `StatusesForSpec`, `PodPhase`,
       `MemoryLimitBytes`, `MemoryLimitForContainer`, `QuantityOrZero`.
-      AGENTS Â§3.1: `State.Terminated`, `State.Waiting`, `State.LastTerminationState`,
+      AGENTS Ã‚Â§3.1: `State.Terminated`, `State.Waiting`, `State.LastTerminationState`,
       `Resources.Limits`, `Resources.Requests`, `ContainerStatuses[i]`.
 - [x] `3.2.2` Check **every** preceding level in the pointer chain, not just the first hop.
 - [x] `3.2.3` Enforce that raw chained access outside `guard.go` is forbidden; add a lint/test
       note and a reviewer checklist entry.
-- [x] `3.2.4` `TestNilPointerSafety` â€” feed synthetic `Pod` objects with nil `ContainerStatuses`,
+- [x] `3.2.4` `TestNilPointerSafety` Ã¢â‚¬â€ feed synthetic `Pod` objects with nil `ContainerStatuses`,
       `TestClassifyNilHeavyPodTreesDoNotPanic` walks eight malformed shapes (nil status tree, nil
       State, Terminated and Waiting both nil, name mismatch, no spec containers, nil Resources, empty
       name) and calls every accessor on each. `TestGuardAccessorsAreNilSafe` covers nil arguments.
@@ -803,11 +803,11 @@ new module requirements.
 
 ### 3.4 Egress and scrubbing integration
 
-- [x] `3.4.1` Create `internal/emitter/payload.go` with wire types matching ARCH Â§4 **exactly**.
+- [x] `3.4.1` Create `internal/emitter/payload.go` with wire types matching ARCH Ã‚Â§4 **exactly**.
       Flat, no invented wrappers, field names transcribed from `agent/models.py`. `omitempty`
       appears **nowhere**: every nullable field is emitted as an explicit `null`, because
       `extra: "forbid"` plus per-field defaults makes "omitted" and "null" different inputs, and
-      ARCH Â§4.1 requires null - a Go guard-chain miss must not read as an absent key.
+      ARCH Ã‚Â§4.1 requires null - a Go guard-chain miss must not read as an absent key.
       `ResourceLimits` fields are `*string`/`*int64` for the same reason: a bare `string` cannot
       distinguish "undeclared" from "declared empty" without either `omitempty` (collapses both)
       or `""` (rejected by `min_length: 1`).
@@ -845,7 +845,7 @@ new module requirements.
       values.
       `RedactionReport` has exactly two fields - `total_redactions` and `rules_triggered` - so the
       reporting channel has **no slot** that could hold a masked value. That is the structural form
-      of ARCH Â§6 M4, and it is checked structurally in Python
+      of ARCH Ã‚Â§6 M4, and it is checked structurally in Python
       (`test_redaction_report_carries_counts_only` asserts the field *set*, which a
       scan-for-secrets test would pass just as happily against a model that gained a third field).
       `[]scrubber.RuleID` is **copied and stringified**, not aliased, so a caller mutating the
@@ -870,7 +870,7 @@ new module requirements.
       error accounting applies unchanged. The backoff sleep is a timer `select`-ed on
       `ctx.Done()`, never a bare `time.Sleep` - a bare sleep keeps a worker alive past its
       cancellation, which is the leak `3.5.4` tests for.
-- [x] `3.4.5` Assert no raw secret can reach the HTTP request body â€” a test scans the
+- [x] `3.4.5` Assert no raw secret can reach the HTTP request body Ã¢â‚¬â€ a test scans the
       marshalled body against the fixture corpus.
       Scanned against `tests/fixtures/incident_corpus.json` - the ratified reference - not a
       hand-picked secret, so the guarantee is tied to the same fixture that defines what a secret
@@ -915,7 +915,7 @@ new module requirements.
         observable. This is the opposite of 3.5.2's rule and the two are reconciled deliberately:
         the rule forbids *unconditional blocking* sends, and a `select` with a `default` is the
         strongest form of that.
-- [x] `3.5.2` All channel sends are `select`ed against `ctx.Done()` â€” never an unconditional
+- [x] `3.5.2` All channel sends are `select`ed against `ctx.Done()` Ã¢â‚¬â€ never an unconditional
       blocking send.
       Two sends and two receives exist in production code, and each is bounded differently for a
       stated reason:
@@ -991,7 +991,7 @@ new module requirements.
       watches nothing and reports nothing - silent.
       No `ClusterRole`, no `ClusterRoleBinding`: a namespaced Role bound cluster-wide would pass
       every verb check while granting read access to every namespace.
-- [x] `3.6.3` Create `deploy/sentinel.yaml` with the full ARCH Â§8 hardening block
+- [x] `3.6.3` Create `deploy/sentinel.yaml` with the full ARCH Ã‚Â§8 hardening block
       (`runAsUser/Group: 10001`, `readOnlyRootFilesystem: true`, `cap_drop: ["ALL"]`,
       `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, `emptyDir` at
       `/tmp` only).
@@ -1008,7 +1008,7 @@ new module requirements.
       packet" is enforceable in a NetworkPolicy in a way it is not in code. Ingress is `[]`, so the
       default deny applies.
 - [x] `3.6.4` Write a test that **parses** the deploy YAML and asserts every hardening field
-      and the absence of any mutating RBAC verb (AC-4, and PRD Â§3.2).
+      and the absence of any mutating RBAC verb (AC-4, and PRD Ã‚Â§3.2).
       **It parses.** A grep for `readOnlyRootFilesystem: true` is satisfied by a comment, a value
       in an unrelated document, and a string in a ConfigMap. Two implementations, and the
       duplication is deliberate: `internal/deploy/*_test.go` (structural, with `gopkg.in/yaml.v3`)
@@ -1039,9 +1039,9 @@ new module requirements.
       giving it none means it cannot write to the cluster even if a future bug tried.
       The Sentinel *does* get one - it is the watcher - bound to `get`/`list`/`watch` by 3.6.2.
 - [ ] `3.6.6` Document the offline-import path: `k3s ctr images import` into the internal
-      containerd namespace (AGENTS Â§2).
+      containerd namespace (AGENTS Ã‚Â§2).
       **Deliberately unticked.** The content is written and the reasoning is settled, but it cannot
-      be verified here: this host has no k3s, no containerd, and no images built, and AGENTS Â§5.4
+      be verified here: this host has no k3s, no containerd, and no images built, and AGENTS Ã‚Â§5.4
       requires a gate be reported as a **blocked dependency** rather than checked on an
       unverified assumption. Draft is in `docs/offline-install.md`; the ROADMAP box stays open until
       the command is run against a real k3s node and its output pasted here.
@@ -1053,7 +1053,7 @@ new module requirements.
 
 - [x] `3.7.1` `go vet ./...` exits `0`.
       Run locally, exit `0`. Also run as `go vet -tags race ./...` (exit `0`), which typechecks
-      the `-race` build variant that G1 does not see â€” the shape where a `!race`-tagged helper is
+      the `-race` build variant that G1 does not see Ã¢â‚¬â€ the shape where a `!race`-tagged helper is
       undefined under `-race` and G3 fails to compile while G1 passes.
 
 - [x] `3.7.2` `test -z "$(gofmt -l .)"` exits `0`.
@@ -1064,7 +1064,7 @@ new module requirements.
       goroutine-leak tests.
       **GREEN ON UBUNTU, `2026-09-29`.** CI run `36639115541` (`e2e-detonation`, step 6
       "M3 authority gate - go test -race") and run `36639115526` (`ci`, `go-gates` G3) both
-      concluded `success` on commit `8451366`. That is the authority AGENTS Â§5.4 and ARCH AD-10
+      concluded `success` on commit `8451366`. That is the authority AGENTS Ã‚Â§5.4 and ARCH AD-10
       require: the race detector has no ThreadSanitizer for `windows/arm64`, so this gate was
       never runnable on the development host and was left unticked for two milestones rather
       than ticked on an assumption.
@@ -1085,7 +1085,7 @@ new module requirements.
       now a Crockford base32 ULID, which `agent/models.py` already required and the Go side did
       not previously satisfy.
 
-### â–¶ TERMINAL VALIDATION TEST â€” Milestone 3
+### Ã¢â€“Â¶ TERMINAL VALIDATION TEST Ã¢â‚¬â€ Milestone 3
 
 > **Command:** `go test -race -timeout 30s -run 'TestNilPointerSafety|TestNoGoroutineLeak|TestIncidentPayloadContract' -v ./...`
 >
@@ -1093,20 +1093,20 @@ new module requirements.
 > 1. No panic and no race on nil-`State` / nil-`Terminated` / nil-`Waiting` / nil-`Limits`
 >    synthetic pods.
 > 2. Goroutine count returns to baseline after cancellation.
-> 3. An emitted payload carries every mandatory ARCH Â§4 field, is schema-valid, and its
+> 3. An emitted payload carries every mandatory ARCH Ã‚Â§4 field, is schema-valid, and its
 >    scrubbed strings contain zero fixture-corpus plaintexts.
 > 4. The parsed `deploy/rbac.yaml` contains **no** mutating verb and `deploy/sentinel.yaml`
->    satisfies every ARCH Â§8 hardening assertion.
+>    satisfies every ARCH Ã‚Â§8 hardening assertion.
 > 5. `detection_latency_ms <= 2000` on the synthetic OOM corpus.
 >
-> **Maps to:** PRD AC-1, AC-4, ARCH Â§7/Â§8, invariants I-A1, I-A2, I-A4.
+> **Maps to:** PRD AC-1, AC-4, ARCH Ã‚Â§7/Ã‚Â§8, invariants I-A1, I-A2, I-A4.
 >
-> **Done when:** all boxes in Milestone 3 are `[x]`, Â§3.7 is green, and this command exits `0`.
+> **Done when:** all boxes in Milestone 3 are `[x]`, Ã‚Â§3.7 is green, and this command exits `0`.
 >
-> ### â–¶ Status: NOT COMPLETE - one box open
+> ### Ã¢â€“Â¶ Status: NOT COMPLETE - one box open
 >
 > **33 of 34 boxes are `[x]`.** The one that is not is open for a reason that is not "still to
-> do" but "cannot be honestly closed from this host", and AGENTS Â§5.4 forbids closing it on an
+> do" but "cannot be honestly closed from this host", and AGENTS Ã‚Â§5.4 forbids closing it on an
 > unverified assumption.
 >
 > - **`3.7.3` is now CLOSED.** `go test -race` ran green on `ubuntu-latest` in CI runs
@@ -1141,9 +1141,9 @@ new module requirements.
 
 ---
 
-## Milestone 4 â€” End-to-End Synthetic Chaos Validation
+## Milestone 4 Ã¢â‚¬â€ End-to-End Synthetic Chaos Validation
 
-**Goal:** prove the whole chain against a real k3s cluster â€” bad pod in, clean RCA and valid
+**Goal:** prove the whole chain against a real k3s cluster Ã¢â‚¬â€ bad pod in, clean RCA and valid
 git diff out, no cluster mutation. **Delivers:** `deploy/chaos/`, `tests/e2e/`,
 verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
@@ -1235,7 +1235,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       `failure` conclusion as an error, so an unbounded wait is indistinguishable
       from a failure without logs.
 - [x] `4.2.3` Record `detection_latency_ms` for every injected `OOMKilled`; assert
-      **p99 â‰¤ 2000 ms** and `detections == injected_events` (AC-1).
+      **p99 Ã¢â€°Â¤ 2000 ms** and `detections == injected_events` (AC-1).
       **Proven by run `36777783585`** (sha `776e8ff`): p99 detection latency
       **29 ms** over 7 incidents against a 2000 ms budget, with **4 OOMKilled
       detections for 4 observed OOM restarts at `[0, 1, 2, 3]`** - the equality
@@ -1266,7 +1266,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       with real git and YAML-parsed**, generated by live cluster incidents rather
       than a fixture. This is what the earlier note said was unreachable: the
       GitOps checkout is now wired into the detonation workflow and the target
-      manifest is selected through `SREK3S_TARGET_MANIFEST`, so ARCH Â§5.4 I-B2 no
+      manifest is selected through `SREK3S_TARGET_MANIFEST`, so ARCH Ã‚Â§5.4 I-B2 no
       longer forces every incident to TIER_2.
 - [x] `4.2.7` For each Tier-2 incident, assert `git_patch == ""` and that a War-Room dispatch
       was emitted.
@@ -1300,25 +1300,25 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 ### 4.3 Post-remediation health verification loop
 
 - [x] `4.3.1` Create `agent/verify.py` implementing the `verification_policy` evaluation
-      (ARCH Â§5.2) against a bounded `watch_duration_seconds`.
+      (ARCH Ã‚Â§5.2) against a bounded `watch_duration_seconds`.
       **Ratified on the existing implementation** (commit `a28bf48`, 741 lines,
       architect-ratified). The window is bounded **twice over**: by a monotonic
       `time.perf_counter` deadline so the window means `watch_duration_seconds`
       rather than `polls x interval`, and by a fixed iteration count so
-      termination is unconditional â€” a frozen or stepped clock cannot extend it.
-      AGENTS.md Â§3 rule 5 forbids a wall clock here for the same reason.
-- [x] `4.3.2` Emit the three verdicts: `Verified`, `Unresolved` (recurrence â‡’
+      termination is unconditional Ã¢â‚¬â€ a frozen or stepped clock cannot extend it.
+      AGENTS.md Ã‚Â§3 rule 5 forbids a wall clock here for the same reason.
+- [x] `4.3.2` Emit the three verdicts: `Verified`, `Unresolved` (recurrence Ã¢â€¡â€™
       `PROMOTE_TO_TIER_2`), `Indeterminate` (`REQUEUE_BOUNDED`).
       **Proven by 60 tests** across `agent/tests/test_verify.py` (54) and
       `test_verify_wiring_controls.py` (6). `action` is a **derived property**,
       read from the policy embedded in the verdict through one
-      kind-to-field table â€” not a stored string and not one of three hardcoded
+      kind-to-field table Ã¢â‚¬â€ not a stored string and not one of three hardcoded
       literals. There is therefore no input through which a caller can put
       `PROMOTE_TO_TIER_2` on a `VERIFIED` verdict, which is what makes the
       guarantee structural rather than a review convention. `VerifiedVerdict`
       additionally refuses construction without an observation, so a closure
       verdict cannot be fabricated.
-- [x] `4.3.3` Enforce `max_requeue_attempts` â€” no infinite requeue loop.
+- [x] `4.3.3` Enforce `max_requeue_attempts` Ã¢â‚¬â€ no infinite requeue loop.
       **Proven by 17 tests** (`TestRequeueChainTerminates` 12,
       `TestRequeueBudgetArithmetic` 5). The bound is a value the module owns, not
       a counter in the caller's hands: `RequeueBudget` exposes no setter and no
@@ -1336,7 +1336,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       `test_reinjecting_the_fault_promotes_to_tier2 PASSED`, 41 passed in 83s. The
       Verified path applied a real unified diff with real `git apply`, synced the
       workload, and observed a container holding uptime above
-      `container_uptime_seconds_min` with zero OOM kills â€” returning `VERIFIED`
+      `container_uptime_seconds_min` with zero OOM kills Ã¢â‚¬â€ returning `VERIFIED`
       routing to `CLOSE_INCIDENT`. The Unresolved path reverted the limit and
       observed a real OOM recurrence, returning `UNRESOLVED` with cause
       `OOM_KILLED` routing to `PROMOTE_TO_TIER_2`.
@@ -1352,7 +1352,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
       **It took five runs to get here, and the failures were the point.** Run
       `36785083401` failed on a `producer | grep -q` SIGPIPE race in the step's own
-      preflight â€” Â§6's defect, reintroduced in the milestone quoting it. Run
+      preflight Ã¢â‚¬â€ Ã‚Â§6's defect, reintroduced in the milestone quoting it. Run
       `36785803765` rendered the namespace manifest with `--dry-run=client` and
       never applied it, so the "create" created nothing while exiting 0. Run
       `36786601947` sized the fixture on the *payload* when the quantity that must
@@ -1363,7 +1363,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       caught only by the live cluster, which is the argument for having run this
       live rather than declaring the box on the strength of 39 green offline
       tests.
-- [x] `4.3.5` Assert the loop observes only â€” it performs no write of its own.
+- [x] `4.3.5` Assert the loop observes only Ã¢â‚¬â€ it performs no write of its own.
       **Proven twice, statically and at runtime.** `TestZeroWrites` (5 tests)
       introspects the module's AST: no import that could reach a cluster, and no
       mutating verb in any call-target or attribute position. `TestRuntimeTripwire`
@@ -1374,7 +1374,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       `/healthz`. **Negative-controlled:** planting `import socket` fails the
       guard, and planting a real `client.create(...)` call fails it. Two earlier
       control attempts were invalid and are recorded in `docs/lessons-learned.md`
-      Â§1's spirit â€” a dead `def apply_patch` is invisible to a check that only
+      Ã‚Â§1's spirit Ã¢â‚¬â€ a dead `def apply_patch` is invisible to a check that only
       sees call targets, and an uninstalled module produces a collection error
       rather than a guard trip.
 
@@ -1396,7 +1396,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       **start line** is normalised to `<START>`, because it moves whenever an
       unrelated comment is edited above the limit, which says nothing about
       whether the patch is right. The hunk's **line count** is compared exactly,
-      as is every context line, the removed line and the added line â€” so a patch
+      as is every context line, the removed line and the added line Ã¢â‚¬â€ so a patch
       that grew, lost context, or changed a different key all fail. Three
       further assertions state what the patch is *for* independently of the byte
       comparison: exactly one removed line, exactly one added line, exactly one
@@ -1405,7 +1405,7 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 - [x] `4.4.3` Add a golden RCA with an assertion on required sections, so RCA regressions are
       caught without brittle full-text equality.
       **Structural, never textual.** `test_generated_rca_structure` asserts the
-      generator's actual headings (`# RCA:` is h1 â€” there is no `## RCA:`, and no
+      generator's actual headings (`# RCA:` is h1 Ã¢â‚¬â€ there is no `## RCA:`, and no
       `**Root cause:**` field; the root-cause statement is the `## Summary`
       paragraph) and asserts the *absence* of both wrong shapes, because a
       maintainer writing a golden by hand reaches for exactly those two. Evidence
@@ -1421,14 +1421,14 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       output.** CI run `36786601947` proved that `$(head -c N /dev/zero | tr ...)`
       buffers the whole result before assignment, so a 90 MiB payload peaked above
       128 MiB and the container was OOMKilled under a 128Mi limit. Contract A
-      carries `exit_code`, `resource_limits` and `restart_count` â€” **no peak RSS** â€”
+      carries `exit_code`, `resource_limits` and `restart_count` Ã¢â‚¬â€ **no peak RSS** Ã¢â‚¬â€
       so an RCA asserting the peak would state something the telemetry does not
       contain. That is the error `emitter.mapReason` refuses to make when it
       declines to map an unmappable kind. The lesson therefore lives below a `---`
       separator as annotation, and both halves are enforced: present in the
       annotation, **absent from the agent's output**.
 - [x] `4.4.4` Ensure every golden file itself contains zero plaintext secrets.
-      **Both goldens scanned against `tests/fixtures/incident_corpus.json`** â€” the
+      **Both goldens scanned against `tests/fixtures/incident_corpus.json`** Ã¢â‚¬â€ the
       corpus the Go scrubber tests and the E2E masking assertions already consume,
       so this joins an existing guarantee rather than creating a parallel one. (The
       ROADMAP text names `secrets_corpus.txt`; no such file exists, and inventing
@@ -1436,9 +1436,9 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       The scan asserts the corpus yielded secrets first, so it cannot pass on an
       empty result set; `test_the_scan_is_against_the_corpus_and_not_a_decoration`
       plants a real corpus secret and requires it to be reported. Negative-control
-      fragments are checked separately â€” finding one means the golden was assembled
+      fragments are checked separately Ã¢â‚¬â€ finding one means the golden was assembled
       from a scrubber fixture rather than from real output. Absolute paths are
-      also rejected, per ARCH Â§2.5.4.
+      also rejected, per ARCH Ã‚Â§2.5.4.
 
 ### 4.5 Documentation and final gates
 
@@ -1521,58 +1521,166 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
       The `-race` authority for `4.5.5` is CI step 9 `G3 - go test -race`, green
       on this same commit.
 
-### â–¶ TERMINAL VALIDATION TEST â€” Milestone 4
+### Ã¢â€“Â¶ TERMINAL VALIDATION TEST Ã¢â‚¬â€ Milestone 4
 
 > **Command:** `./tests/e2e/run.sh` (requires a running single-node k3s), followed by
 > `pytest tests/e2e/test_acceptance.py -v`.
 >
 > **Pass condition:** exit code `0` across the whole chain, asserting all of:
 > 1. Bad pods deployed to k3s produce detected incidents with **p99 detection latency
->    â‰¤ 2000 ms** and a 1:1 injection-to-detection ratio.
+>    Ã¢â€°Â¤ 2000 ms** and a 1:1 injection-to-detection ratio.
 > 2. Every emitted RCA is clean, schema-valid, non-empty, and evidence-grounded.
 > 3. Every Tier-1 `git_patch` passes `git apply --check`, applies, and parses; the resulting
 >    manifest change matches the stated root cause.
 > 4. Every Tier-2 incident yields `git_patch == ""` and a War-Room dispatch.
-> 5. **Zero** plaintext credentials appear in any payload, log, or golden file â€” end-to-end.
+> 5. **Zero** plaintext credentials appear in any payload, log, or golden file Ã¢â‚¬â€ end-to-end.
 > 6. **Zero** cluster mutations by the Sentinel: object generations before and after are
 >    identical outside the chaos namespace.
 > 7. The post-remediation loop returns `Verified` for a good fix and promotes to Tier-2 for a
 >    repeated fault.
 > 8. Both containers report `id -u` = `10001` with a read-only root filesystem.
 >
-> **Maps to:** PRD F4 and **all four** acceptance criteria; ARCH Â§3/Â§4/Â§5/Â§8.
+> **Maps to:** PRD F4 and **all four** acceptance criteria; ARCH Ã‚Â§3/Ã‚Â§4/Ã‚Â§5/Ã‚Â§8.
 >
-> **Done when:** all boxes in Milestone 4 are `[x]`, Â§4.5 is green, and this command exits `0`.
+> **Done when:** all boxes in Milestone 4 are `[x]`, Ã‚Â§4.5 is green, and this command exits `0`.
 
 ---
 
 ## Milestone Dependency Summary
 
 ```
-M1 Scrubber  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º M2 Agent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º M3 Watcher â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º M4 E2E Chaos
-     â”‚                          â”‚                        â”‚                          â”‚
-  AC-2 masking            AC-3 diff validity       AC-1 â‰¤2s detection        All four ACs
-  ARCH Â§6                 ARCH Â§4/Â§5               AC-4 non-root            proven E2E
+M1 Scrubber  Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº M2 Agent Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº M3 Watcher Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€“Âº M4 E2E Chaos
+     Ã¢â€â€š                          Ã¢â€â€š                        Ã¢â€â€š                          Ã¢â€â€š
+  AC-2 masking            AC-3 diff validity       AC-1 Ã¢â€°Â¤2s detection        All four ACs
+  ARCH Ã‚Â§6                 ARCH Ã‚Â§4/Ã‚Â§5               AC-4 non-root            proven E2E
                           F2 sandbox, F3 tiers     read-only RBAC           F4 verify loop
 ```
 
 | Milestone | Deliverable | Primary criteria | Terminal test |
 |---|---|---|---|
-| 1 | `internal/scrubber` | AC-2 | M1 Â§â–¶ |
-| 2 | `agent/` | AC-3 | M2 Â§â–¶ |
-| 3 | `cmd/sentinel`, `internal/k8s`, `internal/emitter`, `deploy/` | AC-1, AC-4 | M3 Â§â–¶ |
-| 4 | `deploy/chaos/`, `tests/e2e/`, `agent/verify.py` | AC-1â€¦AC-4 | M4 Â§â–¶ |
+| 1 | `internal/scrubber` | AC-2 | M1 Ã‚Â§Ã¢â€“Â¶ |
+| 2 | `agent/` | AC-3 | M2 Ã‚Â§Ã¢â€“Â¶ |
+| 3 | `cmd/sentinel`, `internal/k8s`, `internal/emitter`, `deploy/` | AC-1, AC-4 | M3 Ã‚Â§Ã¢â€“Â¶ |
+| 4 | `deploy/chaos/`, `tests/e2e/`, `agent/verify.py` | AC-1Ã¢â‚¬Â¦AC-4 | M4 Ã‚Â§Ã¢â€“Â¶ |
 
 ---
 
-## Definition of Done (project)
-
-The MVP is complete when:
-
 - [ ] All four milestones are `[x]` with green terminal validation tests.
-- [ ] All four global quality gates exit `0`.
-- [ ] PRD AC-1 (â‰¤2s p99), AC-2 (100% masking), AC-3 (valid diff), AC-4 (non-root) each have
+      **NOT MET — and not closeable by documentation.** Two problems, both
+      found while verifying this checklist rather than after it.
+
+      **Milestone 3 box `3.6.6` is deliberately open** and must stay open. It
+      documents the offline-import path in `docs/offline-install.md`, and the box
+      was left unticked because the documented command has never been run. That
+      reasoning still holds, and checking it was worthwhile: the CI detonation
+      workflow *does* exercise real k3s containerd, but by a **different
+      mechanism**. The workflow runs `ctr images pull` from `mirror.gcr.io`
+      followed by `ctr images tag` (`e2e-detonation.yaml` L353-355).
+      `docs/offline-install.md` documents `k3s ctr images import <tarball>`.
+      Both put an image into the `k8s.io` namespace and both prove the namespace
+      mechanics; neither proves the import-a-tarball path, which is the entire
+      subject of the box. Closing it needs that command run against a real node
+      and its output pasted here.
+
+      **Milestone 1 box `1.4.1` is ticked for a file that has never existed.**
+      It reads `Create tests/fixtures/secrets_corpus.txt` and is marked `[x]`.
+      That file is not on disk and has no deletion commit in the history, so it
+      was never created. The corpus the tests actually read is
+      `tests/fixtures/incident_corpus.json` (8 groups, 32 maskable cases). Boxes
+      1.4.2 through 1.4.5 are green against *that* file, which is why the defect
+      is invisible to the gates: every test passes while the box names a
+      different one. `1.4.1` should be re-pointed at `incident_corpus.json` and
+      its text corrected. Per AGENTS.md §5.1 — "If code and spec disagree, stop
+      and raise the discrepancy" — this is raised here rather than silently
+      amended.
+- [x] All four global quality gates exit `0`.
+      **MET, and the count in this checklist is stale.** There are **six** gates,
+      not four: G1 `go vet ./...`, G2 `test -z "$(gofmt -l .)"`, G3 `go test
+      -race -timeout 30s ./...`, G4 `black --check agent/`, G5 `flake8 agent/`,
+      G6 `mypy --strict agent/`. All six green on sha `a611d71` — CI run
+      `36795230970`, both jobs success, including step 9 `G3 — go test -race`.
+      `audit_workflow.py` also exits `0` with no findings.
+- [x] PRD AC-1 (Â«Â£Â§2s p99), AC-2 (100% masking), AC-3 (valid diff), AC-4 (non-root) each have
       recorded evidence.
-- [ ] The Sentinel holds **no** mutating RBAC verb, verified by a test that parses the manifests.
-- [ ] No configuration, flag, or code path can enable a direct cluster write.
+      **Recorded in box `4.5.7`**, all four on sha `a611d71`. AC-1: p99 **23ms**
+      against a 2000ms budget, 4 OOMKilled detections for 4 observed restarts at
+      `[0, 1, 2, 3]`. AC-2: E2E step 31 `No planted secret survived scrubbing`
+      passes and the corpus gate reports 32 secrets scanned, 0 leaks. AC-3: 4
+      Tier-1 patches applied with real git and YAML-parsed. AC-4: CI step 12
+      `Container runtime smoke (entrypoint resolves, runs as UID 10001)`.
+      **One caveat carried forward, recorded here because it bears on AC-2:** the
+      evidence comes from `incident_corpus.json`. See the `1.4.1` note above — the
+      file this checklist and `ARCHITECTURE.md` both name as the AC-2 corpus does
+      not exist.
+- [x] The Sentinel holds **no** mutating RBAC verb, verified by a test that parses the manifests.
+      **MET.** `TestSentinelRoleGrantsNoMutatingVerb` in
+      `internal/deploy/rbac_hardening_test.go` parses `deploy/rbac.yaml` and fails
+      the build on any verb beyond `get`/`list`/`watch`. Green in the
+      `internal/deploy` package on `a611d71`. The verbs are enumerated rather than
+      wildcarded, which is the control: a wildcard would cover future write verbs
+      by accident. Sibling tests assert no cluster-scoped binding widens the
+      Sentinel and that the agent automounts no ServiceAccount token.
+      *Naming note:* `deploy/rbac.yaml`'s comment cited a test called
+      `TestSentinelHasNoMutatingVerbs`, which does not exist. Corrected to the
+      real name in commit `a611d71`. A `-run` filter naming a test that does not
+      exist exits `0` with `[no tests to run]`, so the wrong name in a comment is
+      not harmless — it reads as evidence.
+- [x] No configuration, flag, or code path can enable a direct cluster write.
+      **MET, at three independent layers**, documented in `docs/runbook.md` §5.
+      Layer 1: the Sentinel's Role enumerates `["get","list","watch"]` and no
+      other verb — enforced by the test above. Layer 2: the agent holds **no
+      cluster credential at all**, and `agent/verify.py` holds a single
+      `ObservationReader.read` with no Kubernetes client, subprocess, socket or
+      filesystem access — enforced by `TestZeroWrites` (AST) and
+      `TestRuntimeTripwire` (live `sys.addaudithook`). Layer 3: the schema cannot
+      express a write — **I-B1** (Tier-2 implies `git_patch == ""`),
+      **I-B4** (freeform output is a fatal validation failure), **I-B5** (no
+      field can express a write verb), all in `agent/models.py`.
+      Verified by search on `a611d71`: no `autofix`, `allow_write`, `dry_run=False`
+      or equivalent exists in `agent/` or `internal/`, and `agent/` imports no
+      Kubernetes client and no HTTP library. There is no flag to enable, because
+      the capability does not exist to be enabled.
 - [ ] `ARCHITECTURE.md` matches the implemented schemas and layout exactly.
+      **NOT MET.** The **schemas** are in parity: every field of `IncidentPayload`
+      and `TriageResponse` in `agent/models.py` appears in the document, checked
+      programmatically rather than by reading. The **layout** is not.
+
+      `ARCHITECTURE.md:133` declares, in the §3 layout tree:
+
+          tests/
+            fixtures/
+              secrets_corpus.txt        # AC-2 masking corpus (one sample per rule)
+
+      **That file does not exist**, and never has. Every other path named in the
+      tree is present: `agent/pyproject.toml`, `agent/requirements.txt`, the five
+      `deploy/` manifests, both `deploy/chaos/` fixtures, `sample-incident.json`,
+      `oom-restartloop.yaml`, and `expected/oom-expected.patch`. The real corpus
+      is `tests/fixtures/incident_corpus.json`.
+
+      The same wrong path appears at **`ARCHITECTURE.md:476`**, where invariant
+      **I-A1** is defined as "no value under `scrubbed_logs` or
+      `cluster_events[].message` contains any plaintext secret from
+      `tests/fixtures/secrets_corpus.txt`". A CI-asserted invariant in the single
+      source of truth points at a file that does not exist. The tests that
+      satisfy I-A1 read `incident_corpus.json`, so the invariant is *satisfied in
+      substance* and *wrong in its citation* — which is the worst combination,
+      because the gate that would catch it is the gate that passes.
+
+      Third instance, already recorded in box `4.4.4`: the ROADMAP text for that
+      box also names `secrets_corpus.txt`. Three documents, one phantom path.
+
+      **Fix, not applied here.** Correct all three citations to
+      `tests/fixtures/incident_corpus.json`, which is the corpus the Go scrubber
+      tests, the E2E masking assertions and the golden-file secret scan all
+      actually read. Creating a new `secrets_corpus.txt` was rejected: it would
+      create a second, competing answer to "what counts as a secret", which is
+      precisely what box `4.4.4` refused to do. AGENTS.md §5.1 requires raising a
+      code/spec discrepancy rather than amending it unilaterally, so this is
+      raised. **Until it is corrected, `ARCHITECTURE.md` is not a trustworthy
+      single source of truth for I-A1**, and that is worth fixing before any
+      post-MVP work builds on it.
+
+      Minor, same section: `expected/oom-expected-rca.md` is on disk (added in
+      Milestone 4.4) but unnamed in the tree, which says only
+      `oom-expected.patch` under a `expected/` heading described as "golden
+      outputs (RCA + diff)".
