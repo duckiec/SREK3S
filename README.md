@@ -5,7 +5,7 @@ analysis, and — when the cause is unambiguous and the fix is a one-line resour
 change — emits a verified unified `git diff` for a human to merge. It never
 writes to the cluster. That is enforced by the cluster, not by convention.
 
-**Status:** MVP sealed — 727 Python tests + 178 Go test functions green, all CI
+**Status:** MVP sealed — 749 Python tests + 178 Go test functions green, all CI
 gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
 [`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
 along the way, including the ones a passing gate failed to catch.
@@ -63,7 +63,7 @@ None of this needs a cluster.
 
 ```bash
 go test ./...                     # Go units. Add -race; CI-only where TSan is absent.
-pytest agent/tests/ -q            # 727 passed, 2 skipped
+pytest agent/tests/ -q            # 749 passed, 2 skipped
 black --check agent/ tests/
 flake8 agent/ tests/
 mypy --strict agent/ tests/
@@ -409,13 +409,26 @@ structured so the interesting paths are the offline ones.
 | Golden fixtures | Byte-identical diff and RCA output | No |
 | Offline `git apply` | Real `git apply --check` in a scratch repo | No |
 | E2E detonation | Informer → scrub → egress → classify → patch → verify | Yes (k3s) |
+| E2E in-cluster | `deploy/` applies; Service DNS, RBAC, hardening, live | Yes (k3s) |
 
-The E2E workflow installs k3s, plants a memory leak, and asserts the entire
+The E2E detonation workflow installs k3s, plants a memory leak, and asserts the entire
 chain — including that a planted secret did not survive scrubbing, that
 scrubbing *did* mask something, and that masking preserved diagnostic evidence.
 "Masked everything" and "masked nothing" are both failures, and both are asserted.
 
-Two of the 727 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+The **in-cluster leg** exists because the detonation leg runs the Sentinel, the
+agent and the capture proxy as host processes on loopback, and applies nothing
+from `deploy/`. The Service, both NetworkPolicies, the Role and the container
+hardening were therefore never executed by any job. The in-cluster leg applies
+`deploy/` through `tests/e2e/fixtures/incluster/`, then asserts that the Service
+publishes ready endpoints, that cluster DNS resolves `srek3s-agent` and the agent
+answers `/healthz`, that the Sentinel's real ServiceAccount is granted reads and
+refused writes by a live apiserver, and that the running agent pod is UID 10001
+with a read-only root and no mounted token. It does not detonate anything; that
+chain is the detonation leg's job, and duplicating it would re-prove a layer that
+is not in question to cover one that is.
+
+Two of the 749 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. `go test -race` and the container build are
 likewise CI-only on hosts without ThreadSanitizer or a Docker daemon; this is
 reported as blocked rather than checked off.

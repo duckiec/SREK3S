@@ -68,10 +68,17 @@ _INDENT: Final[int] = 4
 #: The root line names the repository itself rather than a path within it.
 _ROOT_ENTRY: Final[str] = "SREK3S/"
 
-#: Top-level directories the tree enumerates, and which the reverse check
-#: therefore covers. A directory absent from this set is out of scope, and adding
+#: Top-level directories the tree enumerates, and which the reverse checks
+#: therefore cover. A directory absent from this set is out of scope, and adding
 #: one is a deliberate decision about what the document claims to describe.
-_ENUMERATED_ROOTS: Final[tuple[str, ...]] = ("cmd", "internal", "agent")
+#:
+#: ``tests`` was added when the in-cluster E2E overlay landed. It had been out of
+#: scope, which meant the directory check could not see ``tests/e2e/`` - the same
+#: blind spot ``internal/deploy/`` had, in the directory holding every E2E
+#: fixture. A validator that covers the code and not its harness is measuring
+#: half the repository, and the half it skipped is the half that runs against a
+#: cluster.
+_ENUMERATED_ROOTS: Final[tuple[str, ...]] = ("cmd", "internal", "agent", "tests")
 
 #: Never enumerated: build output, caches, and anything dot-prefixed.
 _IGNORED_DIR_PARTS: Final[frozenset[str]] = frozenset(

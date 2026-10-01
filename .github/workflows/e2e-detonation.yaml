@@ -1343,6 +1343,331 @@ jobs:
           echo "=== runner report ==="
           if [ -f /tmp/runner.log ]; then tail -45 /tmp/runner.log; else echo "  (none)"; fi
 
+      # =============================================================
+      # In-cluster leg. Additive: steps 1-9 above are untouched, and
+      # everything below reuses the k3s instance they installed.
+      #
+      # What this leg is for
+      # -------------------
+      # Every step above runs the Sentinel, the agent and the capture proxy as
+      # HOST processes on loopback. Only the victim workload is in the cluster.
+      # So `deploy/` has never been applied by anything: not the Service, not
+      # either NetworkPolicy, not the Role, not readOnlyRootFilesystem, not
+      # runAsUser. v1.0.0 shipped a deploy set whose Sentinel pointed at a
+      # Service no manifest created, on a port nothing listened on, and every
+      # gate was green - because no test opened this directory.
+      #
+      # These steps apply it and watch it route.
+      #
+      # What this leg does NOT do, stated up front
+      # -------------------------------------------
+      # It does not detonate anything. Detection, scrubbing, classification and
+      # patch generation are proven by the steps above, against a real cluster,
+      # with a real OOM. Repeating that here would duplicate the ratified
+      # Milestone 4.1/4.2 evidence to re-prove a chain that is not in question.
+      # What is in question is whether the deploy set applies and routes, and
+      # that is a different question with a different answer.
+      #
+      # It also does not start the Sentinel, and that is a gap rather than a
+      # choice: deploy/sentinel.yaml references
+      # registry.internal/srek3s-sentinel:0.1.0 and nothing in this repository
+      # builds that image. docs/offline-install.md line 105 documents
+      # `docker build -f Dockerfile` for it, and there is no root Dockerfile -
+      # the only one is agent/Dockerfile. So the Deployment object is asserted
+      # to be created, and its pod is not waited on. Closing that needs an
+      # image, which is a separate piece of work.
+      # =============================================================
+
+      - name: "E2E-IN: build and import the agent image into k3s containerd"
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+
+          # The tag must be exactly what deploy/agent.yaml names. A tag mismatch
+          # produces ImagePullBackOff, which reads like a network fault rather
+          # than the configuration error it is, and the leg's own image has to
+          # be right before anything else can be diagnosed.
+          AGENT_IMAGE="registry.internal/srek3s-agent:0.1.0"
+
+          # The build context is the repository root, not agent/. Same reason
+          # AGENTS.md gives: the Dockerfile needs agent/ and its config.
+          docker build -t "$AGENT_IMAGE" -f agent/Dockerfile .
+
+          docker save "$AGENT_IMAGE" -o /tmp/srek3s-agent.tar
+
+          # --namespace k8s.io, not --all-namespaces. This cluster is already
+          # running with images pulled into k8s.io, so the explicit namespace is
+          # the idempotent form: the import lands where kubelet actually looks
+          # and is visible in `images list` afterwards. docs/offline-install.md
+          # records both forms and says which is which; this is Mechanism B's
+          # repeated-import case, and it remains the unverified one.
+          sudo k3s ctr --timeout 120s --namespace k8s.io images import \
+            /tmp/srek3s-agent.tar --namespace k8s.io
+
+          # The effect, not the exit status. `ctr images import` exiting 0 has
+          # been observed to land the image somewhere kubelet never reads, which
+          # presents as ImagePullBackOff with no other symptom. So the tag is
+          # confirmed present and qualified in the namespace that matters.
+          if ! sudo k3s ctr --timeout 30s --namespace k8s.io images list \
+               | grep -qF "$AGENT_IMAGE"; then
+            echo "::error::$AGENT_IMAGE is not present in the k8s.io namespace"
+            sudo k3s ctr --timeout 30s --namespace k8s.io images list || true
+            exit 1
+          fi
+          echo "agent image registered in k8s.io as $AGENT_IMAGE"
+
+      - name: "E2E-IN: create the fixture ConfigMaps"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # --from-file, not a committed ConfigMap body. The script that runs
+          # in-cluster is then byte-identical to the one the offline tests
+          # import and the host-process leg runs. A transcribed copy would be a
+          # second source of truth for an instrument whose whole value is that
+          # it is transparent.
+          kubectl -n srek3s-system create configmap srek3s-capture-proxy \
+            --from-file=capture_proxy.py=tests/e2e/capture_proxy.py \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # The agent's manifest root. deploy/chaos/oom-leak.yaml is the real
+          # fixture, mounted so the agent reads the same bytes the host-process
+          # leg reads.
+          kubectl -n srek3s-system create configmap srek3s-agent-gitops \
+            --from-file=oom-leak.yaml=deploy/chaos/oom-leak.yaml \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          for cm in srek3s-capture-proxy srek3s-agent-gitops; do
+            if ! kubectl -n srek3s-system get configmap "$cm" >/dev/null 2>&1; then
+              echo "::error::ConfigMap $cm was not created"
+              exit 1
+            fi
+          done
+          echo "both fixture ConfigMaps present"
+
+      - name: "E2E-IN: apply the real deploy set through the overlay"
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          # -k, so the base is deploy/ itself rather than a copy. The overlay
+          # adds the capture proxy, the chaos-namespace Role and the routing
+          # probe; it changes nothing in deploy/. tests/e2e/fixtures/incluster/
+          # asserts that relationship, and asserts the base path resolves to the
+          # real directory, so a rename breaks the build rather than quietly
+          # detaching the base.
+          kubectl apply -k tests/e2e/fixtures/incluster
+
+          # Every object the deploy set declares must exist afterwards. Asserted
+          # by name, because "kubectl apply exited 0" is not evidence that any
+          # particular object was admitted - a namespace that does not exist
+          # makes every namespaced object in the set fail while the command
+          # still reports success for the ones it got to.
+          missing=0
+          for ref in \
+            "serviceaccount/srek3s-sentinel" \
+            "role/srek3s-sentinel" \
+            "rolebinding/srek3s-sentinel" \
+            "service/srek3s-agent" \
+            "deployment/srek3s-agent" \
+            "deployment/srek3s-sentinel" \
+            "networkpolicy/srek3s-agent-egress" \
+            "deployment/srek3s-capture" \
+            "service/srek3s-capture" \
+            "deployment/srek3s-route-probe" \
+          ; do
+            if kubectl -n srek3s-system get "$ref" >/dev/null 2>&1; then
+              echo "  ok: $ref"
+            else
+              echo "  MISSING: $ref"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::the deploy set did not fully apply"
+            exit 1
+          fi
+
+          # The chaos namespace is created by deploy/chaos/namespace.yaml, which
+          # step 5 already applied. The overlay's Role binds into it, so a
+          # re-apply here would be a no-op at best and a "namespace not found"
+          # at worst if the ordering were ever disturbed.
+          kubectl -n sentinel-chaos get role srek3s-sentinel >/dev/null
+          echo "  ok: role/srek3s-sentinel in sentinel-chaos"
+
+      - name: "E2E-IN: assert the agent Service has ready endpoints"
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+
+          # A Service object with no ready endpoints is a valid object and a
+          # total routing failure. v1.0.0's Service did not exist at all, so this
+          # is the first assertion in the repository that looks at the
+          # difference. The check is on endpoints, never on the Service object.
+          ok=0
+          for i in $(seq 1 60); do
+            endpoints="$(kubectl -n srek3s-system get endpoints srek3s-agent \
+              -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
+            if [ -n "$endpoints" ]; then
+              echo "srek3s-agent has ready endpoints after ${i}0s: $endpoints"
+              ok=1
+              break
+            fi
+            echo "  waiting for srek3s-agent endpoints (${i}/60)"
+            kubectl -n srek3s-system get pods -l app.kubernetes.io/name=srek3s-agent \
+              -o wide || true
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::srek3s-agent never published a ready endpoint; the Service resolves to nothing"
+            kubectl -n srek3s-system describe deployment srek3s-agent || true
+            kubectl -n srek3s-system get events --sort-by=.lastTimestamp | tail -20 || true
+            exit 1
+          fi
+
+      - name: "E2E-IN: assert in-cluster DNS routes to the agent Service"
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+
+          # This is the assertion the whole leg exists for. A pod inside the
+          # cluster resolves `srek3s-agent` through cluster DNS, connects to the
+          # Service, and calls a real contract endpoint. Nothing else in the
+          # workflow performs that resolution - the steps above all address
+          # 127.0.0.1 - so this is the only thing in the repository that would
+          # have failed on v1.0.0.
+          #
+          # The probe exits 0 on success and 1 after its own 120s deadline, so a
+          # DNS failure or a policy refusal is a pod that never reaches Ready and
+          # is reported as such. `rollout status` is the check; the probe's own
+          # stdout carries the status code and body for the receipt.
+          if ! kubectl -n srek3s-system rollout status deployment/srek3s-route-probe \
+               --timeout=300s; then
+            echo "::error::the routing probe never succeeded against http://srek3s-agent:8000"
+            echo "--- probe logs ---"
+            kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=40 || true
+            echo "--- agent logs ---"
+            kubectl -n srek3s-system logs deployment/srek3s-agent --tail=40 || true
+            exit 1
+          fi
+
+          echo "--- probe output ---"
+          kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=5
+
+          # And the direct contract, so the receipt carries a real status code
+          # rather than only a rollout result.
+          kubectl -n srek3s-system logs deployment/srek3s-route-probe \
+            | grep -q '"ok": true' || {
+              echo "::error::the probe reported failure"
+              kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=20 || true
+              exit 1
+            }
+          echo "in-cluster DNS resolved srek3s-agent and the agent answered /healthz"
+
+      - name: "E2E-IN: assert the Sentinel's in-cluster RBAC is read-only"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # The real identity, in both namespaces it now holds a grant in. This
+          # is the same check the runbook tells an operator to run by hand, run
+          # here against a live apiserver instead of asserted by a manifest test.
+          SA=system:serviceaccount:srek3s-system:srek3s-sentinel
+          for verb in get list watch; do
+            for resource in pods events; do
+              for ns in srek3s-system sentinel-chaos; do
+                if ! kubectl auth can-i "$verb" "$resource" -n "$ns" --as="$SA" 2>/dev/null \
+                     | grep -qx yes; then
+                  echo "::error::$SA cannot $verb $resource in $ns; the read-only path is broken"
+                  exit 1
+                fi
+              done
+            done
+          done
+          echo "  ok: get/list/watch on pods and events, in both namespaces"
+
+          # The negative half, which is the half that matters. A manifest test
+          # can prove the Role does not *name* a write verb; only the apiserver
+          # can prove the identity is *refused*.
+          for verb in create patch update delete; do
+            for resource in pods deployments; do
+              answer="$(kubectl auth can-i "$verb" "$resource" -n sentinel-chaos \
+                --as="$SA" 2>/dev/null || echo no)"
+              if [ "$answer" = "yes" ]; then
+                echo "::error::$SA is GRANTED $verb on $resource; the no-autofix guarantee does not hold"
+                exit 1
+              fi
+              echo "  ok: refused $verb on $resource"
+            done
+          done
+
+          # And the agent must hold nothing at all, which is a stronger form of
+          # the same property.
+          AGENT_SA=system:serviceaccount:srek3s-system:srek3s-agent
+          for verb in get list watch create patch delete; do
+            answer="$(kubectl auth can-i "$verb" pods -n srek3s-system \
+              --as="$AGENT_SA" 2>/dev/null || echo no)"
+            if [ "$answer" = "yes" ]; then
+              echo "::error::the agent ServiceAccount is granted $verb on pods; it is meant to hold no cluster credential"
+              exit 1
+            fi
+          done
+          echo "  ok: the agent's ServiceAccount holds no cluster access at all"
+
+      - name: "E2E-IN: assert the hardening holds on the running agent"
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # Read from the live pod's resolved spec, not from the manifest. The
+          # manifest is what the manifests tests parse; this is what the kubelet
+          # actually admitted, which is the thing an attacker would meet.
+          pod="$(kubectl -n srek3s-system get pod \
+            -l app.kubernetes.io/name=srek3s-agent \
+            -o jsonpath='{.items[0].metadata.name}')"
+          if [ -z "$pod" ]; then
+            echo "::error::no agent pod to inspect"
+            exit 1
+          fi
+
+          uid="$(kubectl -n srek3s-system get pod "$pod" \
+            -o jsonpath='{.spec.containers[0].securityContext.runAsUser}')"
+          if [ "$uid" != "10001" ]; then
+            echo "::error::the running agent runs as UID $uid, not 10001"
+            exit 1
+          fi
+          echo "  ok: runAsUser 10001"
+
+          ror="$(kubectl -n srek3s-system get pod "$pod" \
+            -o jsonpath='{.spec.containers[0].securityContext.readOnlyRootFilesystem}')"
+          if [ "$ror" != "true" ]; then
+            echo "::error::the running agent's root filesystem is writable (readOnlyRootFilesystem=$ror)"
+            exit 1
+          fi
+          echo "  ok: readOnlyRootFilesystem"
+
+          dropped="$(kubectl -n srek3s-system get pod "$pod" \
+            -o jsonpath='{.spec.containers[0].securityContext.capabilities.drop}')"
+          if ! grep -q ALL <<<"$dropped"; then
+            echo "::error::the running agent does not drop ALL capabilities (drop=$dropped)"
+            exit 1
+          fi
+          echo "  ok: capabilities drop ALL"
+
+          # I-B5's stronger form, observed rather than declared: the agent pod
+          # has no ServiceAccount token mounted, so it cannot reach the API
+          # server even if a future bug tried to.
+          token="$(kubectl -n srek3s-system get pod "$pod" \
+            -o jsonpath='{.spec.automountServiceAccountToken}')"
+          if [ "$token" != "false" ]; then
+            echo "::error::the agent pod has automountServiceAccountToken=$token; it should mount no token"
+            exit 1
+          fi
+          echo "  ok: no ServiceAccount token on the agent pod"
+
+          echo "--- the agent's own UID, from inside the container ---"
+          kubectl -n srek3s-system exec "$pod" -- id -u || true
+
       - name: Teardown
         if: always()
         # No timeout needed: every command in it is `|| true` or a kill, and a

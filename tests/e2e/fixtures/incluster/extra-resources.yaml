@@ -1,0 +1,420 @@
+# E2E in-cluster overlay: resources that exist ONLY to let the detonation
+# exercise the real deploy set in a real cluster.
+#
+# Why this is an overlay and not a fork
+# -------------------------------------
+# The proven host-process leg (steps 1-9 of the e2e-detonation job) runs the
+# Sentinel, the agent and the capture proxy as host processes on loopback. It
+# never applies deploy/. That proved the detection -> scrub -> classify ->
+# patch chain, and it proved it against a real cluster for the victim workload.
+#
+# What it could not prove is anything about deploy/ itself: not the Service, not
+# either NetworkPolicy, not the Role, not readOnlyRootFilesystem, not
+# runAsUser: 10001. v1.0.0 shipped a deploy set whose Sentinel pointed at a
+# Service no manifest created, on a port nothing listened to, and every gate was
+# green - because no test applied this directory.
+#
+# So this overlay exists to apply deploy/ and observe it. It references the real
+# manifests as a kustomize base rather than copying them, because a copy would
+# drift from the thing it is supposed to be testing, and a test of a copy proves
+# nothing about the original.
+#
+# What is test scaffolding, and why it is kept out of deploy/
+# -----------------------------------------------------------
+# Three things here could arguably belong in production. They are here anyway,
+# and that is a deliberate line.
+#
+# 1. `chaos-rbac.yaml` grants the Sentinel's ServiceAccount a read-only Role in
+#    `sentinel-chaos`. deploy/rbac.yaml grants one in `srek3s-system` only, so a
+#    Sentinel scoped to any other namespace is unauthorised today. That is a
+#    real gap and it is filed as one - but shipping a Role bound to a
+#    disposable chaos namespace inside the production set would put a grant to a
+#    namespace that does not exist in production into every deployment.
+#
+# 2. `capture.yaml` runs the wire-capture proxy in-cluster. See the identity
+#    note on the pod labels below; it is the subtlest thing in this file.
+#
+# 3. The agent's GitOps mount. The agent needs SREK3S_MANIFEST_ROOT to point at
+#    a checkout containing SREK3S_TARGET_MANIFEST, and it builds its own
+#    throwaway git repo for the I-B2 check, so it needs no real repository - only
+#    the target manifest, readable, at the right relative path. A ConfigMap
+#    carrying exactly that file is the minimum. Whether production should mount
+#    a real checkout, and how, is a design question this overlay does not answer.
+#
+# Deliberately absent
+# -------------------
+# No mutation of deploy/'s own hardening. The pods added here carry the same
+# securityContext, runAsUser, readOnlyRootFilesystem and capability drop as the
+# manifests they supplement, and
+# test_e2e_incluster_manifests.py asserts that rather than trusting it. A test
+# fixture that relaxes the policy it is testing measures nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srek3s-capture
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-capture
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-capture
+  policyTypes:
+    - Egress
+  # The capture proxy is transparent by construction and must not become a
+  # general egress path for the deployment it instruments. It reaches exactly one
+  # thing: the agent, by Service DNS.
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: srek3s-agent
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              component: kube-apiserver
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The capture proxy, in-cluster.
+#
+# The identity note, which is the part worth reading twice
+# -------------------------------------------------------
+# deploy/agent.yaml's NetworkPolicy admits ingress to the agent from pods
+# labelled `app.kubernetes.io/name: srek3s-sentinel` and nothing else. That
+# policy is load-bearing: it is the network expression of "only the Sentinel
+# talks to the triage endpoint".
+#
+# An in-path instrument has to be admitted by it, and the three ways to arrange
+# that are all bad in a different direction:
+#
+#   * relax the policy to admit a second identity - that weakens the production
+#     control so a test can observe it;
+#   * give the proxy the Sentinel's label - which is what this does;
+#   * run the proxy as a sidecar in the Sentinel pod - which forces the Sentinel
+#     to address 127.0.0.1, putting us straight back on loopback and on the
+#     routing this leg exists to test.
+#
+# Labelling is chosen because it leaves the policy under test *unmodified*, so
+# the property "only a pod claiming to be the Sentinel may reach the agent" is
+# still genuinely enforced while the leg runs. A pod without that label is still
+# refused, and TestTheCaptureCannotMasqueradeWithoutTheLabel asserts the
+# selector is the one that matters.
+#
+# The cost is stated plainly: NetworkPolicy authenticates labels, not
+# identities, so this is impersonation. In a disposable chaos namespace, with a
+# fixture that exists only for the duration of one CI run, that is an acceptable
+# price for exercising the real policy. It would not be acceptable in a
+# production namespace, which is why this file is not in deploy/.
+#
+# The Service selects on `srek3s.io/capture`, NOT on the impersonated label, so
+# the capture Service can never select the real Sentinel pod by accident.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-capture
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-capture
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      srek3s.io/capture: "true"
+  template:
+    metadata:
+      labels:
+        # See the identity note above. This label is what admits the pod to the
+        # agent's ingress policy.
+        app.kubernetes.io/name: srek3s-sentinel
+        # This label is what the capture Service selects on. Kept separate from
+        # the impersonated one so the two cannot be confused.
+        srek3s.io/capture: "true"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # The proxy needs no Kubernetes API access. Same reasoning as the agent:
+      # no token is the stronger form of the same property.
+      automountServiceAccountToken: false
+      containers:
+        - name: capture
+          # The agent image, because it is the only image in this repository
+          # that carries a Python interpreter and is already built and imported
+          # into the test cluster. capture_proxy.py imports stdlib only, by
+          # charter, so it runs unmodified on it.
+          image: registry.internal/srek3s-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /opt/capture/capture_proxy.py
+          args:
+            - --output
+            - /captures/captured_incidents.jsonl
+            # 0.0.0.0, not the 127.0.0.1 default. A pod's Service only reaches
+            # it if it is bound to the pod interface; the loopback default is
+            # correct for a host process and unreachable here.
+            - --listen-host
+            - 0.0.0.0
+            - --listen-port
+            - "8000"
+            # The upstream is the production Service, by in-cluster DNS. This is
+            # the hop that was never exercised before v1.0.1.
+            - --upstream-host
+            - srek3s-agent
+            - --upstream-port
+            - "8000"
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: script
+              mountPath: /opt/capture
+              readOnly: true
+            - name: captures
+              mountPath: /captures
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "200m"
+            limits:
+              cpu: "1"
+              ephemeral-storage: "64Mi"
+          readinessProbe:
+            # The proxy has no endpoint of its own by design - it forwards every
+            # path, and inventing one on a component whose job is to be
+            # transparent would change the thing being measured. So readiness is
+            # a TCP check against its own listener. A bound port is the only
+            # honest liveness signal a transparent proxy can offer.
+            tcpSocket:
+              port: 8000
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 15
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: captures
+          emptyDir: {}
+        - name: script
+          configMap:
+            # Created by the workflow from the real file:
+            #   kubectl create configmap srek3s-capture-proxy \
+            #     --from-file=capture_proxy.py=tests/e2e/capture_proxy.py
+            # so the script that runs in-cluster is the same bytes the offline
+            # tests import, rather than a transcription of it.
+            name: srek3s-capture-proxy
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srek3s-capture
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-capture
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+spec:
+  type: ClusterIP
+  # Selects on the capture label only. Never on `app.kubernetes.io/name:
+  # srek3s-sentinel`, which this pod also carries.
+  selector:
+    srek3s.io/capture: "true"
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: 8000
+---
+# The Sentinel's grant in the chaos namespace.
+#
+# Read-only, and an exact mirror of deploy/rbac.yaml's Role - all three rules,
+# including the apps-group one. The first draft of this fixture carried only
+# pods, pods/log and events, and
+# test_the_chaos_grant_is_read_only_and_mirrors_the_shipped_role failed it: the
+# watcher reads deployments and replicasets, so a Role that omits them would have
+# left the in-cluster Sentinel unable to do its job while every other gate stayed
+# green. The test is asserting against the shipped Role rather than a hand-kept
+# list for exactly that reason - a hand-kept list is a fourth thing to forget to
+# update.
+#
+# A fixture that granted *more* would be worse than useless: it would make the
+# run's read-only evidence describe the fixture rather than the thing shipped,
+# and a reader would have no way to tell.
+apiVersion: rbac.authorization.k8s.io
+kind: Role
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io
+kind: RoleBinding
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: srek3s-sentinel
+subjects:
+  # The Sentinel's real ServiceAccount, from deploy/rbac.yaml. Not a new one:
+  # the identity under test is the one production uses.
+  - kind: ServiceAccount
+    name: srek3s-sentinel
+    namespace: srek3s-system
+---
+# The routing probe.
+#
+# This is the object that actually closes the v1.0.0 gap, and it is worth being
+# precise about what it is. The missing-Service defect meant the Sentinel's
+# configured endpoint did not resolve. The only way to observe that is to make
+# the resolution happen and watch it succeed or fail - so this pod resolves
+# `srek3s-agent` through cluster DNS, connects to the Service, and speaks the
+# wire contract. Nothing else in the workflow performs that resolution.
+#
+# A pod rather than a `kubectl run --rm` one-liner, so the manifests are
+# reviewable and the offline suite can assert its labels and hardening instead
+# of trusting a shell string.
+#
+# It carries the Sentinel's label for the same reason the capture proxy does:
+# deploy/agent.yaml's ingress policy admits only that label, and a probe that
+# could not connect would be measuring the policy rather than the routing. The
+# label is the point - this proves the route works *for the identity that uses
+# it*, and the workflow separately proves a pod without the label is refused.
+# Between those two, that is the whole of "only the Sentinel reaches the agent".
+#
+# The agent image because it is the only image in this repository carrying a
+# Python interpreter, and urllib is sufficient. No curl in that base, and adding
+# one would mean a new image to build and import.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-route-probe
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-route-probe
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-route-probe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srek3s-sentinel
+        srek3s.io/probe: "true"
+    spec:
+      restartPolicy: Always
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+        - name: probe
+          image: registry.internal/srek3s-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c"]
+          args:
+            - |
+              import json, sys, time, urllib.request
+
+              # The Service DNS name. Not an IP, not a pod name: the v1.0.0
+              # defect was precisely that this name did not resolve, so a probe
+              # that avoided DNS would not have caught it.
+              base = "http://srek3s-agent:8000"
+              deadline = time.time() + 120
+              last = None
+              while time.time() < deadline:
+                  try:
+                      with urllib.request.urlopen(base + "/healthz", timeout=5) as resp:
+                          body = resp.read().decode("utf-8", "replace")
+                          print(json.dumps({"ok": True, "status": resp.status, "body": body}), flush=True)
+                          sys.exit(0)
+                  except Exception as exc:
+                      last = "{}: {}".format(type(exc).__name__, exc)
+                      time.sleep(2)
+              print(json.dumps({"ok": False, "error": last}), flush=True)
+              sys.exit(1)
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              cpu: "500m"
+              ephemeral-storage: "32Mi"
+      volumes:
+        - name: tmp
+          emptyDir: {}

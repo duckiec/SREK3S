@@ -143,6 +143,12 @@ SREK3S/
 │       └── crashloop.yaml
 │
 └── tests/
+    ├── benchmarks/         # load generation for the saturation gates
+    ├── e2e/                # detonation harness: runner, capture proxy, in-cluster overlay
+        ├── capture_proxy.py          # stdlib-only wire instrument; Sentinel to agent
+        ├── runner.py                 # samples the lifecycle; asserts ROADMAP 4.2.x
+        ├── fixtures/                 # E2E fixtures; the incluster/ subdir is the deploy overlay
+            └── incluster/          # overlay: deploy/ base, capture proxy, probe
     └── fixtures/
         ├── incident_corpus.json      # AC-2 masking corpus (8 rule groups, 32 maskable cases)
         ├── sample-incident.json      # canonical valid Incident Payload

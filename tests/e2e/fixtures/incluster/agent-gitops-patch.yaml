@@ -1,0 +1,112 @@
+# Strategic-merge patch: give the agent its GitOps manifest root, in-cluster.
+#
+# What the agent actually needs
+# -----------------------------
+# SREK3S_MANIFEST_ROOT must point at a directory containing
+# SREK3S_TARGET_MANIFEST, and SREK3S_TARGET_MANIFEST must name a manifest
+# extension (classifier.py's _MANIFEST_SUFFIXES). It does *not* need a real git
+# repository: patch.py's git_apply_check materialises the manifest into its own
+# throwaway repository inside a temp dir precisely so that I-B2 does not depend
+# on a checkout being present.
+#
+# So the minimum in-cluster is: one readable file, at a repo-relative path, plus
+# the `git` binary (already in agent/Dockerfile) plus a writable temp dir
+# (already mounted at /tmp). This patch supplies exactly that and nothing more.
+#
+# Why an init container rather than a subPath mount
+# -------------------------------------------------
+# A ConfigMap volume with `subPath` can place a single file at a nested path, and
+# it would be one fewer moving part. It was not used because its behaviour when
+# the parent directories do not already exist in the image is not something this
+# repository can verify offline, and this fixture has never been run against a
+# cluster. An init container that runs `mkdir -p` and `cp` states the intent
+# outright and depends on nothing subtle.
+#
+# The ConfigMap is created by the workflow rather than committed here, because
+# its content is deploy/chaos/oom-leak.yaml and a committed copy would be a
+# second source of truth for a fixture that already exists. `kubectl create
+# configmap --from-file` puts the real bytes in.
+#
+# Why the init container is held to the same standard as the agent
+# ----------------------------------------------------------------
+# deploy/agent.yaml's containers run as UID 10001, non-root, no privilege
+# escalation, all capabilities dropped, RuntimeDefault seccomp. The init
+# container runs the same image and carries the same block. A fixture that
+# exempted itself from the policy it exists to test would make the
+# `kubectl auth can-i` evidence and the pod-security evidence worth less than
+# nothing - the run would still be green.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-agent
+  namespace: srek3s-system
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: stage-gitops
+          image: registry.internal/srek3s-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /gitops/deploy/chaos
+              cp /staged/oom-leak.yaml /gitops/deploy/chaos/oom-leak.yaml
+              test -s /gitops/deploy/chaos/oom-leak.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: gitops
+              mountPath: /gitops
+            - name: manifest-source
+              mountPath: /staged
+              readOnly: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              cpu: "500m"
+              ephemeral-storage: "32Mi"
+      containers:
+        - name: agent
+          env:
+            # The provider fails closed when MANIFEST_ROOT is unset - that is the
+            # production default and it is not changed here. What this patch
+            # supplies is a root that exists, so the E2E can reach Tier-1 at all.
+            - name: SREK3S_MANIFEST_ROOT
+              value: /gitops
+            - name: SREK3S_TARGET_MANIFEST
+              value: deploy/chaos/oom-leak.yaml
+            # The sandbox subprocess needs a writable TMPDIR, and the root
+            # filesystem is read-only. deploy/agent.yaml already mounts /tmp; this
+            # only points Python at it, and matches what the host-process leg
+            # passes.
+            - name: TMPDIR
+              value: /tmp
+          volumeMounts:
+            - name: gitops
+              mountPath: /gitops
+              readOnly: true
+      volumes:
+        # emptyDir, not the ConfigMap: the ConfigMap is mounted at /staged and an
+        # init container copies it into the nested path. The agent's own mount is
+        # readOnly, so a compromised triage path cannot rewrite the manifest it
+        # is about to produce a patch against.
+        - name: gitops
+          emptyDir: {}
+        - name: manifest-source
+          configMap:
+            name: srek3s-agent-gitops
+            defaultMode: 0444

@@ -1,0 +1,52 @@
+# E2E in-cluster overlay.
+#
+# Base: deploy/, unmodified. Patches: one. Extras: two files.
+#
+# Applied by a new step appended to the e2e-detonation job, after the proven
+# host-process leg has passed and before teardown. It reuses the k3s instance
+# that job already installed, so the only thing this adds is the observation
+# that deploy/ applies and routes - not a second cluster, and not a second copy
+# of the install steps.
+#
+# The base is referenced by relative path, never vendored. A vendored copy would
+# be free to drift from the manifests it claims to test, and a test of a copy
+# proves nothing about the original - which is the whole reason this leg exists.
+# test_e2e_incluster_manifests.py asserts that the path below resolves to the
+# real deploy/ directory, so a rename or a move breaks the build rather than
+# quietly detaching the base.
+#
+# Order note: `namespace.yaml` from the base is applied before anything names the
+# namespace, and the chaos namespace is created separately by the workflow step
+# because the Role in extra-resources.yaml binds into it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  # The real deploy set, by relative path. Four levels up: fixtures/incluster ->
+  # fixtures -> e2e -> tests -> repo root.
+  - ../../../../deploy
+  - extra-resources.yaml
+
+patches:
+  - path: agent-gitops-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: srek3s-agent
+
+# The base sets `namespace: srek3s-system` and `commonLabels:
+# app.kubernetes.io/part-of: srek3s`. Both are inherited, deliberately: the
+# overlay must not rename or re-namespace anything it is testing.
+#
+# `commonLabels` is NOT re-declared here. Kustomize merges labels additively, and
+# every object here already carries `app.kubernetes.io/part-of: srek3s` and
+# `srek3s.io/fixture: e2e-incluster` in its own metadata. The fixture label is
+# what makes these objects greppable after the run and is asserted by the
+# offline tests, so that a fixture that loses its marker is noticed rather than
+# mistaken for a production manifest.
+#
+# No `images:` block, for the same reason deploy/kustomization.yaml has none: the
+# tag in the manifest is the tag that gets applied, and an override here would
+# hide it from the very thing under test. The workflow imports the built images
+# into the cluster's containerd under exactly the tags named in these files.

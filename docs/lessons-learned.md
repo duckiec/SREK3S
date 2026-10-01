@@ -823,3 +823,110 @@ The corollary is about the harness. When an end-to-end workflow replaces the
 production transport with a convenient one, ask what the substitution made
 unobservable — and check that the answer is not "the thing that was broken".
 Here it was, and the workflow passed for a full milestone.
+
+
+## 24. The Port-Forward That Was Never There (v1.0.1 follow-on)
+
+A directive arrived to "eliminate the E2E's use of `kubectl port-forward` for
+Sentinel-to-Agent communication", on the premise that the harness was inserting
+itself into the routing with a port-forward.
+
+There is no `kubectl port-forward` in this repository. A whole-repo search finds
+the string only in prose - in this file, in a manifest comment, and in the
+README. The E2E ran the Sentinel, the agent and the capture proxy as three host
+processes on loopback, and never applied `deploy/` at all.
+
+The premise was wrong, and the truth was worse.
+
+### What the E2E actually exercised
+
+In-cluster: the victim workload, and nothing else. Out-of-cluster: everything
+under test. So the following were never executed by any job, ever:
+
+- `deploy/service.yaml` - the Service, and with it all of Service routing;
+- `deploy/agent.yaml` and `deploy/sentinel.yaml` - both Deployments;
+- both NetworkPolicies;
+- `deploy/rbac.yaml` - the Role, the ServiceAccount, the binding;
+- `readOnlyRootFilesystem`, `runAsUser: 10001`, `cap_drop: ALL`, restricted PSA.
+
+Every one of those is a security control. The system had a green E2E, a green
+CI, and a ratified Definition of Done, and none of it had ever started the thing
+it was shipping.
+
+### Why the substitution was invisible
+
+The harness substituted 127.0.0.1 for in-cluster DNS, and loopback for
+ClusterIP routing. Both substitutions are invisible *in the passing direction*:
+everything that works on loopback also works through a Service. They are only
+visible in the failing direction, and they removed every way for the deployment
+layer to fail.
+
+This is the sharp edge of a convenience substitution. Replacing a component with
+something simpler does not just test less - it can remove the only path by which
+a whole class of defect could have been observed, while leaving the suite green
+and the run looking thorough.
+
+### The fixtures that fell out
+
+Building the in-cluster leg surfaced three further gaps, none of which any gate
+had seen:
+
+1. **The Sentinel cannot watch any namespace but its own.** `deploy/rbac.yaml`
+   grants a Role in `srek3s-system` only. Run the Sentinel with
+   `-namespace sentinel-chaos`, as the runbook instructs, and it is
+   unauthorised. The chaos-namespace grant now lives in the E2E overlay, not in
+   `deploy/`, because shipping a Role bound to a disposable test namespace into
+   every production deployment is worse than the gap. The gap is filed, not
+   papered over.
+2. **No root `Dockerfile` exists.** `deploy/sentinel.yaml` references
+   `registry.internal/srek3s-sentinel:0.1.0` and `docs/offline-install.md` line
+   105 documents `docker build -f Dockerfile` to produce it. The only Dockerfile
+   in the repository is `agent/Dockerfile`. The deploy set references an image
+   nothing builds - so the in-cluster leg can deploy the agent and assert the
+   Service route, and cannot yet start the Sentinel.
+3. **The agent needs a manifest root it has no way to get in-cluster.** The
+   provider fails closed when `SREK3S_MANIFEST_ROOT` is unset, which is correct
+   and means a missing mount produces a *correct* Tier-2 escalation rather than
+   an error. A leg that watched for incidents would have seen plausible Tier-2
+   output and passed.
+
+### The impersonation, stated plainly
+
+`deploy/agent.yaml` admits ingress only from
+`app.kubernetes.io/name: srek3s-sentinel`. An in-path instrument has to be
+admitted by that policy, and NetworkPolicy authenticates labels rather than
+identities, so the capture proxy and the routing probe both carry the
+Sentinel's label.
+
+That is impersonation. It is the right trade *here* - in a disposable namespace,
+for a fixture that exists for one CI run - because it leaves the policy under
+test unmodified, so "only a pod claiming to be the Sentinel may reach the
+agent" is still genuinely enforced while the leg runs. It would be the wrong
+trade in a production namespace, which is why neither object is in `deploy/`.
+The alternative, relaxing the policy to admit a second identity, would have meant
+weakening the control so a test could observe it.
+
+### What the leg does and does not prove
+
+Proves: `deploy/` applies; the Service publishes ready endpoints; cluster DNS
+resolves `srek3s-agent` and the agent answers `/healthz`; the Sentinel's real
+ServiceAccount is granted reads and refused writes by a live apiserver in both
+namespaces; the agent's ServiceAccount holds nothing; and the running agent pod
+is UID 10001 with a read-only root and no token.
+
+Does not prove: that the Sentinel Deployment starts (no image), or that anything
+detonates in-cluster. Detection and patch generation are proven by the
+host-process leg against a real OOM, and duplicating that would re-prove a chain
+that is not in question in order to re-verify a layer that is.
+
+### The generalisable form
+
+*Ask what a test harness's convenience substitution made unobservable - and
+check that the answer is not "the layer nobody was testing".* Here the
+substitution was loopback for Service routing, and the layer nobody was testing
+was the entire deployment.
+
+The second half is the one to keep. **A green end-to-end run means the paths that
+ran are covered. It says nothing about the paths that were substituted out, and
+the substitution is usually invisible in the passing direction.** "End-to-end" is
+a claim about the ends. It is not a claim about the middle.
