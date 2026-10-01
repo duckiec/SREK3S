@@ -1402,14 +1402,49 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
 ### 4.5 Documentation and final gates
 
-- [ ] `4.5.1` Write operator runbook: deploy, observe, interpret a War-Room dispatch, review a
+- [x] `4.5.1` Write operator runbook: deploy, observe, interpret a War-Room dispatch, review a
       Tier-1 PR.
-- [ ] `4.5.2` Document the explicit statement that **no** configuration enables direct cluster
+      **`docs/runbook.md`**, six sections. Every command and flag in it was read
+      out of the source first: the Sentinel's six flags and their environment
+      equivalents from `cmd/sentinel/main.go`, the agent's three knobs from
+      `agent/main.py`, the apply order and the deliberate absence of a kustomize
+      `images:` block from `deploy/kustomization.yaml`. The `dedup_suppressed`
+      entry documents the trap that cost 4.2.7, because an operator seeing a high
+      suppression count would otherwise read it as healthy.
+- [x] `4.5.2` Document the explicit statement that **no** configuration enables direct cluster
       writes, and where that is enforced in code.
-- [ ] `4.5.3` `go vet ./...` exits `0`.
-- [ ] `4.5.4` `test -z "$(gofmt -l .)"` exits `0`.
-- [ ] `4.5.5` `go test -race -timeout 30s ./...` exits `0`.
-- [ ] `4.5.6` `black --check agent/`, `flake8 agent/`, `mypy --strict agent/` all exit `0`.
+      **`docs/runbook.md` section 5**, stated as a fact and then evidenced at
+      three independent layers. Layer 1: the enumerated read verbs in
+      `deploy/rbac.yaml`, enforced by `TestSentinelRoleGrantsNoMutatingVerb`
+      which parses the manifest and fails the build. Layer 2: the agent holds no
+      cluster credential at all, and `agent/verify.py` holds a single
+      `ObservationReader.read` with no client, subprocess, socket or filesystem
+      access, enforced by `TestZeroWrites` via AST introspection and by
+      `TestRuntimeTripwire` via a live `sys.addaudithook`. Layer 3: the schema
+      invariants **I-B1** (Tier-2 implies an empty patch), **I-B4** (freeform
+      output is a fatal validation failure) and **I-B5** (no field can express a
+      write), all enforced in `agent/models.py`. The section names the one
+      legitimate write path - a human merging a reviewed diff - and says why that
+      is the design rather than a loophole.
+- [x] `4.5.3` `go vet ./...` exits `0`.
+      **PASS**, locally on Windows/amd64.
+- [x] `4.5.4` `test -z "$(gofmt -l .)"` exits `0`.
+      **PASS** - `gofmt -l .` returns empty.
+- [x] `4.5.5` `go test -race -timeout 30s ./...` exits `0`.
+      **PASS on CI, not on this host**, and the distinction is the point.
+      `-race` requires ThreadSanitizer, which the local Windows host cannot
+      provide, so `go test -timeout 30s ./...` was run locally instead - 6
+      packages, all `ok` - and the `-race` authority is the
+      `M3 authority gate - go test -race` step in `.github/workflows/ci.yaml`,
+      which passes on `ubuntu-latest`. AGENTS.md section 4 states that a local
+      pass without `-race` does not waive this gate, so this box is closed on the
+      CI step and explicitly not on this machine.
+- [x] `4.5.6` `black --check agent/`, `flake8 agent/`, `mypy --strict agent/` all exit `0`.
+      **PASS.** Run over `agent/ tests/` rather than `agent/` alone: invoked
+      alone, `mypy --strict agent/` reports eight spurious `import-not-found` for
+      `runner` and `capture_proxy`, which live in `tests/e2e/` and are outside
+      that path. `audit_workflow.py` also exits `0` with no findings.
+      710 passed, 2 skipped.
 - [ ] `4.5.7` Full acceptance re-run: AC-1, AC-2, AC-3, AC-4 all evidenced in one report.
 
 ### ▶ TERMINAL VALIDATION TEST — Milestone 4

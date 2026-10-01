@@ -9,7 +9,7 @@
 #   1. This Role. The apiserver rejects a write verb regardless of what the
 #      process intends. It holds even if a bug reaches a client-go mutating
 #      method, or if the binary is replaced with something else entirely.
-#   2. TestSentinelHasNoMutatingVerbs parses this file and fails the build if a
+#   2. TestSentinelRoleGrantsNoMutatingVerb parses this file and fails the build if a
 #      verb other than get/list/watch appears. It holds even if the Role is
 #      correct today and someone adds an escalation path next quarter.
 #
