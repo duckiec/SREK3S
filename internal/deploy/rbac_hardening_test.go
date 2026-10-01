@@ -298,6 +298,21 @@ func TestAgentDoesNotAutomountAServiceAccountToken(t *testing.T) {
 // here. Raise the drain past the grace period and the kubelet SIGKILLs the process
 // mid-drain on every rolling update - with no error anywhere, because the loss is
 // silent by construction.
+//
+// THE PATH IS PodSpec, NOT THE CONTAINER, and it was wrong here until 2026-10-01.
+//
+// This test read the value from containers[0]. terminationGracePeriodSeconds is a
+// field of PodSpec with no container-level counterpart, so the apiserver rejects the
+// whole Deployment with a strict-decoding error naming
+// "spec.template.spec.containers[0].terminationGracePeriodSeconds". The field
+// shipped at that level and the deploy set could not be applied at all - found by
+// applying it to a live control plane, not by any test.
+//
+// The assertion passed for a whole milestone because it ran against a YAML parser,
+// where the value is present and plausible at either indentation. Reading a document
+// is not the same as validating one, and a check written against a parser inherits
+// that limit. TestTerminationGraceIsNotOnAContainer is the companion assertion that
+// closes it; see also deploy/sentinel.yaml.
 func TestSentinelTerminationGraceExceedsTheDrainBudget(t *testing.T) {
 	source := readRepoFile(t, "cmd", "sentinel", "main.go")
 	grace := parseIntAfter(t, source, "ShutdownGrace = ")
@@ -310,18 +325,96 @@ func TestSentinelTerminationGraceExceedsTheDrainBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
-	containers, _ := digSlice(deployment, "spec", "template", "spec", "containers")
-	actual := dig(containers[0].(map[string]any), "terminationGracePeriodSeconds")
+	actual := dig(deployment, "spec", "template", "spec", "terminationGracePeriodSeconds")
 
 	seconds, ok := actual.(int)
 	if !ok {
-		t.Fatalf("terminationGracePeriodSeconds is %T, want an integer", actual)
+		t.Fatalf("pod-level terminationGracePeriodSeconds is %T, want an integer; it "+
+			"must be a sibling of `containers` under spec.template.spec", actual)
 	}
 	if seconds <= grace {
 		t.Errorf("terminationGracePeriodSeconds = %d, ShutdownGrace = %d; the "+
 			"kubelet would SIGKILL the process before the drain finished, making "+
 			"the graceful shutdown path decorative", seconds, grace)
 	}
+}
+
+// TestTerminationGraceIsNotOnAContainer proves the field is absent at container
+// level, in both shipped deployments.
+//
+// Negative-controlled in TestTerminationGraceContainerFieldIsDetectable, which
+// feeds this the very shape that shipped and requires it to object.
+func TestTerminationGraceIsNotOnAContainer(t *testing.T) {
+	for _, name := range []string{"sentinel.yaml", "agent.yaml"} {
+		documents, err := decodeAll(readManifest(t, name))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		deployment, err := one(documents, "Deployment")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		containers, _ := digSlice(deployment, "spec", "template", "spec", "containers")
+		if len(containers) == 0 {
+			t.Fatalf("%s: no containers to check", name)
+		}
+		for _, raw := range containers {
+			container, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("%s: container entry is %T, want a map", name, raw)
+			}
+			if _, present := container["terminationGracePeriodSeconds"]; present {
+				t.Errorf("%s: container %v sets terminationGracePeriodSeconds. It is "+
+					"a PodSpec field; the apiserver refuses the entire Deployment with "+
+					"a strict-decoding error, so this manifest is unappliable. Assert it "+
+					"on the pod spec instead.", name, container["name"])
+			}
+		}
+		// And the valid location must carry a value, so this cannot pass on a
+		// manifest that merely dropped the field.
+		if dig(deployment, "spec", "template", "spec",
+			"terminationGracePeriodSeconds") == nil {
+			t.Errorf("%s: no pod-level terminationGracePeriodSeconds; the drain budget "+
+				"is unprotected", name)
+		}
+	}
+}
+
+// TestTerminationGraceContainerFieldIsDetectable is the negative control for
+// TestTerminationGraceIsNotOnAContainer.
+//
+// A guard that cannot fail is a guard nobody reads, and this repository has a
+// documented history of exactly that: the original form of
+// TestSentinelTerminationGraceExceedsTheDrainBudget asserted a container-level field
+// for a milestone and never noticed, because a planted container-level copy is
+// indistinguishable from a correct one to a YAML parser. This test feeds the
+// detector the planted shape directly.
+func TestTerminationGraceContainerFieldIsDetectable(t *testing.T) {
+	planted := map[string]any{
+		"name":                          "sentinel",
+		"terminationGracePeriodSeconds": 45,
+	}
+	if _, present := planted["terminationGracePeriodSeconds"]; !present {
+		t.Fatal("the control is not the shape it claims to be")
+	}
+	// The same expression the real test uses, against the planted map.
+	if !containerCarriesGrace(planted) {
+		t.Fatal("the detector failed to notice a container-level " +
+			"terminationGracePeriodSeconds; the real assertion would be vacuous")
+	}
+	// And it must NOT fire on a container that does not carry it.
+	if containerCarriesGrace(map[string]any{"name": "agent"}) {
+		t.Fatal("the detector fired on a container with no such field")
+	}
+}
+
+// containerCarriesGrace is the predicate both the real assertion and the control
+// consult. Factored out so the control exercises the same expression rather than a
+// restatement of it - a control that re-implements the check proves only that the
+// control works.
+func containerCarriesGrace(container map[string]any) bool {
+	_, present := container["terminationGracePeriodSeconds"]
+	return present
 }
 
 // ---------------------------------------------------------------------------

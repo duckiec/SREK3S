@@ -1,0 +1,43 @@
+# Build context exclusions for the Sentinel image ONLY.
+#
+# Honoured by BuildKit, which looks for a file named `<dockerfile-path>.dockerignore`
+# and uses it INSTEAD of the root `.dockerignore`. The classic builder has no such
+# mechanism and falls back to the root file, which is why the root file is a floor
+# and never excludes a path any Dockerfile COPYs.
+#
+# What this context must contain, and why:
+#
+#   go.mod, go.sum   the module definition; `go mod download` runs against these
+#                    before any source is copied, so the dependency layer is cached
+#                    independently of application edits.
+#   cmd/             cmd/sentinel/Dockerfile line 67.
+#   internal/        cmd/sentinel/Dockerfile line 68.
+#
+# Everything else is dead weight in the upload. The root file cannot exclude them
+# (it must stay correct for the agent build too), so this file is where the
+# Sentinel's leanness actually lives.
+#
+# This is the structural fix for the defect that made the Sentinel unbuildable:
+# the root `.dockerignore` used to exclude `internal/` and `cmd/`, so
+# `COPY internal/ internal/` failed with `"/internal": not found` on a
+# repository where the directory plainly existed. Per-image scoping removes the
+# class of error entirely — neither image can now starve the other.
+
+# The Python agent is a separate image with a separate build. Nothing in the Go
+# build reaches into it.
+agent/
+
+# Not compiled, not copied, not needed to produce /bin/sentinel.
+tests/
+deploy/
+docs/
+scripts/
+.opencode/
+
+# Documentation and governance files. Excluded rather than merely unused: the
+# upload happens on every build and these are ~200 KB of prose per pass.
+*.md
+
+# Local scratch that a developer may have left in the worktree.
+probe_*.go
+tmpdump/

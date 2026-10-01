@@ -69,10 +69,48 @@ spec:
             # payload is already scrubbed in memory on the way out.
             - name: SREK3S_AGENT_URL
               value: http://srek3s-agent:8000
-            # Empty means all namespaces. Set to a single namespace to scope the
-            # watch and narrow the RBAC requirement at the same time.
+            # Defaults to THIS namespace, which is the namespace deploy/rbac.yaml
+            # actually grants. Secure-by-default: the shipped manifest's watch scope
+            # and its read authority now AGREE, so a straight `kubectl apply -k
+            # deploy/` produces a working, authorised watcher with no errors in its
+            # log — see "WHY THIS IS NOT EMPTY" below for what that changes.
+            #
+            # WHY THIS IS NOT EMPTY, and what it costs.
+            #
+            # An empty value means ALL namespaces. Combined with a Role that exists
+            # only in srek3s-system, that pairing is incoherent: the informer issues
+            # a cluster-wide LIST the apiserver refuses, retries forever, and the
+            # operator sees no incidents and no useful error — the confirmed defect in
+            # PRD_LIVE_VALIDATION.md §4, reproduced on this cluster before this value
+            # was changed:
+            #
+            #     failed to list *v1.Pod: pods is forbidden: User
+            #       "system:serviceaccount:srek3s-system:srek3s-sentinel" cannot list
+            #       resource "pods" in API group "" at the cluster scope
+            #
+            # A previous revision of this comment argued the value should stay empty
+            # because narrowing it "would only change WHICH namespace is
+            # unauthorised". That was reasoning about the wrong baseline. The
+            # alternative to a coherent default was not a working configuration; it
+            # was a guaranteed 403 on every LIST.
+            #
+            # WHAT THIS COSTS, stated plainly: the Sentinel observes only
+            # srek3s-system out of the box, so it will NOT report failures in
+            # application namespaces until an operator widens it. That is the
+            # intended trade — the default is the narrower, authorised one, and
+            # widening requires a deliberate act rather than a working accident.
+            #
+            # TO OBSERVE MORE, do both halves (docs/runbook.md §1 has the commands):
+            #
+            #   1. set WATCH_NAMESPACE to the namespace you want, AND
+            #   2. grant the read verbs THERE, with a RoleBinding referring back to
+            #      the ServiceAccount in srek3s-system
+            #
+            # deploy/overlays/local-live/ is a worked example of exactly that pair.
+            # A ClusterRole is NOT the fix and would be the single highest-severity
+            # change available to this codebase.
             - name: WATCH_NAMESPACE
-              value: ""
+              value: srek3s-system
             - name: TMPDIR
               value: /tmp
 
@@ -126,12 +164,21 @@ spec:
           # probe here would only be a way to remove a working pod from a Service
           # it is not part of.
 
-          # MUST exceed cmd/sentinel's ShutdownGrace (20s), or the kubelet SIGKILLs
-          # the process mid-drain and the graceful path is decorative. The
-          # invariant is asserted by TestTerminationGraceExceedsTheDrainBudget -
-          # a change to one without the other fails the build rather than turning
-          # every rolling update into a slow-loss event.
-          terminationGracePeriodSeconds: 45
+      # MUST exceed cmd/sentinel's ShutdownGrace (20s), or the kubelet SIGKILLs the
+      # process mid-drain and the graceful path is decorative. The invariant is
+      # asserted by TestTerminationGraceExceedsTheDrainBudget — a change to one
+      # without the other fails the build rather than turning every rolling update
+      # into a slow-loss event.
+      #
+      # POD level, not container level. `terminationGracePeriodSeconds` is a PodSpec
+      # field with no container-level counterpart, so at container level the
+      # apiserver rejects the whole Deployment with
+      # `strict decoding error: unknown field
+      #  "spec.template.spec.containers[0].terminationGracePeriodSeconds"`.
+      # It shipped that way and no gate caught it, for the same reason as the agent
+      # manifest: the drain-budget assertion reads the value as TEXT and cannot
+      # distinguish the two levels. Found by applying to a live control plane.
+      terminationGracePeriodSeconds: 45
 
       volumes:
         - name: tmp
@@ -146,6 +193,33 @@ spec:
 # other reason to send a packet, and "no other reason" is enforceable here in a way
 # it is not in the code - a compromised process with an unexpected egress would be
 # stopped by this rather than trusted not to have one.
+#
+# ---------------------------------------------------------------------------
+# PORTABILITY — READ BEFORE APPLYING TO A DIFFERENT CLUSTER
+# ---------------------------------------------------------------------------
+# The apiserver-egress rule below permits two DEFAULT SERVICE CIDRs — k3s's
+# `10.43.0.0/16` and kubeadm's `10.96.0.0/12` — on port 443. Both are the standard
+# values for those distributions, so the shipped manifest works on a stock cluster
+# without editing. No node or pod address appears in it: those are per-installation
+# facts, and an ephemeral one does not belong in a repository manifest.
+#
+# If your control plane is reached by an address in neither range — a different
+# service CIDR, or a genuinely external apiserver — patch the ipBlock rather than
+# editing this file, and derive the value rather than guessing it:
+#
+#   kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}'
+#
+# A stale or wrong range fails EXACTLY as the previous rule did: silently, with zero
+# 403s, and with a stats line reading `watcher_emitted: 0`. Treat a changed address
+# as a required edit rather than a cosmetic one.
+#
+# No static test in this repository can validate an address. There is no apiserver
+# to ask during `go test`, and a YAML parser can only confirm the document is
+# well-formed - which is exactly the limit that let an invalid field sit at the
+# wrong nesting level for an entire milestone. The check that matters is
+# behavioural: after any change to this rule, confirm the reflector's
+# `failed to list *v1.Pod` messages have STOPPED, and that `watcher_emitted` rises
+# when a failing pod exists. Absence of 403s proves nothing; a working LIST does.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -164,18 +238,84 @@ spec:
   # Ingress policy type, the default deny applies and nothing can reach it.
   ingress: []
   egress:
-    # The Kubernetes API. The Sentinel cannot watch pods without this, and it is
-    # the only cluster-internal dependency.
+    # -------------------------------------------------------------------------
+    # THE KUBERNETES API, BY Service CIDR ON 443.
+    #
+    # This was, until 2026-10-01:
+    #
+    #     to:
+    #       - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+    #         podSelector:       {matchLabels: {component: kube-apiserver}}
+    #     ports: [{protocol: TCP, port: 6443}]
+    #
+    # which is correct ONLY where the apiserver runs as a pod labelled
+    # `component=kube-apiserver` inside kube-system - i.e. kubeadm. It matches nothing
+    # on k3s, and nothing on EKS, GKE, or any managed control plane where the
+    # apiserver is not a selectable pod. On this cluster:
+    #
+    #     $ kubectl -n kube-system get pods -l component=kube-apiserver
+    #     No resources found in kube-system namespace.
+    #
+    # The failure is the dangerous kind. The reflector's log is unremarkable and
+    # periodic:
+    #
+    #     W reflector.go:561] failed to list *v1.Pod: Get
+    #       "https://10.43.0.1:443/api/v1/namespaces/sentinel-chaos/pods?limit=500..."
+    #       dial tcp 10.43.0.1:443: connect: connection refused
+    #
+    # interleaved with healthy counters: {"watcher_emitted":0,"watcher_dropped":0}.
+    # There were ZERO 403s, because no authorization was ever attempted. An
+    # RBAC-only check reports this deployment healthy while the watcher sees nothing,
+    # and a chaos fixture OOM-killing against it yields "no incidents detected",
+    # indistinguishable from a quiet cluster. That is precisely the silent failure
+    # PRD F4 and the post-remediation loop exist to make visible.
+    #
+    # A NetworkPolicy `to:` can select a namespace, a set of pods, or an `ipBlock`.
+    # The apiserver is a host process behind a Service in every one of these
+    # topologies, so `ipBlock` is the only instrument that can express it portably.
+    # OPERATOR ACTION: If your API server is external to the Service CIDR, you must
+    # patch this ipBlock to include your control-plane endpoints.
+    #
+    # The two ranges below are the DEFAULT SERVICE CIDRs of the two common
+    # distributions, kept deliberately generic:
+    #
+    #   10.43.0.0/16   k3s
+    #   10.96.0.0/12   kubeadm (kind, minikube, EKS, GKE)
+    #
+    # Both are private RFC1918 space and neither is a workload address, so neither
+    # widens what the Sentinel can reach as a workload; what it may DO with what it
+    # reads is still bounded by a namespaced Role enumerating
+    # ["get","list","watch"].
+    #
+    # NO NODE IP APPEARS HERE, deliberately. An earlier revision carried this
+    # cluster's node endpoint (172.30.181.188/32 on port 6443) so the policy would
+    # also cover CNIs that evaluate after DNAT to a node address. That address is
+    # ephemeral — WSL reassigns it across reboots — so committing it would have
+    # shipped a repository manifest that silently stops matching on the next boot,
+    # failing in exactly the way this rule was written to eliminate: the reflector
+    # logs `failed to list *v1.Pod`, the stats line reads `watcher_emitted: 0`, and
+    # there are ZERO 403s because no authorization is ever attempted.
+    #
+    # The rule that actually holds across reboots is the Service CIDR on 443, since
+    # in-cluster client config always addresses `kubernetes.default.svc`. A cluster
+    # that needs the node endpoint is a cluster whose operator should say so in
+    # their own overlay — where an ephemeral address belongs, and where the
+    # derivation step is documented rather than forgotten.
+    #
+    # VERIFY AFTER ANY CHANGE: the check that matters is behavioural, not static. No
+    # test in this repository can ask an apiserver whether egress works, and a YAML
+    # parser can only confirm the document is well-formed. Confirm the reflector's
+    # `failed to list *v1.Pod` messages have STOPPED and that `watcher_emitted` rises
+    # when a failing pod exists. Absence of 403s proves nothing; a working LIST does.
+    # -------------------------------------------------------------------------
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              component: kube-apiserver
+        - ipBlock:
+            cidr: 10.43.0.0/16
+        - ipBlock:
+            cidr: 10.96.0.0/12
       ports:
         - protocol: TCP
-          port: 6443
+          port: 443
     # The agent, for POST /v1/incidents.
     - to:
         - podSelector:

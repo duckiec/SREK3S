@@ -231,3 +231,99 @@ jobs:
           }
           echo "--- declared entrypoint ---"
           docker inspect --format '  ENTRYPOINT {{json .Config.Entrypoint}}' srek3s-agent:ci
+
+  multi-arch-dry-run:
+    name: Multi-architecture build (dry run, both platforms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # This job exists because of a specific, silent failure mode, and it is worth
+    # stating what it is before describing what the job does.
+    #
+    # Before the BuildKit refactor, both Dockerfiles compiled for whatever CPU
+    # happened to be running the build. That is invisible on a single-architecture
+    # CI runner: the image builds, the tests pass, and the Dockerfile is wrong.
+    # It becomes visible only when someone runs `docker buildx build
+    # --platform=linux/arm64` on an amd64 machine and discovers the binary inside
+    # is an amd64 binary wearing an arm64 label — a defect that passes every gate
+    # in this workflow and fails at pod start, on a real cluster, with an
+    # `exec format error` naming neither the Dockerfile nor the manifest.
+    #
+    # So the gate has to be a CROSS build, run here on every PR, rather than left
+    # to whoever eventually needs the other architecture.
+    #
+    # `needs` is deliberately absent: this job does not depend on the gates above.
+    # A multi-arch failure is a DIFFERENT diagnosis from a test failure, and
+    # serialising them would make a red run ambiguous about which thing broke.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # QEMU is what makes a foreign-architecture RUN instruction work. BuildKit
+      # cannot execute `go build` or `apt-get install` for another CPU without it,
+      # and the failure is a bare `exec format error` from inside a build step —
+      # which reads as a broken Dockerfile rather than as a missing emulator.
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Show the buildx builder and its platforms
+        run: docker buildx inspect --bootstrap
+
+      # `--output type=cacheonly` IS THE DRY RUN, and it is the right mechanism
+      # rather than `--push` to a throwaway tag or `--load` with a fake platform.
+      #
+      #   * `--load` cannot be combined with a multi-platform build at all; buildx
+      #     rejects it outright.
+      #   * `--push` would need a registry and would make a dry run mutate remote
+      #     state, which is precisely what a dry run exists to avoid.
+      #   * `cacheonly` runs every layer — including the foreign-architecture RUN
+      #     steps under QEMU — and then discards the result. It fails on a real
+      #     build error and produces no artefact.
+      #
+      # The agent is built FIRST and on its own because it is the slower and more
+      # likely of the two to fail: `pip install` resolves a full dependency tree
+      # for a foreign architecture, which is where a missing wheel surfaces.
+      - name: Dry-run build — agent (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: agent/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          output: type=cacheonly
+          tags: srek3s-agent:dry-run
+
+      - name: Dry-run build — sentinel (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cmd/sentinel/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          output: type=cacheonly
+          tags: srek3s-sentinel:dry-run
+
+      # A dry run proves both platforms COMPILE. It does not prove the arm64 image
+      # RUNS, and it is worth being explicit that those are different claims —
+      # `cacheonly` discards the artefact, so nothing here is executed.
+      #
+      # The Sentinel's entrypoint smoke test (`RUN /out/sentinel -version`) is
+      # SKIPPED during a cross build by design: the binary is arm64 and the builder
+      # is amd64, so executing it needs a binfmt handler. The Dockerfile prints
+      # that it skipped and names `make verify-images` as the check that does
+      # execute it. This step therefore asserts the skip was VISIBLE rather than
+      # silent, because a build that quietly stopped verifying itself is exactly
+      # the shape of failure this repository keeps finding.
+      - name: Re-derive the architecture the dry run could not check
+        run: |
+          echo "The Sentinel Dockerfile gates its entrypoint smoke test on"
+          echo "native-vs-target. Verify that decision is still present:"
+          grep -n 'SKIPPING the entrypoint smoke test' cmd/sentinel/Dockerfile
+          echo
+          echo "amd64 runner + arm64 target = cross build = the test is skipped by"
+          echo "design. 'make verify-images' on an arm64 host is what executes it."

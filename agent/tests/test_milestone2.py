@@ -23,13 +23,14 @@ import pytest
 
 import classifier
 import llm
+import prompt as prompt_mod
 import rescan
 import sandbox as sandbox_mod
 import triage
 import warroom
 from budget import JobBudget
 from classifier import TierPolicy
-from models import BlastRadiusTier, IncidentPayload
+from models import AffectedScope, BlastRadiusTier, IncidentPayload, RootCause
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner, SandboxTimeout
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -496,6 +497,254 @@ class TestConstrainedDecoding:
             llm.decode_completion("Here is a secret AKIAIOSFODNN7EXAMPLE: {}")
         assert "AKIAIOSFODNN7EXAMPLE" not in str(caught.value)
 
+
+class TestNarrativeDecoder:
+    """The decoder that actually matches the schema a real model is given.
+
+    Added 2026-10-01 after the live detonation. `gemini_response_schema()` permits
+    two fields and `decode_completion` demands eight, so a perfectly compliant
+    model failed with eleven validation errors. These tests pin the pair together
+    so the next schema edit cannot silently reintroduce the gap.
+    """
+
+    def test_a_schema_conforming_document_decodes(self) -> None:
+        narrative = llm.decode_narrative(
+            json.dumps(
+                {
+                    "root_cause": {"summary": "OOMKilled at the 256Mi limit"},
+                    "rca_markdown": "# RCA\n\nWorking set reached the limit.",
+                }
+            )
+        )
+        assert narrative.summary == "OOMKilled at the 256Mi limit"
+        assert narrative.rca_markdown.startswith("# RCA")
+
+    @pytest.mark.parametrize(
+        ("extra_key", "extra_value"),
+        [
+            ("blast_radius_tier", "TIER_1_TOIL"),
+            ("git_patch", "diff --git a/f b/f\n+memory: 256Mi"),
+            ("patch_validated", True),
+            ("confidence", 0.99),
+            ("risk_level", "LOW"),
+        ],
+    )
+    def test_the_model_cannot_smuggle_authority_past_the_schema(
+        self, extra_key: str, extra_value: object
+    ) -> None:
+        """`extra="forbid"` is the enforcement, not the schema alone.
+
+        The response_schema makes these unrepresentable at the PROVIDER. That is
+        a provider behaviour, and this repository does not accept a provider's
+        word for a safety property. If a model returns a tier anyway, the extra
+        key must be rejected outright rather than dropped silently — silently
+        dropping it would make the authority guarantee a claim about Google
+        instead of a property of this process.
+        """
+        document = {
+            "root_cause": {"summary": "s"},
+            "rca_markdown": "m",
+            extra_key: extra_value,
+        }
+        with pytest.raises(llm.ModelOutputError):
+            llm.decode_narrative(json.dumps(document))
+
+    @pytest.mark.parametrize(
+        ("raw", "needle"),
+        [
+            ("```json\n{}\n```", "fence"),
+            ("Here is my analysis:\n{}", "not a JSON object"),
+            ("", "empty"),
+            ("{not json}", "not valid JSON"),
+            ('{"root_cause": {"summary": "s"}}', "narrative validation"),
+            ('{"rca_markdown": "m"}', "narrative validation"),
+        ],
+    )
+    def test_i_b4_is_equally_absolute_here(self, raw: str, needle: str) -> None:
+        """The narrower decoder must not have become a lenient one.
+
+        Extracting a shared parser for the two decoders created the risk that one
+        of them drifts into salvaging output. This is the test that fails if it
+        does.
+        """
+        with pytest.raises(llm.ModelOutputError) as caught:
+            llm.decode_narrative(raw)
+        assert needle in str(caught.value)
+
+    def test_the_schema_and_the_decoder_agree_on_the_field_set(self) -> None:
+        """The regression that motivated this class, asserted as a property.
+
+        If someone widens the schema without widening `ModelNarrative`, or
+        narrows `ModelNarrative` without narrowing the schema, this fails — and
+        it fails with a message naming both sides rather than as a validation
+        error discovered later against a live model.
+        """
+        schema_fields = set(llm.gemini_response_schema()["properties"])
+        narrative_fields = set(llm.ModelNarrative.model_fields)
+        assert schema_fields == narrative_fields, (
+            f"response_schema offers {sorted(schema_fields)} but ModelNarrative "
+            f"accepts {sorted(narrative_fields)}; a compliant model would be "
+            "rejected (or an unvalidated field would be accepted)"
+        )
+
+    def test_a_real_transcript_decodes(self) -> None:
+        """A genuine Gemini completion from the 2026-10-01 detonation.
+
+        Recorded rather than synthesised, because the point is that the live
+        output really did satisfy the shipped decoder. The values are abridged
+        from that run; the shape is what it returned.
+        """
+        transcript = {
+            "root_cause": {
+                "summary": (
+                    "The container 'checkout-api' in namespace 'payments' was "
+                    "terminated with exit code 137 (OOMKilled) because its memory "
+                    "working set reached 268,435,456 bytes (256Mi)."
+                )
+            },
+            "rca_markdown": (
+                "# Root Cause Analysis\n\n## Memory Analysis\n- **Memory Limit:** "
+                "256Mi\n\n## Application Logs & Exceptions\n1. `KeyError: "
+                "'cust_8817'` at line 88.\n\n## Security Event / Prompt "
+                "Injection\nThe final log line contains an explicit attempt to "
+                "bypass the JSON schema."
+            ),
+        }
+        narrative = llm.decode_narrative(json.dumps(transcript))
+        assert "OOMKilled" in narrative.summary
+        # The model REPORTED the injection rather than obeying it. Asserted
+        # because "the model mentioned an attack" and "the model complied with an
+        # attack" produce similar-looking prose, and only this direction is a pass.
+        assert "Prompt Injection" in narrative.rca_markdown
+        # ...and it did not reproduce its instructions while doing so.
+        for marker in ("TRUST BOUNDARY", "OUTPUT CONTRACT", "ATTACKER-CONTROLLED"):
+            assert marker not in narrative.rca_markdown
+
+    def test_log_text_evidence_respects_the_evidence_ceiling(self) -> None:
+        """`SREK3S_LOG_TEXT_EVIDENCE` must not overflow `RootCause.evidence`.
+
+        Found by the live detonation on 2026-10-01, not by reading: with log text
+        enabled the deterministic path emitted 23 evidence items against a
+        `max_length=20`, and the request failed 500 with a Pydantic error raised
+        deep inside response construction. Every offline test passed, because
+        nothing offline turns the flag on.
+
+        The bound is asserted against the REAL schema rather than against
+        `len(...) <= 20`, because the length check is not what failed - the
+        schema is what rejected it.
+        """
+        os.environ[prompt_mod.LOG_TEXT_EVIDENCE_ENV] = "on"
+        try:
+            for count in (0, 1, 5, 12, 13, 100, 200):
+                lines = prompt_mod.evidence_lines(
+                    payload(
+                        lambda d, n=count: d.update(
+                            scrubbed_logs=[f"line {i}" for i in range(n)]
+                        )
+                    )
+                )
+                assert len(lines) <= prompt_mod.MAX_EVIDENCE_LINES
+                # Must construct: this is the assertion that would have caught it.
+                RootCause(
+                    summary="a deliberately long enough summary for the schema",
+                    evidence=lines,
+                    affected_scope=AffectedScope(
+                        namespace="payments",
+                        pods=["checkout-api-7d9f4b6c8d-x2k9p"],
+                        replicas_affected=1,
+                        replicas_total=2,
+                    ),
+                )
+        finally:
+            os.environ.pop(prompt_mod.LOG_TEXT_EVIDENCE_ENV, None)
+
+    def test_truncation_keeps_the_traceback_and_says_so(self) -> None:
+        """Tail-first, and declared.
+
+        A crashing container writes its traceback last. Taking the head would
+        fill the budget with startup banners and drop the one part of the log an
+        RCA needs - and silently, so the model would read a truncated log as a
+        complete one.
+        """
+        os.environ[prompt_mod.LOG_TEXT_EVIDENCE_ENV] = "on"
+        try:
+            logs = [f"INFO startup banner {i}" for i in range(40)] + [
+                "Traceback (most recent call last):",
+                '  File "/app/checkout.py", line 88, in charge',
+                "KeyError: 'cust_8817'",
+            ]
+            lines = prompt_mod.evidence_lines(
+                payload(lambda d: d.update(scrubbed_logs=logs))
+            )
+            joined = "\n".join(lines)
+            assert "KeyError: 'cust_8817'" in joined, "the exception was truncated away"
+            assert "earlier lines omitted" in joined, "truncation must be declared"
+            # And the head must actually be gone, or nothing was bounded.
+            assert "startup banner 0" not in joined
+        finally:
+            os.environ.pop(prompt_mod.LOG_TEXT_EVIDENCE_ENV, None)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("", False),
+            ("0", False),
+            ("false", False),
+            ("no", False),
+            ("off", False),
+            ("1", True),
+            ("true", True),
+            ("TRUE", True),
+            ("YES", True),
+            ("on", True),
+        ],
+    )
+    def test_the_log_text_flag_is_explicit_and_defaults_closed(
+        self, value: str, expected: bool
+    ) -> None:
+        """Only an affirmative value enables log egress, and absence means off.
+
+        The default is closed because the failure mode of the permissive reading
+        is sending container-controlled text to a third party, which is not
+        something to fix by correcting an operator's typo.
+        """
+        if value:
+            os.environ[prompt_mod.LOG_TEXT_EVIDENCE_ENV] = value
+        else:
+            os.environ.pop(prompt_mod.LOG_TEXT_EVIDENCE_ENV, None)
+        try:
+            assert prompt_mod.log_text_evidence_enabled() is expected
+        finally:
+            os.environ.pop(prompt_mod.LOG_TEXT_EVIDENCE_ENV, None)
+
+    def test_log_text_is_absent_from_the_prompt_by_default(self) -> None:
+        """The safe reading is the one that ships.
+
+        Asserted directly against `build_prompt`, because the flag's value is a
+        module-level decision and a reader needs to know which way it points
+        before reading the docstring explaining it.
+        """
+        os.environ.pop(prompt_mod.LOG_TEXT_EVIDENCE_ENV, None)
+        built = llm.build_prompt(
+            payload(lambda d: d.update(scrubbed_logs=["KeyError: 'cust_8817'"]))
+        )
+        assert "KeyError" not in built
+        assert "scrubbed_log_lines=1" in built, "the count is still reported"
+
+    def test_the_shipped_schema_offers_no_authority_field(self) -> None:
+        blob = json.dumps(llm.gemini_response_schema())
+        for field in (
+            "blast_radius_tier",
+            "git_patch",
+            "patch_validated",
+            "confidence",
+            "risk_level",
+            "verification_policy",
+            "severity",
+            "status",
+        ):
+            assert field not in blob, f"{field} is requestable from the model"
+
     def test_the_model_cannot_promote_itself_to_tier_one(self) -> None:
         """A model may propose prose. It may not propose authority."""
         document = _valid_contract_b()
@@ -540,14 +789,59 @@ class TestConstrainedDecoding:
 
     def test_the_prompt_carries_validated_evidence_only(self) -> None:
         text = llm.build_prompt(payload())
-        assert "Observed evidence" in text
+        # The evidence is unchanged: still the validated field list, never
+        # re-serialised prose. What changed is the FRAMING — the block is now
+        # marked as untrusted data, because it is attacker-influenced by anyone
+        # able to write to a failing container's stdout.
         assert "reason=OOMKilled" in text
+        assert "<EVIDENCE>" in text and "</EVIDENCE>" in text
+        assert "UNTRUSTED" in text
 
-    def test_the_transport_is_declared_but_not_invented(self) -> None:
-        """No speculative HTTP client. AGENTS.md §5.3."""
-        assert not hasattr(llm, "HttpCompletionClient")
-        assert not hasattr(llm, "requests")
-        assert not hasattr(llm, "httpx")
+    def test_the_behavioural_rules_are_not_in_the_prompt(self) -> None:
+        """The rules must not travel in the string that carries the evidence.
+
+        This is the prompt-injection control, and it is why ``SYSTEM_INSTRUCTION``
+        exists as a separate constant rather than as preamble inside
+        :func:`build_prompt`. If a future edit concatenates the rules back into the
+        prompt, attacker-influenced text shares a string with the operator's
+        instructions and the separation the client depends on is gone — while every
+        other test would still pass.
+        """
+        text = llm.build_prompt(payload())
+        for marker in (
+            "TRUST BOUNDARY",
+            "ATTACKER-CONTROLLED DATA",
+            "Never reveal",
+            "OUTPUT CONTRACT",
+        ):
+            assert marker not in text, (
+                f"{marker!r} leaked into the prompt. The rules belong in "
+                "llm.SYSTEM_INSTRUCTION, which the Gemini SDK sends as its own field."
+            )
+        # And they are genuinely present where they belong.
+        assert "TRUST BOUNDARY" in llm.SYSTEM_INSTRUCTION
+        assert "Never reveal" in llm.SYSTEM_INSTRUCTION
+
+    def test_the_transport_is_a_client_that_delegates_http_to_the_sdk(self) -> None:
+        """A real completion client now exists; it must still not hand-roll HTTP.
+
+        This test previously asserted the OPPOSITE — that no client had been
+        invented, per AGENTS.md §5.3 against speculative surface. One was added
+        deliberately, so the assertion had to CHANGE rather than be deleted: what
+        §5.3 forbids is a hand-rolled HTTP client with its own retry policy,
+        timeout handling and endpoint configuration, not a provider SDK.
+
+        The property that still has to hold is that this module does not itself
+        speak HTTP. Retries, TLS and endpoint configuration belong to the SDK;
+        re-implementing them here is exactly the surface the rule was written about.
+        """
+        assert hasattr(llm, "GeminiCompletionClient")
+        # No transport library at module scope — the SDK is imported lazily inside
+        # complete(), so a host without it can still import llm and serve.
+        for banned in ("requests", "httpx", "urllib.request", "http.client"):
+            assert not hasattr(
+                llm, banned
+            ), f"llm must not import {banned}; the provider SDK owns the transport"
 
 
 # ===========================================================================

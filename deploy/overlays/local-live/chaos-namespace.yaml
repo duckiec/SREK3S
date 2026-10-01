@@ -1,0 +1,48 @@
+# The disposable chaos namespace.
+#
+# Separate from `srek3s-system`, and that separation is the blast-radius guardrail
+# rather than an organisational preference:
+#
+#   * A NetworkPolicy in `default` inherits the base policy set for every other
+#     workload on the cluster. Putting the Sentinel's egress restrictions there
+#     would either break unrelated services or be quietly widened to make them work
+#     — and a widened policy is a policy that is no longer the one tested.
+#   * RBAC in `default` is easy to inherit. In its own namespace, a RoleBinding
+#     naming the wrong ServiceAccount is namespaced to this namespace and the
+#     mistake is visible in review.
+#
+# PSA is `restricted`, matching deploy/namespace.yaml rather than relaxing to
+# `baseline`. `deploy/chaos/oom-leak.yaml` and `deploy/chaos/crashloop.yaml` are
+# both written to satisfy it — runAsUser 10001, seccomp RuntimeDefault,
+# allowPrivilegeEscalation false, capabilities.drop ALL, readOnlyRootFilesystem
+# true. A fixture that is refused admission at the gate is worse than no fixture:
+# it fails closed and reads as "the cluster is quiet".
+#
+# `enforce-version: latest` resolves against the RUNNING control plane, which is
+# k3s v1.36.4 locally and v1.29.9 in CI. A manifest this host admits can be refused
+# by CI for a reason unrelated to the code, so any PSA finding must name the
+# control-plane version before it is called a defect.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: sentinel-chaos
+    app.kubernetes.io/part-of: srek3s
+    app.kubernetes.io/component: chaos
+    # Pod Security Admission, `restricted`. Warn and audit at the same level, so a
+    # violation is recorded even where a future change has to lower `enforce` for a
+    # legitimate reason — there would be a record of it happening.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    # Teardown hook. `TESTING_BASE_RULES.md` Rule 4 makes removal of this namespace
+    # mandatory before and after a run.
+    #
+    # Recorded honestly: **no controller consumes these labels.** Nothing in the
+    # workflows, scripts or e2e harness reads them, and this manifest says so rather
+    # than implying an automated janitor that does not exist. They are a labelled
+    # hook for a human or a future cleanup script, not a mechanism.
+    srek3s.io/chaos: enabled
+    srek3s.io/cleanup: manual

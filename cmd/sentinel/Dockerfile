@@ -54,13 +54,18 @@
 # means, and a tag like `ignore` or `osusergo` is exactly the kind of thing that
 # differs between releases.
 # ---------------------------------------------------------------------------
-FROM golang:1.23-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
 
 WORKDIR /src
 
 # Dependencies first, as their own layer. The source COPY below invalidates on
 # every edit, and without this split every source change would re-download the
 # whole client-go tree.
+#
+# `go mod download` runs for the HOST's toolchain, not the target's. That is
+# correct and is the whole point of the `--platform=$BUILDPLATFORM` above: the
+# module graph is architecture-independent, so there is no reason to emulate a
+# foreign CPU to populate it.
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -73,25 +78,114 @@ COPY internal/ internal/
 # not load-bearing for health - it is for telling a running pod which build it is.
 ARG VERSION=0.1.0-dev
 
+# ---------------------------------------------------------------------------
+# CROSS-COMPILATION
+# ---------------------------------------------------------------------------
+# `ARG TARGETOS` / `ARG TARGETARCH` are BuildKit's automatic platform arguments.
+# They are declared here rather than used implicitly because an undeclared ARG is
+# silently empty, and an empty GOARCH makes `go build` fall back to the host -
+# producing an image that is labelled for one architecture and contains another,
+# which fails at pod start on an exec format error and not before.
+#
+# `--platform=$BUILDPLATFORM` on the FROM line is what makes this GENUINE
+# cross-compilation rather than emulation. The builder stays on the host's own
+# CPU and emits a foreign-architecture binary with the Go toolchain's own
+# cross-compiler. Nothing is translated and no binfmt handler is needed, because
+# the resulting binary is never EXECUTED during the build - only written.
+#
+# That last clause is the entire design, because of the smoke test below.
+#
+# `TARGETARCH` is the GOARCH spelling BuildKit provides (`amd64`, `arm64`), not
+# the Dockerfile platform spelling (`x86_64`, `aarch64`). They differ and using
+# the wrong one is the classic cross-build failure: `GOARCH=x86_64` is invalid
+# and `go build` reports it, while `GOARCH=aarch64` is invalid and the failure
+# appears much later, as a binary that will not run.
+#
+# `${TARGETOS:-linux}` is a fallback, not a default: BuildKit always sets
+# TARGETOS for a `FROM --platform=` build, so the fallback exists solely for the
+# CLASSIC builder, which sets neither and would otherwise expand to `GOOS=` and
+# fail with a message about the host OS.
+ARG TARGETOS
+ARG TARGETARCH
+
 # CGO_ENABLED=0: the module has no cgo imports (asserted by the absence of any
 # `import "C"`, and the resulting binary is verified to be static), and a static
-# binary is what lets the runtime stage be distroless rather than glibc.
+# binary is what lets the runtime stage be distroless rather than glibc. It also
+# means the output is runnable on any kernel of the target architecture, which is
+# what lets one image be loaded on nodes of mixed architecture.
 # -trimpath strips local filesystem paths from the binary; without it the build
 # embeds the builder's directory layout into the shipped artefact.
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
       -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/sentinel \
       ./cmd/sentinel
 
-# The entrypoint is probed, not the file's mode: /bin/sentinel -version must
-# exit 0, and a file that exists but is not executable fails the liveness probe
-# with a permission error that names neither the Dockerfile nor the manifest.
-RUN /out/sentinel -version >/dev/null
+# ---------------------------------------------------------------------------
+# THE SMOKE TEST, AND WHY IT IS CONDITIONAL
+# ---------------------------------------------------------------------------
+# `/bin/sentinel -version` must exit 0: a file that exists but is not executable
+# fails the liveness probe with a permission error naming neither this file nor
+# the manifest, so this assertion is worth having.
+#
+# It can only run when the target architecture IS the build architecture. On this
+# host (linux/arm64) a `--platform=linux/amd64` build produces an amd64 binary, and
+# executing it needs a binfmt handler - `/proc/sys/fs/binfmt_misc/` on a stock
+# WSL2 host contains only `register`, `status` and `WSLInterop`, so the exec
+# fails with ENOEXEC and the build dies on a cross-compilation that in fact
+# SUCCEEDED.
+#
+# So the assertion is gated on the build being native, and the gate is explicit
+# rather than a silent skip: a cross build reports that it did not run the smoke
+# test, so the omission is visible in the build log instead of being invisible in
+# a layer that was cached.
+#
+# WHAT THIS COSTS, stated rather than hidden: on a cross build, "the entrypoint
+# runs" is verified by `go build` succeeding and by the executable bit existing,
+# not by execution. That is weaker. It is not nothing - a bad linker target or a
+# missing package fails the build outright - but it does not prove the binary
+# starts. `make verify-images` runs the smoke test natively for the host
+# architecture, which is where the host CAN execute what it built; the cross-arch
+# leg is verified by loading the image and running it under emulation, which is a
+# separate, opt-in target.
+RUN set -eu; \
+    build_arch="$(go env GOHOSTARCH)"; \
+    target_arch="${TARGETARCH:-$build_arch}"; \
+    if [ "$build_arch" = "$target_arch" ]; then \
+      echo "native build ($build_arch): running the entrypoint smoke test"; \
+      /out/sentinel -version >/dev/null; \
+    else \
+      echo "cross build ($build_arch -> $target_arch): SKIPPING the entrypoint smoke test."; \
+      echo "  The binary cannot be executed here without a binfmt handler."; \
+      echo "  Verify it with 'make verify-images PLATFORM=linux/$target_arch' on a host with emulation."; \
+    fi
 
 # ---------------------------------------------------------------------------
 # Runtime stage.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Runtime stage.
+# ---------------------------------------------------------------------------
+# NO `--platform=` FLAG HERE, and BuildKit agrees: the final stage defaults to
+# `$TARGETPLATFORM`, so `RedundantTargetPlatform: Setting platform to predefined
+# $TARGETPLATFORM in FROM is redundant` is the warning it emits if you write it.
+#
+# An earlier revision DID write `--platform=$TARGETPLATFORM` here, on the reasoning
+# that naming the value was clearer than relying on a default. That is a real
+# trade — explicitness versus a warning on every build — and it resolved toward
+# silence, because a warning printed on every build teaches people to ignore
+# warnings, and this Dockerfile's warnings are the ones that matter.
+#
+# The asymmetry with the BUILD stage above is intentional and is the thing worth
+# remembering: `--platform=$BUILDPLATFORM` there is load-bearing (it is what makes
+# the build a genuine cross-compile rather than an emulation), and its absence
+# here is equally load-bearing (the default is already correct). Same word, two
+# opposite decisions, for two different reasons.
+#
+# The pin to `-debian12` is also multi-arch: distroless static publishes both
+# linux/amd64 and linux/arm64, so one line serves both. Had that not been true the
+# first arm64 build would have failed with `no matching manifest`, an error that
+# names the tag rather than the architecture.
 FROM gcr.io/distroless/static-debian12
 
 LABEL org.opencontainers.image.title="srek3s-sentinel" \

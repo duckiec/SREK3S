@@ -1,0 +1,229 @@
+# SREK3S local live-validation overlay.
+#
+# Two things this overlay exists to do, and one thing it must never do.
+#
+# DO  1. Make Tier-1 reachable in-cluster, by giving the agent a readable target
+#        manifest so I-B2 can be satisfied and a patch can be verified.
+# DO  2. Scope the Sentinel's watch to `sentinel-chaos`, so its watch scope and its
+#        RBAC grant agree (see PRD_LIVE_VALIDATION.md §4).
+# NEVER weaken Pod Security Admission. `deploy/namespace.yaml` enforces
+#        `restricted`, and that stays.
+#
+# ---------------------------------------------------------------------------
+# WHY NOT A hostPath MOUNT — the correction that produced this overlay
+# ---------------------------------------------------------------------------
+# An earlier revision of this overlay mounted the checkout with:
+#
+#     volumes:
+#       - name: manifests
+#         hostPath:
+#           path: /home/duckie/SREK3S
+#
+# That pod would never have started. Pod Security `restricted` permits exactly
+# these volume types, and `hostPath` is not among them:
+#
+#     configMap, csi, downwardAPI, emptyDir, ephemeral,
+#     persistentVolumeClaim, projected, secret
+#
+# `hostPath` is additionally forbidden outright by the Baseline profile
+# (`spec.volumes[*].hostPath`, allowed values `nil` only). The apiserver's PSA
+# admission controller rejects the pod at creation with a `violates PodSecurity
+# "restricted:latest"` error naming `spec.volumes[1].hostPath`.
+#
+# So the answer was never to relax the namespace. The correct in-cluster pattern
+# for "give a container a read-only copy of one file" under `restricted` is a
+# ConfigMap projected to the path the agent expects.
+#
+# ---------------------------------------------------------------------------
+# WHY NOT MOUNT .git/
+# ---------------------------------------------------------------------------
+# Even had hostPath been permitted, mounting a working tree hands the container
+# `.git`: hooks that execute, an object store, reflogs, and remote URLs that may
+# embed a credential. An analysis container has no use for any of it and every
+# reason to lack it. The content this needs is a *single reviewed manifest*, not a
+# repository, so a ConfigMap carrying exactly that file is both smaller and safer.
+#
+# `agent/patch.py` layer 3 already does the right thing with whatever bytes it is
+# given: it copies the target into a throwaway repository under /tmp, runs
+# `git init` there, and executes `git apply --check` against those bytes. It never
+# needs a `.git` in the mounted path.
+#
+# ---------------------------------------------------------------------------
+# ORDERING
+# ---------------------------------------------------------------------------
+# `deploy/kustomization.yaml` orders resources by hand because Kustomize does not
+# order them and `kubectl apply -k` sends them in the order the API receives them.
+# `namespace.yaml` first, then `rbac.yaml` (the Role and ServiceAccount the
+# Deployments reference), then the workloads, then the Service. This file repeats
+# that order rather than inheriting it, because an overlay that lists resources
+# alphabetically reintroduces "namespace not found".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# THE `namespace:` TRANSFORM COLLIDES WITH A SECOND NAMESPACE — read this
+# ---------------------------------------------------------------------------
+# `namespace: srek3s-system` below rewrites the `metadata.namespace` of every
+# namespaced resource. It does NOT skip Namespace objects, and a Namespace is
+# namespaced-by-name in a way that makes this actively wrong here: the build fails
+# with
+#
+#     namespace transformation produces ID conflict: ... "name":"srek3s-system" ...
+#     ... "previousNames":"sentinel-chaos" ... "name":"srek3s-system"
+#
+# i.e. `sentinel-chaos` was RENAMED to `srek3s-system` and collided with the real
+# one. A silently-correct-looking transform that would have produced a cluster with
+# two identical namespaces and no chaos namespace at all.
+#
+# Fix: the base already sets `namespace: srek3s-system` for its own five manifests,
+# so the overlay does not need to set it again. Dropping the field here leaves the
+# base's own value in force for everything it contributes, and leaves
+# ./chaos-namespace.yaml's explicit `metadata.name: sentinel-chaos` untouched —
+# because that object declares its own name rather than inheriting one.
+#
+# If a future object ever needs a namespace that differs from the base's, set it
+# explicitly on THAT object rather than by re-adding a blanket transform here. A
+# global `namespace:` in an overlay that spans two namespaces is always a bug waiting
+# for the second namespace to be added.
+#
+# commonLabels is likewise applied to both namespaces, which is intended: the chaos
+# namespace carries app.kubernetes.io/part-of: srek3s so a `part-of=srek3s` sweep
+# finds the fixtures alongside the components.
+
+commonLabels:
+  app.kubernetes.io/part-of: srek3s
+
+# ---------------------------------------------------------------------------
+# WHY THE BASE IS A SIBLING DIRECTORY, NOT `../..`
+# ---------------------------------------------------------------------------
+# `resources: - ../../namespace.yaml` does not build. Kustomize's default load
+# restrictor ("RootOnly") refuses any file outside the directory being built:
+#
+#     error: accumulating resources: file 'deploy/namespace.yaml' is not in or below
+#            'deploy/overlays/local-live'
+#
+# The usual workaround is `loadRestrictions: LoadRestrictionsNone`, which silences the
+# error by disabling a containment boundary for every resource the overlay builds. That
+# is the wrong trade — the restrictor is what stops an overlay from quietly reaching into
+# a sibling tree and pulling something in silently.
+#
+# So the base manifests are exposed as their own directory at `deploy/base/`, referenced
+# as `../base`. That is a directory reference two levels up rather than a FILE reference
+# two levels up, and the difference is what the restrictor permits: a directory carries
+# its own `kustomization.yaml`, so the resolver follows the resource's own root instead
+# of demanding the file sit below the overlay's. `deploy/base/` declares the resources
+# itself rather than re-listing them here, so there is exactly one definition of the
+# production set inside the overlay tree.
+#
+# `deploy/kustomization.yaml` remains the base of record and is untouched. This overlay
+# never references it, so the production set and the validation set cannot drift into
+# sharing a definition — and therefore cannot share a bug.
+resources:
+  # Order inside ../../base/ is load-bearing; see deploy/base/kustomization.yaml.
+  #
+  # PATH ARITHMETIC, because getting it wrong twice is how this was discovered:
+  # the overlay lives at deploy/overlays/local-live/ and the base at deploy/base/, so
+  # the base is TWO levels up. A first attempt wrote `./base` and a second wrote
+  # `../base` (resolving to deploy/overlays/base, which does not exist). Both failed
+  # with `evalsymlink failure ... no such file or directory` — a message that reads
+  # like the load restrictor is still refusing a legitimate reference, when in fact
+  # the reference was simply wrong. Worth naming because the failure mode looks like
+  # a containment problem and is really an arithmetic one.
+  - ../../base
+  # Local-validation additions come AFTER the workloads so the namespaces exist before
+  # anything inside them is created.
+  - ./chaos-namespace.yaml
+  - ./chaos-rbac.yaml
+
+# ---------------------------------------------------------------------------
+# THE TARGET-MANIFEST CONFIGMAP IS DECLARED IN ../base, NOT HERE
+# ---------------------------------------------------------------------------
+# It was declared here first, and the agent pods would not start:
+#
+#     MountVolume.SetUp failed for volume "manifests": configmap
+#       "srek3s-target-manifest" not found
+#
+# with the ConfigMap sitting harmlessly in the `default` namespace. The cause is
+# this file's missing `namespace:` — see the long note at the top of this file for
+# why it was removed. A `configMapGenerator` declared in a kustomization with no
+# `namespace:` in scope produces a ConfigMap with NO `metadata.namespace`, and
+# `kubectl apply` places it in the current context's namespace.
+#
+# It now lives in deploy/base/kustomization.yaml, whose `namespace: srek3s-system`
+# applies without colliding (that base contains exactly one Namespace object, already
+# named srek3s-system). Declaring it in both places would also be a silent duplicate:
+# kustomize would generate the object twice under two names and the patch would
+# reference whichever it resolved.
+#
+# The `disableNameSuffixHash` decision and its cost are documented in ../base, where
+# the generator now is. Nothing about the rollout-trigger tradeoff changes by moving
+# the declaration — a reference introduced by a patch still escapes the name-reference
+# transformer.
+
+# No `images:` block, for the same reason deploy/kustomization.yaml has none: an
+# override here would hide the tag the hardening tests parse from the manifest
+# that would actually ship. The tags are imported into the k8s.io containerd
+# namespace under their exact qualified names instead.
+
+patches:
+  # -------------------------------------------------------------------------
+  # Agent: project the manifest to /manifests/deploy/chaos/oom-leak.yaml
+  #
+  # `projected` rather than a bare `configMap` volume, because the agent's
+  # provider resolves `SREK3S_TARGET_MANIFEST` as a REPO-RELATIVE path and then
+  # walks it under `SREK3S_MANIFEST_ROOT`. A plain configMap volume would place the
+  # file at /manifests/oom-leak.yaml and the provider would report it unreadable,
+  # escalating to Tier-2 for a reason that has nothing to do with fail-closed
+  # behaviour. The `items:` `path:` is what makes the layout match.
+  #
+  # readOnly: true — I-B4. The agent must not be able to rewrite the manifest it
+  # is about to propose a diff against, or the diff could apply to something other
+  # than what it was derived from. That failure is reachable from this direction.
+  # -------------------------------------------------------------------------
+  - path: ./patch-agent-manifests.yaml
+    target:
+      kind: Deployment
+      name: srek3s-agent
+
+  # -------------------------------------------------------------------------
+  # Sentinel: scope the watch to the namespace its Role is bound into.
+  #
+  # This is the two-sided fix for the mismatch recorded in
+  # PRD_LIVE_VALIDATION.md §4. `deploy/sentinel.yaml` ships `WATCH_NAMESPACE: ""`,
+  # which asks for a cluster-wide LIST that the namespaced Role does not grant; the
+  # informer then retries a forbidden request forever and the operator sees silence.
+  # The paired half of the fix is ./chaos-rbac.yaml, which grants the read verbs
+  # in that namespace. Neither half works without the other.
+  # -------------------------------------------------------------------------
+  - path: ./patch-sentinel-scope.yaml
+    target:
+      kind: Deployment
+      name: srek3s-sentinel
+
+  # -------------------------------------------------------------------------
+  # NO NETWORKPOLICY PATCH HERE — AND THAT IS THE POINT.
+  #
+  # There used to be one. The shipped apiserver-egress rule selected
+  # `component=kube-apiserver` pods in kube-system on port 6443, which is correct
+  # only for kubeadm and matches nothing on k3s, EKS, GKE or any managed control
+  # plane where the apiserver is not a selectable pod. The Sentinel's reflector then
+  # logged `failed to list *v1.Pod ... connection refused` every 30s forever,
+  # interleaved with `watcher_emitted: 0`, and produced ZERO 403s because no
+  # authorization was ever attempted. A watcher that is silently blind.
+  #
+  # The fix was first written as an overlay patch, on the reasoning that the base
+  # rule was correct for kubeadm and rewriting it would break kubeadm users. That
+  # reasoning was wrong in its conclusion: an `ipBlock` covering the `kubernetes`
+  # Service CIDR and the node endpoint works on EVERY topology, because the
+  # apiserver is a host process behind a Service in all of them. A rule that only
+  # works on one distribution is a defect, not a portability choice.
+  #
+  # So the fix was GRADUATED INTO deploy/sentinel.yaml, and this patch was deleted.
+  # Leaving it would have been actively harmful: the overlay would mask a
+  # regression in the base rule, so a future edit that broke the base would still
+  # produce a working local validation run and the defect would ship.
+  #
+  # The overlay now asserts nothing about egress, which means
+  # REALWORLD_TESTING.md §1's informer-sync check measures the BASE policy. That is
+  # the arrangement worth having: the validation overlay tests the thing that ships.
+  # -------------------------------------------------------------------------

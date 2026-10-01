@@ -8,10 +8,16 @@
 | Requirement source | `PRD.md` |
 | Delivery plan | `ROADMAP.md` |
 | Defect history | `docs/lessons-learned.md` |
+| Engineering rationale | [`ENGINEERING.md`](ENGINEERING.md) |
 
 > Per AGENTS.md §5, this document is the single source of truth for schemas and directory
 > layout. Changes here require an explicit decision; roadmap tasks must not invent new
 > layouts or field names.
+
+> **Reading order.** This document says *what* the system is. [`ENGINEERING.md`](ENGINEERING.md)
+> says *why*, and is written for the maintainer who arrives later and cannot tell whether a
+> tempting simplification is safe — including the boundaries that look like friction and the
+> test methodology that produced them.
 
 ---
 
@@ -59,6 +65,11 @@
 token, and no RBAC role of its own. Its only egress is one HTTP POST to the Sentinel, and its
 only output is text. Structural absence of a credential is the control — not a policy check.
 
+**Watch scope is part of the boundary, and it is currently inconsistent.** The box above
+draws a cluster. What the Sentinel actually watches is set by `WATCH_NAMESPACE`, and what it
+is *permitted* to watch is set by `deploy/rbac.yaml`. Those two must agree, and **as
+committed they do not** — see §2.1, which is a documented defect rather than a design note.
+
 ---
 
 ## 2. Component Boundary and Least Privilege
@@ -72,6 +83,48 @@ only output is text. Structural absence of a credential is the control — not a
 No mutating verb (`create`, `update`, `patch`, `delete`, `deletecollection`) appears in any
 `Role` under `deploy/`. This is asserted by a test that parses the manifests (PRD AC-4).
 
+### 2.1 Scope and grant must agree — open defect
+
+**This section documents an inconsistency in the committed manifests, found by static
+analysis on 2026-10-01 and not yet reproduced at runtime.** It is recorded here rather than
+fixed, because `WATCH_NAMESPACE` and the `Role` are both correct in isolation and the defect
+is in the pairing; fixing either one alone is a judgement call that belongs with the open
+`ROADMAP.md` task, not with a documentation edit.
+
+| Where | What it sets |
+|---|---|
+| `deploy/sentinel.yaml` → `env: WATCH_NAMESPACE: ""` | Watch **all namespaces**. An empty value is the sentinel for "do not scope", and it selects a cluster-wide informer factory, whose initial `LIST` is `GET /api/v1/pods` against every namespace. |
+| `deploy/rbac.yaml` | A **namespaced `Role`** in `srek3s-system`. No `ClusterRole`. No `ClusterRoleBinding`. Nothing anywhere in `deploy/` grants a cluster-scoped read. |
+
+The consequence is exact: the cluster-wide `LIST` is **unauthorised**. The informer retries
+the forbidden `LIST` on its backoff, and the observable result is **no incidents and no
+error** — the process starts cleanly, logs a startup line, and reports a quiet cluster. That
+is indistinguishable, from the outside, from a healthy Sentinel watching a namespace that
+happens to have nothing wrong in it.
+
+Three properties make it worth naming rather than fixing quietly:
+
+1. **Every gate in this repository still passes.** `TestSentinelRoleGrantsNoMutatingVerb`
+   asserts the Role has no write verb — true. The sibling check
+   `TestSentinelRoleGrantsWhatTheWatcherReads` asserts the Role grants the reads the
+   watcher *would* make — also true, for `srek3s-system`. Both assertions are scoped to the
+   namespace the Role lives in; neither compares that namespace against the value of
+   `WATCH_NAMESPACE`. A pair of individually-correct checks over a pair of individually-
+   correct manifests, whose composition is wrong.
+2. **The fix is not "add a `ClusterRole`."** That is the single highest-severity change
+   available to this codebase (PRD §5.2, runbook §1) and it would make the RBAC tests pass
+   in a way that widens blast radius rather than restoring function.
+3. **The correct fix is two-sided**: set `WATCH_NAMESPACE` to a specific namespace *and*
+   place a matching `Role` + `RoleBinding` in that namespace, referring to the ServiceAccount
+   in `srek3s-system`. The procedure and its `kubectl auth can-i` confirmation are in
+   `docs/runbook.md` §1, "RBAC is namespace-scoped, and that is deliberate". One Role per
+   namespace is the intended shape, not a workaround.
+
+**What an operator should expect until this is resolved.** A Sentinel applied from
+`deploy/` as committed reports nothing and logs nothing that says why. The startup line
+naming `watch_namespace` is the cheapest diagnostic that exists — read it before
+concluding the cluster is quiet (`docs/runbook.md` §2).
+
 ---
 
 ## 3. Directory Layout
@@ -81,7 +134,14 @@ SREK3S/
 ├── AGENTS.md                     # engineering guardrails (authoritative)
 ├── PRD.md                        # requirements + acceptance criteria
 ├── ARCHITECTURE.md               # THIS FILE — schemas + layout (single source of truth)
+├── ENGINEERING.md                # WHY it is built this way; for people changing it
 ├── ROADMAP.md                    # 4 sequential milestones
+├── Makefile                      # make doctor / bootstrap / test / build / deploy
+│
+├── .github/workflows/
+│   ├── ci.yaml                   # G1-G6 + container smoke + multi-arch dry run
+│   ├── release.yaml              # tag-gated GHCR publish, linux/amd64 + linux/arm64
+│   └── e2e-detonation.yaml       # live-cluster detonation
 │
 ├── cmd/
 │   └── sentinel/                 # Go entrypoint; wiring, flags, signal handling
@@ -139,9 +199,15 @@ SREK3S/
 │   ├── agent.yaml                # FastAPI: same hardening
 │   ├── service.yaml              # agent ClusterIP; target of SREK3S_AGENT_URL
 │   ├── kustomization.yaml
-│   └── chaos/                    # Milestone 4 synthetic chaos fixtures
-│       ├── oom-leak.yaml
-│       └── crashloop.yaml
+│   └── chaos/                    # deliberate-failure fixtures
+│       ├── oom-leak.yaml        # allocates past its cgroup limit
+│       ├── crashloop.yaml       # exits non-zero in a loop
+│       └── real-crash.yaml      # a REAL app: traceback + planted credential
+│
+├── scripts/
+│   ├── audit_workflow.py         # audits the CI definition itself
+│   └── bootstrap.sh              # host pre-flight; `make doctor`
+│
 │
 └── tests/
     ├── benchmarks/         # load generation for the saturation gates
@@ -446,6 +512,206 @@ workloads, because only those produce the `Waiting{CrashLoopBackOff}` /
 `OOMKilled` states the criteria are written against. A single-shot Job cannot be
 verified by this loop, because it will never emit an incident to verify.
 
+### 5.5.1 The verification loop is implemented, tested, and not wired
+
+**`agent/verify.py` is not reachable from the running HTTP service.** The module is 741
+lines, implements §5.2 in full, and is covered by `agent/tests/test_verify.py` and
+`agent/tests/test_verification_e2e.py` — including a live-k3s leg recorded in `ROADMAP.md`
+box `4.3.4` that applied a real unified diff with `git apply`, synced the workload, and
+observed both a `VERIFIED` and an `UNRESOLVED` verdict. Its write-incapability is asserted
+twice, statically by `TestZeroWrites` walking the module's AST and at runtime by
+`TestRuntimeTripwire` arming a real `sys.addaudithook`.
+
+**And no production module imports it.** `main.py` and `triage.py` do not. `triage.py`
+*emits* a `verification_policy` on the wire, and nothing in the service reads that field.
+So PRD F4 — "close the loop" — is **specified and unit-verified but not reachable in the
+shipped service**.
+
+Recorded here because the failure mode is specific and expensive. A reader meeting
+`agent/verify.py` in the §3 tree, a `verification_policy` in the §5.1 field spec, sixty
+recorded tests (`ROADMAP.md` box `4.3.2`), and a green terminal validation in
+`ROADMAP.md` will conclude the loop runs. Nothing
+in this repository contradicts that conclusion, because nothing in this repository asserts
+the wiring — there is no test that fails when a module is orphaned. **Coverage of a module is
+not evidence that the module is called**, and the only check that would catch it is an
+import-graph assertion from the FastAPI app factory, which does not exist and is the obvious
+candidate for a post-MVP gate.
+
+Two things this does *not* affect, so they are stated to prevent over-correction:
+
+- **The no-autofix guarantee.** `docs/runbook.md` §5 cites `verify.py` as evidence that the
+  agent cannot write to a cluster. That remains true, and is arguably strengthened by the
+  module being unwired: a component nothing imports cannot acquire authority.
+- **`verification_policy` as a contract field.** §5.1 and §5.2 remain accurate as a
+  *schema*. The field is emitted; what is absent is a consumer.
+
+Open task in `ROADMAP.md`. Do not write work that assumes the loop is live.
+
+### 5.5.2 `agent/llm.py` is a validation boundary with an optional Gemini client
+
+`agent/llm.py` owns the boundary a model crosses. **As shipped and as wired on 2026-10-01,
+the model is not on the decision path**: the deterministic Tier-1 classifier and the tier
+router both run ahead of any model consultation (§5.3), and the Gemini client is reached only
+to enrich the Tier-2 RCA *narrative*. See the two halves below, because they have different
+authority.
+
+**The validation boundary — always on, provider-independent.**
+
+- `CompletionClient` is a `typing.Protocol`. It now has **one implementation**,
+  `GeminiCompletionClient`, but the protocol remains the seam: tests inject a stub, and
+  `decode_completion` stays the only path from a completion string to a `TriageResponse`.
+- The module imports **no network library at module scope.** `google-genai` is imported
+  lazily inside `GeminiCompletionClient.complete()`, so a host without the SDK, without a
+  `GEMINI_API_KEY`, or air-gapped, still imports this module, still triages, and still
+  answers `/healthz`. Verified: the module imported with `google.generativeai` absent from
+  `sys.modules`, and `/healthz` + `/readyz` both returned 200 with the SDK installed.
+- No test asserts the absence of a client any more — that assertion became false when one
+  was added, and a deleted assertion is not a satisfied one. What is asserted instead is the
+  property AGENTS.md §5.3 was actually about: `llm` must not hand-roll HTTP. It has no
+  `requests`, `httpx`, `urllib.request` or `http.client` attribute; retries, TLS, timeouts
+  and endpoint configuration belong to the provider SDK.
+- Every artefact the **tier, patch and validation flags** produce is deterministic: regex
+  matching, quantity arithmetic, PyYAML structural parsing, and real `git apply`. Two
+  incidents with the same payload produce byte-identical output for those fields, which is
+  what makes the goldens in `tests/fixtures/expected/` meaningful. **This claim does not
+  extend to the prose fields once a model is reachable** — see the second half.
+
+**The Gemini client — present, structured, and deliberately powerless.**
+
+- SDK is **`google-genai`**, not `google-generativeai`. The latter is Google's legacy client,
+  carrying `Development Status :: 7 - Inactive` in its own metadata, and
+  `ai.google.dev/gemini-api/docs/migrate` directs users to migrate. The default model is a 3.x
+  Flash, **not `gemini-1.5-flash`**: the deprecation table lists no 1.5-series model at all,
+  so 1.5 has been shut down and a request for it returns `NOT_FOUND`. Both names are
+  overridable (`GEMINI_MODEL`) because fleet availability is Google's fact, not this repo's.
+- `system_instruction=` carries the behavioural rules as **their own provider field**. The
+  telemetry goes in `contents`. This is the prompt-injection control and it is structural
+  rather than advisory: anyone able to write to a failing container's stdout can print text
+  that reads like an instruction, so "put the rules first in the prompt" is not a defence.
+  Verified by capturing the outbound call, not by reading the source — `contents` contained no
+  rule marker, and `system_instruction` contained no evidence.
+- `response_mime_type="application/json"` plus `response_schema` constrain the output **at the
+  provider**. The schema is deliberately narrower than `TriageResponse`: it exposes only
+  `root_cause.summary` and `rca_markdown`, and **not** `blast_radius_tier`,
+  `remediation.git_patch`, `patch_validated` or `confidence`. A model physically cannot
+  return a tier or a patch, because the schema has no field to return one in. `reconcile`
+  overwrites those from the router regardless.
+- `decode_completion` remains the last line even though the provider constrains the output,
+  because a provider behaviour is not a safety property this repository will take on trust.
+  I-B4 still holds.
+- Failure modes all raise `ModelOutputError`, including a refusal or an empty completion. A
+  refusal is a **valid outcome**, and the caller escalates rather than retrying — retrying a
+  model that declined once tends to produce prose again.
+- `decode_narrative` is the decoder for a real client. `decode_completion` still
+  validates the full document and remains the boundary for any client handed the
+  whole thing. **These are not interchangeable**: the schema offers two fields and
+  the full decoder demands eight, so a perfectly compliant model fails
+  `decode_completion`. `ModelNarrative` declares the permitted slice as a model so
+  the two halves agree by construction, and a test asserts the field sets match.
+- Thinking is disabled (`thinking_budget=0`). 3.x Flash models reason before
+  answering and charge that reasoning against `max_output_tokens`; measured with a
+  1459-character prompt, the default budget produced `finish_reason=MAX_TOKENS` with
+  **no text part at all**. It also restores what `temperature=0.0` means — reasoning
+  left enabled can vary between runs in ways 0.0 does not control.
+- Retries cover **500/502/503/504 and `UNAVAILABLE`/`DEADLINE_EXCEEDED` only**, at
+  most 3 attempts inside the 60s budget. **429 is not retried**: it means either a
+  momentary rate limit or an exhausted quota, and only `RESOURCE_EXHAUSTED`
+  distinguishes them. An exhausted quota cannot be restored by 1.5s-apart retries,
+  and an earlier revision that tried reported it as load-shedding.
+- Failure modes raise `ModelOutputError` with the cause named, because they need
+  different responses from whoever is on call. `_diagnose_empty` distinguishes
+  token exhaustion, safety blocks, recitation blocks, and refusal. A refusal is a
+  **valid outcome**.
+
+**Observed live on 2026-10-01.** With log-text evidence enabled and a real
+adversarial payload, Gemini 3.5 Flash returned schema-conforming JSON that cited the
+actual traceback (`KeyError: 'cust_8817'` at line 88), preserved `[REDACTED]`,
+reported the injection as an attack rather than obeying it, and reproduced none of
+the system instruction. The container returned HTTP 200 with `TIER_2_ARCHITECTURAL`,
+`git_patch: ""`, and the DO-NOT-APPLY banner intact.
+
+Three live defects were found only by making the call, and are recorded in
+`docs/lessons-learned.md`: the schema/decoder incompatibility, a log-text overflow of
+`RootCause.evidence` that produced HTTP 500, and the misattribution of both
+token-exhaustion and quota-exhaustion. Two further defects — a model section silently
+discarded by a later field assignment, and a retried 429 — were found by negative
+controls rather than by the API.
+
+**Not yet observed.** The deployed `Tier-2` narrative path reached Gemini via
+`_model_summary`/`_model_rca_section`, and the adversarial run above is real, but the
+quota was exhausted partway through the session, so the final end-to-end container run
+served a cached earlier completion rather than a fresh one. Treat the container-level
+result as evidence that the wiring reaches the model and preserves authority, not as
+a fresh live observation.
+
+### 5.5.2b Where the model is actually consulted, and what it cannot touch
+
+The client exists and is reachable, via `agent/triage.py`:
+`_model_summary()` and `_model_rca_section()` call `_narrative_overlay()`, which
+returns a `ModelNarrative` **or nothing**. Every failure — no key, SDK absent,
+transport error after retries, refusal, safety block, malformed output — returns
+nothing and the deterministic prose stands. There is no partial-credit path.
+
+Two properties are structural rather than conventional:
+
+- **Only prose is substitutable.** The Tier-2 response writes `blast_radius_tier`,
+  `git_patch`, `patch_validated`, `risk_level`, and `verification_policy` as
+  literals or upstream decisions, unreachable from the overlay. Verified by a live
+  run with a key configured: all five unchanged.
+- **The model's long-form analysis APPENDS to the dispatch document, after
+  `_escalate` renders it.** That ordering is not cosmetic: `rca_markdown` is
+  assigned wholesale by the war-room renderer, so anything appended earlier is
+  silently discarded. It was, once. See `docs/lessons-learned.md`.
+
+The log-text gate is `SREK3S_LOG_TEXT_EVIDENCE`, read at call time and **defaulting
+closed**. It controls whether `evidence_lines()` emits log text or only the count of
+it. Off by default because sending container-controlled text to a third party should
+require a deliberate act; the documentation states plainly that a model shown only
+metadata reasons about less than it could.
+
+The shipped baseline has no `GEMINI_API_KEY`, so the agent runs exactly as before:
+deterministic, byte-identical for identical input. Setting the key enables the
+narrative; nothing else about the tier changes.
+
+Consequences for readers: do not describe SREK3S as "an LLM that fixes Kubernetes". It is a
+deterministic classifier whose tier and patch authority is computed before any model is
+consulted (§5.3), with an optional model used to write the Tier-2 explanation. The
+blast-radius argument in `PRD.md` §2 is *stronger* for that: a model failure degrades to
+Tier-2 human escalation rather than to a speculative patch, and a model that is jailbroken
+degrades to a bad paragraph inside a Tier-2 escalation that a human already owns. Wiring a
+real client was a change to the §1 trust boundary and was reviewed as one; it is recorded here
+because a reader who meets the client in `agent/llm.py` needs to know it exists and what it
+is not allowed to decide.
+
+### 5.5.3 Sandbox enforcement: rlimits are primary, and the cgroup write lands too late
+
+Two facts about `agent/sandbox.py`, verified by reading the source on 2026-10-01 and not
+observed at runtime.
+
+**The cgroup write happens after the process has already exited.** `_run_guarded` calls
+`subprocess.run(...)` and, only after it returns (or raises), calls `_try_cgroup` to write
+`srek3s-agent/memory.max` and `srek3s-agent/cpu.max`. Those limits are therefore applied
+*after* the child they are meant to bound has finished, and cannot constrain it.
+`SandboxResult.cgroup_enforced` reports whether the writes succeeded; it does not, and does
+not claim to, report whether they bounded anything. The module docstring's "when one is
+delegated, writes the memory and CPU ceilings there too" is accurate about the write and
+silent about its position in the sequence.
+
+**The real enforcement is `RLIMIT_AS` / `RLIMIT_CPU` plus the `subprocess` timeout.** The
+rlimits are installed in `preexec_fn`, i.e. before `exec`, so the kernel applies them to the
+child and they cannot be raised from inside. `resource_limits_supported()` reports whether
+they applied. This is the mechanism the docstring already describes as primary, and it is the
+only one that can be relied on.
+
+**And a documented constant contradicts itself.** The module docstring says the child gets
+"500 ms of CPU", and `ROADMAP.md` §2.4.2 asks for `500m`. `DEFAULT_CPU_SECONDS` is `1` —
+one CPU-*second*. `RLIMIT_CPU` counts CPU seconds and cannot express a fraction, so `500m`
+is not expressible as an rlimit at all; the honest reading is that the budget was rounded up
+to the smallest unit an rlimit can carry. The comment on the constant still claims "500 ms of
+CPU per investigation", which is wrong by a factor of two. Open task in `ROADMAP.md`: amend
+the docstring and the roadmap to say "1 CPU-second", or express the budget as a cgroup
+`cpu.max` where a fraction is expressible.
+
 ---
 
 ## 6. Secret Masking Regex Manifest
@@ -592,6 +858,14 @@ The remaining 10× is the corpus itself: 43 fixture cases including a multi-line
 a heavier mix than the original synthetic fixture. The ARCH §6.2 budget of 20,000 lines/sec is met
 with large margin, and CI on `ubuntu-latest` remains the authoritative measurement.
 
+> **Platform note, added 2026-10-01, with the figures deliberately unaltered.** The
+> `~187,000` figure was measured on the **old `windows/arm64`** host, which is no longer the
+> development environment; the current host is `Fedora Linux 44` on `linux/aarch64` (§9.1).
+> This is recorded history and is left exactly as measured. It has **not** been re-measured
+> here, and this note makes no throughput claim for `linux/aarch64`. A benchmark re-run on
+> the new host should be recorded as a new figure with its platform named, not substituted
+> for this one; `ubuntu-latest` (`amd64`) remains the authority.
+
 **Narrowed M3 scope, stated explicitly.** Because rule 7 is now single-line, a `key=value` secret
 *split across a newline* is not caught by the cross-line pass. This is a deliberate trade: that
 case is rare in practice, whereas the alternative was collapsing whole batches. A future
@@ -644,6 +918,57 @@ additionally sets `PYTHONDONTWRITEBYTECODE=1` (a read-only root filesystem canno
 `__pycache__`) and `TMPDIR=/tmp`. No `hostPath`, no `hostNetwork`, no privileged init
 container, and no `ServiceAccount` token automount for `agent/`.
 
+### 8.1 The agent's GitOps root ships empty, so Tier-1 is unreachable as deployed
+
+`deploy/agent.yaml` sets `SREK3S_MANIFEST_ROOT=/manifests` and mounts a volume there — and
+that volume is an **`emptyDir`**, which is empty by construction. The chain from there is
+deterministic and short:
+
+1. `FileManifestProvider.read_manifest` cannot open the target, so it returns `None` (its
+   documented "cannot be read" answer — it returns `None` rather than raising for a content
+   problem, precisely so the failure routes to a considered escalation instead of a `500`).
+2. `triage._build_remediation_diff` returns at **step 2** of the diff build — the memory
+   limit is read, then the manifest read fails.
+3. The caller escalates. Every incident becomes `TIER_2_ARCHITECTURAL` with `git_patch == ""`
+   and `patch_validated == false`.
+
+That is invariant **I-B2** failing closed and the design working as intended. It is recorded
+here because the deployed state is otherwise indistinguishable from a broken agent, and a
+reader who concludes the latter will go looking for a bug that does not exist.
+
+**To make Tier-1 reachable in-cluster**, replace the `manifests` `emptyDir` with a real
+GitOps checkout — a PersistentVolumeClaim, or an init container that clones the repository —
+and set `SREK3S_TARGET_MANIFEST` to a repo-relative path inside it. Note the second half of
+the trap: the default target is `deploy/payments/checkout-api.yaml`, and **that path does not
+exist in this repository**. So leaving `SREK3S_TARGET_MANIFEST` unset, or setting it to the
+documented default, produces exactly the same 100% Tier-2 outcome as leaving the volume
+empty. Both conditions must be addressed, and neither is discoverable from the other.
+
+**What an in-cluster run can therefore prove.** It proves the Tier-2 war-room path and the
+no-mutation guarantee (runbook §5, PRD AC-4). It **cannot** prove AC-3. Offline, against
+`tests/fixtures/`, Tier-1 is fully exercised — including real `git apply --check` and the
+goldens in `tests/fixtures/expected/` — so the gap is a *deployment-wiring* gap, not an
+implementation gap. Stating that distinction matters, because the cheapest false report
+available is "the agent cannot generate patches".
+
+### 8.2 Architecture of the built images
+
+The manifests pin `registry.internal/srek3s-{agent,sentinel}:0.1.0` and the project has been
+built on two architectures, which are **not interchangeable**:
+
+| | Local host | CI (`ubuntu-latest`) |
+|---|---|---|
+| Architecture | `linux/arm64` (Fedora 44 on WSL2, aarch64) | `linux/amd64` |
+| Image target | must be `--platform linux/arm64` | `amd64` |
+
+A hardening assertion such as "runs as UID 10001" holds on both, and an
+`ImagePullBackOff` is architecture-agnostic in its message, so a wrong-platform
+image is easy to misdiagnose as a missing image. `busybox:1.36.1`, which the
+`deploy/chaos/` fixtures pin, does publish an `arm64` manifest, so the chaos path
+works on the local host without a multi-arch build. See
+`docs/offline-install.md` for registration into the `k8s.io` containerd namespace under the
+exact fully-qualified names.
+
 ---
 
 ## 9. Technology Constraints (Binding)
@@ -651,9 +976,37 @@ container, and no `ServiceAccount` token automount for `agent/`.
 | Layer | Constraint |
 |---|---|
 | Sentinel | Go 1.23+; official `k8s.io/client-go`, `k8s.io/api`, `k8s.io/apimachinery`; stdlib first; no unvetted third-party runtime frameworks |
-| Agent | Python 3.11-slim; Pydantic v2 + FastAPI; `fastembed`/`onnxruntime` CPU only; **no PyTorch, no CUDA, no GPU deps** |
-| Cluster | single-node k3s; images imported into internal containerd namespace via `k3s ctr images import` |
-| Quality gates | `go vet ./...`; `test -z "$(gofmt -l .)"`; `go test -race -timeout 30s ./...`; `black --check agent/`; `flake8 agent/`; `mypy --strict agent/` |
+| Agent | Python 3.11-slim; Pydantic v2 + FastAPI; `fastembed`/`onnxruntime` CPU only; **no PyTorch, no CUDA, no GPU deps**. The inference path is a permitted ceiling, not a running one — see §5.5.2. All shipped analysis is deterministic. |
+| Cluster | single-node k3s; images imported into the `k8s.io` containerd namespace under their **exact fully-qualified** names (`registry.internal/srek3s-{agent,sentinel}:0.1.0`), because a name the kubelet cannot resolve is `ImagePullBackOff` and the message does not distinguish a missing tag from a wrong architecture |
+| Image platform | `linux/arm64` on the `Fedora 44`/aarch64 development host; `linux/amd64` in CI — see §8.2 |
+| Sandbox | `RLIMIT_AS` 256 MiB + `RLIMIT_CPU` (1 CPU-second) + `subprocess` timeout; the cgroup write is best-effort and lands after the child exits — see §5.5.3 |
+| Quality gates | `go vet ./...`; `test -z "$(gofmt -l .)"`; `go test -race -timeout 30s ./...`; `black --check agent/`; `flake8 agent/`; `mypy --strict agent/`. Python gates run through `~/SREK3S/.venv311/bin/python -m …` on the `linux/aarch64` host (CPython 3.11.16); the system `python3` there is 3.14.3 and is not a valid interpreter for these commands. |
+| Toolchain authority | `go test -race` is executable **locally** on `linux/aarch64` (gcc present), which it was not on the earlier `windows/arm64` host. **CI on `ubuntu-latest` remains the platform authority for every published figure.** Local verification is additional evidence, never a replacement, and no recorded CI result is withdrawn by that. |
+
+### 9.1 Environment of record (measured 2026-10-01)
+
+Pinned because three separate gates and every in-cluster claim depend on it, and because a
+reader comparing a local number against a CI number needs to know which machine produced
+which. Mirrors `PRD.md` §7 and `AGENTS.md` §2.
+
+| Item | Development host | CI |
+|---|---|---|
+| OS | WSL2, **Fedora Linux 44 (aarch64)**, kernel `6.18.40.1-microsoft-standard-WSL2`, systemd PID 1 | `ubuntu-latest` |
+| Arch | `linux/arm64` | `linux/amd64` |
+| Go | `go version go1.26.8-X:nodwarf5 linux/arm64` (native `golang.aarch64`; resolves to `/usr/sbin/go`) | as declared by the runner |
+| Python | CPython **3.11.16**; gates via `~/SREK3S/.venv311/bin/python -m …`. System `python3` is **3.14.3** and is **not** valid here | 3.11 |
+| Race detector | available (`gcc.aarch64` 16.2.1) — locally verifiable now | available; **authoritative** |
+| Docker | 29.8.2, `overlayfs`, root `/var/lib/docker`, unit active. **`sudo docker` required** — `duckie` is not in the `docker` group and `/var/run/docker.sock` is `root:docker` | runner-dependent |
+| k3s | **v1.36.4+k3s1**, node `dwindle2`, containerd `2.3.4-k3s1.36`, IP `172.30.181.188`, 10 CPU / ~7.5Gi / 110 pods | **v1.29.9+k3s1** |
+| kubectl | v1.36.4+k3s1, kustomize v5.8.1; **`sudo` required** — kubeconfig `/etc/rancher/k3s/k3s.yaml` is `0600` root-owned | runner-owned |
+| PSA evaluation | `enforce-version: latest` resolves against **1.36** locally | resolves against whatever `latest` means on that node |
+| NetworkPolicy | **enforced.** Verified 2026-10-01 by differential test: a pod WITHOUT the SREK3S labels reached `generativelanguage.googleapis.com:443` while the labelled agent pod got `EHOSTUNREACH` from the same namespace. That also disproved the earlier assumption that k3s's flannel ignores policy. | exercised by the in-cluster E2E leg |
+| Cluster state | `srek3s-system` **does not exist**; no namespace carries PSA labels; nothing from `deploy/` applied; `k8s.io` holds only k3s's own images | fixtures and `deploy/` applied per run |
+| Images | `linux/arm64` built locally by `make build`; CI builds **both** `linux/amd64` and `linux/arm64` (`output: type=cacheonly`) | multi-arch manifest list pushed to GHCR on a `v*` tag |
+
+**The version skew is a live diagnostic hazard.** The same manifests can be admitted against
+k3s 1.36 and refused against 1.29 for a reason that has nothing to do with the code. Diagnose
+the skew before diagnosing the manifest.
 
 ---
 
@@ -668,6 +1021,52 @@ Per AGENTS.md §5, `ARCHITECTURE.md` governs schemas and layout. Therefore:
 - Adding a directory outside §3 requires an explicit decision recorded here first.
 - `TIER_1_TOIL` / `TIER_2_ARCHITECTURAL` are **closed enums**. Adding a tier is a design
   change, not an implementation detail.
+- Adding a field to the **model's** `response_schema` (§5.5.2) is a **security change**,
+  not a schema change. That schema is the boundary preventing the model from expressing
+  authority; a field like `blast_radius_tier` makes the model a participant in routing.
+  `ModelNarrative(extra="forbid")` and its negative control exist to make that loud.
+
+### 10.1 Distribution: what CI guarantees, and what it does not
+
+`.github/workflows/ci.yaml` runs the gates, a container smoke test, and a **multi-arch
+dry run** (`output: type=cacheonly`, which executes every layer including
+foreign-architecture `RUN` steps under QEMU and then discards the artefact).
+`.github/workflows/release.yaml` is tag-gated on `v*` and publishes to GHCR using the
+default `GITHUB_TOKEN`.
+
+Three asymmetries worth stating rather than leaving to be discovered:
+
+- **`ci.yaml` holds no registry credential.** A workflow that installs third-party
+  packages on every pull request must never hold a write token; the token would reach
+  whatever the PR's build steps do. `packages: write` is granted to the single
+  publishing job and is asserted to be absent everywhere else.
+- **A multi-arch dry run proves both platforms COMPILE, not that they RUN.** The
+  Sentinel's entrypoint smoke test is skipped on a cross build by design — the binary is
+  foreign and the builder is not — and the Dockerfile prints that it skipped and names
+  `make verify-images` as the check that executes it.
+- **Released images and `deploy/` reference different registries.** GHCR is
+  `ghcr.io/OWNER/srek3s-{agent,sentinel}`; the manifests reference
+  `registry.internal/`. Deploying a released image therefore needs an `images:`
+  transform, and "released" and "what `make deploy` applies" are not the same thing.
+
+### 10.2 The credential requirement
+
+The Gemini API key is **optional**. Tier, patch, and every validation flag are
+deterministic; the model writes only Tier-2 prose. Without a key the agent behaves
+exactly as it did before the client existed.
+
+- **Locally**: `.env` or `.env.local` in the repository root. Both are gitignored.
+- **In-cluster**: a Secret named `srek3s-secrets` with key `GEMINI_API_KEY`, read via
+  `valueFrom.secretKeyRef` with **`optional: true`**. That last part is load-bearing —
+  without it, a cluster with no Secret produces pods stuck in
+  `CreateContainerConfigError`, because a missing `keyRef` is an *admission failure*
+  rather than a missing environment variable, and an operator who wants no model could
+  not run the agent.
+- **Log text to the model** is a separate, second opt-in: `SREK3S_LOG_TEXT_EVIDENCE`,
+  default **off**. It governs whether `evidence_lines()` emits log text or only a count.
+- The Agent's only non-DNS egress is **TCP 443**, granted in `deploy/agent.yaml`. It is
+  `0.0.0.0/0` because a NetworkPolicy selects namespaces, pods, or CIDRs and an external
+  provider has no stable CIDR; the cost is stated at the rule.
 
 ### 6.6 Amendment — Rule 7 `secret_access_key` (ratified, P0 credential leak)
 

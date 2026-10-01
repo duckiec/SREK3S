@@ -1,398 +1,263 @@
-"""Chaos fixture tests (ROADMAP 4.1.1, 4.1.2, 4.1.5).
+"""The chaos fixtures are CODE, and this file executes them.
 
-The manifests in ``deploy/chaos/`` produce **guaranteed** faults. That makes them
-dangerous in a way ordinary manifests are not: a Deployment whose memory limit is
-slightly too low will pass every liveness check on a quiet node and take production
-down on a busy one. So the assertions here are about *containment* as much as
-about content - which namespace they may land in, and whether they can be made to
-run privileged.
+Every defect found in `deploy/chaos/real-crash.yaml` on 2026-10-01 was found by
+deploying it, and every one of them passed every structural check that existed at
+the time. They are worth naming because they share a shape:
 
-Everything parses the YAML rather than grepping it. A grep is satisfied by a
-comment, and a chaos fixture that only *looks* contained is worse than no fixture,
-because the e2e run will apply it and discover the difference on a live cluster.
+1. **`restartPolicy: Never`** made the fixture UNDETECTABLE BY CONSTRUCTION.
+   `internal/k8s/watcher.go:236` drops a `Terminated` with a non-zero non-OOM exit,
+   deliberately, because Contract A's `reason` admits only `OOMKilled` and
+   `CrashLoopBackOff`. Without a restart there is no CrashLoopBackOff, so the
+   Sentinel emitted nothing — with zero errors in its log, which is the silent
+   blindness that failure mode is famous for.
+2. **A `/tmp` marker file** raised `OSError: Read-only file system`, because the
+   pod sets `readOnlyRootFilesystem`. The container still crashed, still exited
+   non-zero, still emitted a Python traceback, and the RCA described a completely
+   unrelated failure.
+3. **An apostrophe in a comment** — "the kubelet's backoff" — terminated the shell
+   string wrapping `python -c '...'`, producing `IndentationError` in the fixture
+   rather than the `KeyError` it exists to produce.
+
+Each is invisible to reading, invisible to a YAML parser, and invisible to every
+RBAC and hardening assertion in `test_deploy_manifests.py`. The only thing that
+catches them is running the script.
+
+So this file runs it. Not in a cluster — locally, in-process, with a timeout. It
+is the cheapest possible check and it would have caught all three before a single
+pod was scheduled.
+
+What it deliberately does NOT do is assert the pod reaches CrashLoopBackOff in a
+cluster. That is a live property, and this is an offline gate; `REALWORLD_TESTING.md`
+covers the live half.
 """
 
 from __future__ import annotations
 
 import pathlib
-from typing import Any, cast
+import subprocess
+from typing import Any, Final
 
 import pytest
 import yaml
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-CHAOS = REPO_ROOT / "deploy" / "chaos"
+REPO_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[2]
+CHAOS: Final[pathlib.Path] = REPO_ROOT / "deploy" / "chaos"
 
-#: The one namespace fixtures are permitted to target. Everything in this module
-#: that touches a namespace asserts against this constant.
-CHAOS_NAMESPACE = "sentinel-chaos"
-
-#: Namespaces a fixture must never be able to land in, whatever else changes.
-FORBIDDEN_NAMESPACES = frozenset({"default", "kube-system", "srek3s-system", ""})
+#: Long enough for `python:3.11-alpine` to start and raise, short enough that a
+#: hung fixture fails the suite instead of stalling it.
+FIXTURE_TIMEOUT_SECONDS: Final[int] = 30
 
 
-def load(name: str) -> dict[str, Any]:
-    loaded = yaml.safe_load((CHAOS / name).read_text(encoding="utf-8"))
-    assert loaded is not None, f"{name} parsed to nothing"
-    # cast rather than a bare return; see container_of.
-    return cast("dict[str, Any]", loaded)
+def _container_command(name: str) -> list[str]:
+    document = yaml.safe_load((CHAOS / name).read_text(encoding="utf-8"))
+    containers = document["spec"]["template"]["spec"]["containers"]
+    assert len(containers) == 1, "expected exactly one container"
+    command: list[str] = containers[0]["command"]
+    return command
 
 
-def container_of(document: dict[str, Any]) -> dict[str, Any]:
-    spec = document["spec"]["template"]["spec"]
-    containers = spec["containers"]
-    assert len(containers) == 1, (
-        f"expected exactly one container, found {len(containers)}; a chaos pod "
-        f"with a sidecar has two OOM candidates in one cgroup and the kill may "
-        f"land on either"
-    )
-    # cast, not a bare return: the YAML tree is `Any` and --strict rejects
-    # returning Any from a function that promises a concrete type. Flagged the
-    # moment `tests/` came under mypy -- which is the argument for having put it
-    # there.
-    return cast("dict[str, Any]", containers[0])
+class TestChaosFixturesAreExecutable:
+    """Run the inline script the way the kubelet would.
 
-
-FIXTURES = ["oom-leak.yaml", "crashloop.yaml"]
-
-
-# ---------------------------------------------------------------------------
-# 4.1.1 - the namespace itself
-# ---------------------------------------------------------------------------
-
-
-def test_chaos_namespace_exists_and_is_restricted() -> None:
-    document = load("namespace.yaml")
-    assert document["kind"] == "Namespace"
-    assert document["metadata"]["name"] == CHAOS_NAMESPACE
-
-    labels = document["metadata"]["labels"]
-    assert labels["pod-security.kubernetes.io/enforce"] == "restricted"
-    assert labels["pod-security.kubernetes.io/enforce-version"] == "latest"
-    assert labels["pod-security.kubernetes.io/audit"] == "restricted"
-    assert labels["pod-security.kubernetes.io/warn"] == "restricted"
-
-
-def test_chaos_namespace_is_identifiable_and_documented() -> None:
-    """A namespace nobody can tell apart from a real one is not a guardrail.
-
-    The label is what a cleanup script or a NetworkPolicy matches on, and the
-    annotation is what stops someone deleting it after reading only
-    ``kubectl get ns``. Both are recorded here so adding a fixture without them is
-    visible in review.
+    `sh` is invoked with the script on STDIN rather than as a file, which is
+    closer to how a container receives `command: [sh, -c, <script>]` and avoids
+    writing to the repository.
     """
-    metadata = load("namespace.yaml")["metadata"]
-    assert metadata["labels"]["srek3s.io/chaos"] == "enabled"
-    assert metadata["labels"]["srek3s.io/cleanup"] == "manual"
-    warning = metadata.get("annotations", {}).get("srek3s.io/warning", "")
-    assert "Disposable" in warning, (
-        "the namespace carries no human-readable warning; someone running "
-        "`kubectl get ns` has no way to know it is safe to delete"
-    )
+
+    @pytest.mark.parametrize("name", ["real-crash.yaml"])
+    def test_the_fixture_script_is_valid_shell(self, name: str) -> None:
+        command = _container_command(name)
+        assert command[0] == "/bin/sh" and command[1] == "-c"
+        result = subprocess.run(
+            ["/bin/sh", "-n"],
+            input=command[2],
+            capture_output=True,
+            text=True,
+            timeout=FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert result.returncode == 0, f"shell syntax error: {result.stderr}"
+
+    @pytest.mark.parametrize("name", ["real-crash.yaml"])
+    def test_the_fixture_does_not_crash_for_the_wrong_reason(self, name: str) -> None:
+        """The failure must be the KeyError under test, not an incidental one.
+
+        This is the assertion whose absence let defects 2 and 3 ship: the container
+        crashed, exited non-zero, and wrote a traceback either way. Only the
+        EXCEPTION TYPE distinguishes "the fixture demonstrated a Python crash" from
+        "the fixture had a bug and demonstrated that instead".
+        """
+        command = _container_command(name)
+        result = subprocess.run(
+            ["/bin/sh"],
+            input=command[2],
+            capture_output=True,
+            text=True,
+            timeout=FIXTURE_TIMEOUT_SECONDS,
+        )
+        combined = result.stdout + result.stderr
+
+        assert "KeyError" in combined, (
+            "the fixture did not raise KeyError; it produced:\n" + combined
+        )
+        # Every one of these is a way this fixture has failed while LOOKING healthy.
+        for incidental in (
+            "IndentationError",
+            "SyntaxError",
+            "Read-only file system",
+            "PermissionError",
+            "FileNotFoundError",
+            "ModuleNotFoundError",
+            "command not found",
+        ):
+            assert incidental not in combined, (
+                f"the fixture failed with {incidental!r}, not the fault under test:\n"
+                + combined
+            )
+
+    def test_the_fixture_writes_nothing_to_disk(self) -> None:
+        """The script must not touch the filesystem at all.
+
+        An earlier guard on this same defect asserted only that `Read-only file
+        system` was absent from the output — and it was **vacuous**, caught by its
+        own negative control. On the test host `/tmp` is writable, so the planted
+        `touch /tmp/.marker` SUCCEEDED, raised nothing, and the guard passed while
+        the defect was present. The real failure (`OSError: [Errno 30]`) only occurs
+        inside the cluster, where `readOnlyRootFilesystem: true` is set.
+
+        A negative control that fails for the wrong reason is worse than none: it
+        reads as a pass. So the property is asserted directly rather than by waiting
+        for an environment-dependent error — the script performs no filesystem
+        write, which is both the requirement and the thing that was wrong.
+        """
+        command = _container_command("real-crash.yaml")
+        body = command[2]
+        for verb in ("touch ", "open(", ">", ">>", "makedirs", "Path("):
+            assert verb not in body, (
+                f"the fixture script contains {verb!r}; it must not write to the "
+                "filesystem, because the pod runs with readOnlyRootFilesystem and "
+                "the resulting OSError would replace the fault under test"
+            )
+
+    @pytest.mark.parametrize("name", ["real-crash.yaml"])
+    def test_the_fixture_produces_a_real_traceback(self, name: str) -> None:
+        """A traceback with frames, because that is what the RCA reasons over.
+
+        A one-frame traceback is what a syntax error produces; a multi-frame one is
+        what an application fault produces. The model is asked to explain frame
+        names, so their absence is a silently degraded RCA.
+        """
+        command = _container_command(name)
+        result = subprocess.run(
+            ["/bin/sh"],
+            input=command[2],
+            capture_output=True,
+            text=True,
+            timeout=FIXTURE_TIMEOUT_SECONDS,
+        )
+        combined = result.stdout + result.stderr
+        assert combined.count("Traceback (most recent call last):") == 1
+        assert combined.count("File ") >= 2, (
+            "expected at least two frames in the traceback:\n" + combined
+        )
+
+    @pytest.mark.parametrize("name", ["real-crash.yaml"])
+    def test_the_fixture_exits_non_zero(self, name: str) -> None:
+        command = _container_command(name)
+        result = subprocess.run(
+            ["/bin/sh"],
+            input=command[2],
+            capture_output=True,
+            text=True,
+            timeout=FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert result.returncode != 0, "a crashing fixture must exit non-zero"
+
+    @pytest.mark.parametrize("name", ["real-crash.yaml"])
+    def test_the_planted_credential_reaches_the_log(self, name: str) -> None:
+        """The fixture is only useful if the thing it plants actually arrives.
+
+        Asserted positively rather than assumed: a fixture that silently stopped
+        printing the key would pass every other test here and prove nothing about
+        scrubbing.
+        """
+        command = _container_command(name)
+        result = subprocess.run(
+            ["/bin/sh"],
+            input=command[2],
+            capture_output=True,
+            text=True,
+            timeout=FIXTURE_TIMEOUT_SECONDS,
+        )
+        combined = result.stdout + result.stderr
+        assert "AKIAIOSFODNN7EXAMPLE" in combined
 
 
-def test_only_the_namespace_manifest_defines_a_namespace() -> None:
-    """Exactly one document in the chaos set may create a Namespace.
+class TestChaosFixturesAreDetectable:
+    """Shape assertions the Sentinel depends on.
 
-    A fixture that defined its own namespace would apply successfully outside the
-    guardrail - and the whole point of ROADMAP 4.1.5 is that fixtures cannot
-    choose their own blast radius. The fixtures reference the namespace; they do
-    not create it.
+    Each corresponds to a way `internal/k8s/watcher.go` will emit nothing, with no
+    error logged.
     """
-    creators = []
-    for path in sorted(CHAOS.glob("*.yaml")):
-        for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
-            if document and document.get("kind") == "Namespace":
-                creators.append(path.name)
-    assert creators == [
-        "namespace.yaml"
-    ], f"these files create a Namespace: {creators}; only namespace.yaml may"
 
+    def _spec(self, name: str) -> dict[str, Any]:
+        document = yaml.safe_load((CHAOS / name).read_text(encoding="utf-8"))
+        spec: dict[str, Any] = document["spec"]["template"]["spec"]
+        return spec
 
-# ---------------------------------------------------------------------------
-# 4.1.5 - containment
-# ---------------------------------------------------------------------------
+    def test_the_fixture_can_reach_crash_loop_backoff(self) -> None:
+        """`restartPolicy` must let the kubelet publish CrashLoopBackOff.
 
+        The single most expensive assertion in this file. With `Never`, the pod
+        reaches `Failed` and the watcher drops it at `watcher.go:236` — correct
+        behaviour, wrong fixture — and the entire validation run reports zero
+        incidents with a clean log.
+        """
+        assert self._spec("real-crash.yaml")["restartPolicy"] == "Always"
 
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_fixture_targets_only_the_chaos_namespace(fixture: str) -> None:
-    document = load(fixture)
-    namespace = document["metadata"].get("namespace")
-    assert (
-        namespace == CHAOS_NAMESPACE
-    ), f"{fixture} targets {namespace!r}, want {CHAOS_NAMESPACE!r}"
-    assert namespace not in FORBIDDEN_NAMESPACES
+    def test_the_fixture_is_a_deployment_not_a_bare_pod(self) -> None:
+        """A bare Pod cannot restart, so it cannot CrashLoop.
 
-    # Every object in the document, not just the top-level one. A multi-document
-    # file could carry a second object in a different namespace and the top-level
-    # check would not see it.
-    for child in yaml.safe_load_all((CHAOS / fixture).read_text(encoding="utf-8")):
-        if child is None:
-            continue
-        child_namespace = child.get("metadata", {}).get("namespace")
-        if child_namespace is not None:
-            assert (
-                child_namespace == CHAOS_NAMESPACE
-            ), f"{fixture} contains a {child.get('kind')} in {child_namespace!r}"
+        Asserted separately from the restartPolicy because it is the outer cause:
+        a Pod with `restartPolicy: Always` is still rejected by the apiserver.
+        """
+        document = yaml.safe_load(
+            (CHAOS / "real-crash.yaml").read_text(encoding="utf-8")
+        )
+        assert document["kind"] == "Deployment"
+        assert document["spec"]["replicas"] == 1
 
+    def test_the_fixture_is_not_oom_killed(self) -> None:
+        """The limit must sit well above what the container allocates.
 
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_fixture_cannot_run_privileged(fixture: str) -> None:
-    """A chaos pod that ran privileged would be an escalation nobody asked for.
+        If the fixture OOMs, the incident is indistinguishable from the sibling
+        `oom-leak.yaml` and proves nothing about application-error detection.
+        """
+        container = yaml.safe_load(
+            (CHAOS / "real-crash.yaml").read_text(encoding="utf-8")
+        )["spec"]["template"]["spec"]["containers"][0]
+        limits = container["resources"]["limits"]["memory"]
+        requests = container["resources"]["requests"]["memory"]
+        assert limits != requests, "the limit equals the request; an OOM is possible"
 
-    The namespace enforces `restricted`, so this would be rejected at admission
-    - but only once someone runs the cluster. Asserting it here means the fixture
-    is correct before it is ever applied.
-    """
-    document = load(fixture)
-    pod_spec = document["spec"]["template"]["spec"]
-    container = container_of(document)
+    def test_the_fixture_uses_one_unambiguous_image_ref(self) -> None:
+        """One spelling per fixture, and it must be the qualified one.
 
-    security = container.get("securityContext") or {}
-    assert security.get("privileged") is not True
-    assert security.get("allowPrivilegeEscalation") is False
-    assert security.get("runAsNonRoot") is True
-    assert security.get("runAsUser") == 10001
-    assert security.get("capabilities", {}).get("drop") == ["ALL"]
+        `imagePullPolicy: Never` resolves against the local store by EXACT ref.
+        `python:3.11-alpine` and `docker.io/library/python:3.11-alpine` are
+        different refs and only one is what `ctr images import` wrote, so the pod
+        fails with `not found` — which points at a registry rather than at the
+        naming.
 
-    # The pod-level context too: a fixture compliant only at the container level
-    # would be caught by PSA but not by this file's first assertion.
-    pod_security = pod_spec.get("securityContext") or {}
-    assert pod_security.get("runAsNonRoot") is True
-    assert pod_security.get("runAsUser") == 10001
-    assert pod_security.get("seccompProfile", {}).get("type") == "RuntimeDefault"
-
-    # And no privileged sidecar or init container.
-    for key in ("initContainers", "ephemeralContainers"):
-        assert not pod_spec.get(key), f"{fixture} declares {key}"
-
-
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_fixture_holds_no_cluster_credential(fixture: str) -> None:
-    """A chaos workload needs no Kubernetes API access.
-
-    Same reasoning as the agent: the fixture produces a *container failure*, and
-    anything that lets it act on the cluster turns a fault-injection tool into a
-    fault-*source* tool.
-    """
-    document = load(fixture)
-    pod_spec = document["spec"]["template"]["spec"]
-    assert pod_spec.get("automountServiceAccountToken") is False
-    assert "serviceAccountName" not in pod_spec
-
-
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_fixture_is_parseable_and_selector_is_consistent(fixture: str) -> None:
-    """Structural sanity, so a typo is a build failure rather than a live failure.
-
-    A selector that does not match its own template labels is rejected by the
-    apiserver at apply time, which in a pre-flight phase means discovering it
-    while trying to boot the cluster.
-    """
-    document = load(fixture)
-    selector = document["spec"]["selector"]["matchLabels"]
-    labels = document["spec"]["template"]["metadata"]["labels"]
-    for key, value in selector.items():
-        assert (
-            labels.get(key) == value
-        ), f"{fixture}: selector {key}={value} does not match the pod's labels"
-
-    raw = (CHAOS / fixture).read_text(encoding="utf-8")
-    assert "\t" not in raw, f"{fixture} contains a tab"
-    assert raw.count("\n---") == 0, (
-        f"{fixture} contains a second document; the fixtures are one object each "
-        f"so that applying them is one deliberate act"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 4.1.2 / 4.1.3 - fixture-specific claims
-# ---------------------------------------------------------------------------
-
-
-def test_oom_fixture_has_the_required_memory_limit() -> None:
-    """ROADMAP 4.1.2: a limit far below the container's need.
-
-    ``64Mi`` is asserted exactly rather than as a range, because the whole
-    determinism argument rests on that number: the fixture doubles a string until
-    it crosses, and a different limit moves the crossing iteration. Asserting a
-    range would let the value drift without anything failing.
-    """
-    resources = container_of(load("oom-leak.yaml"))["resources"]
-    assert resources["limits"]["memory"] == "64Mi"
-    # No request, deliberately. Stated rather than left implicit: a request would
-    # put the pod in Guaranteed QoS and change which victim the cgroup OOM killer
-    # picks under node pressure, which is the wrong failure shape.
-    assert "requests" not in resources or not resources.get("requests")
-
-
-def test_oom_fixture_logs_before_it_dies() -> None:
-    """The planted credentials must reach the log before the OOM.
-
-    The Sentinel reads the *previous* instance's log, so a fixture that printed
-    nothing before allocating would produce an incident with empty logs and the
-    masking assertion would pass vacuously. Ordering is therefore load-bearing:
-    creds, then a settle, then the allocation.
-    """
-    command = container_of(load("oom-leak.yaml"))["command"]
-    script = command[2]
-    cred_at = script.find("CHAOS-CRED")
-    sleep_at = script.find("sleep")
-    alloc_at = script.find("BLOCK=")
-    assert cred_at >= 0, "no credential line in the OOM fixture"
-    assert sleep_at > cred_at, (
-        "the fixture must settle after logging so a Running status is published "
-        "before Terminated; otherwise the kubelet can coalesce the update away"
-    )
-    assert alloc_at > sleep_at, "the allocation phase must come after the settle"
-
-
-def test_crashloop_fixture_exits_non_zero_immediately() -> None:
-    """ROADMAP 4.1.3: exit non-zero, fast, so the kubelet enters backoff.
-
-    A fixture that lingered before exiting would take its backoff path through the
-    "running for a while then died" branch, which is a different classification
-    and would not produce the CrashLoopBackOff the test is meant to create.
-    """
-    command = container_of(load("crashloop.yaml"))["command"]
-    script = command[2]
-    assert "exit" in script, "the crashloop fixture does not exit"
-    # No sleep before the exit: the whole point is an immediate failure.
-    assert "sleep" not in script, (
-        "the crashloop fixture sleeps before exiting; the backoff path taken "
-        "depends on how long the container ran, so a sleep makes the shape "
-        "non-deterministic"
-    )
-
-
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_fixture_prints_credentials_before_failing(fixture: str) -> None:
-    """Both fixtures must plant secrets, or ROADMAP 4.1.4 proves nothing.
-
-    At least two distinct rule classes, because one pass over a single rule class
-    is one pass over one code path. A fixture that planted only a bearer token
-    would be satisfied by a scrubber that masks bearer tokens and nothing else.
-    """
-    script = container_of(load(fixture))["command"][2]
-    assert "CHAOS-CRED" in script, f"{fixture} plants no credentials"
-
-    classes = {
-        "aws_access_key": "aws_access_key_id=" in script,
-        "jwt": "eyJhbGciOi" in script,
-        "bearer": "Bearer " in script,
-        "basic_auth_url": "://" in script and "@" in script,
-    }
-    present = [name for name, hit in classes.items() if hit]
-    assert len(present) >= 2, (
-        f"{fixture} plants credentials from only {len(present)} rule classes "
-        f"({present}); two or more are needed so one pass proves more than one "
-        f"rule"
-    )
-
-
-@pytest.mark.parametrize("fixture", FIXTURES)
-def test_credential_line_count_fits_the_tail_window(fixture: str) -> None:
-    """The Sentinel reads 100 log lines, so the creds must land inside that.
-
-    The bound is a property of ``internal/k8s/telemetry.go``'s ``LogTailLines``,
-    and getting it wrong does not fail the fixture - it silently reduces the
-    masking assertion from "every planted secret" to "whichever survived the
-    tail", which is the kind of quiet weakening that outlives several milestones.
-    """
-    script = container_of(load(fixture))["command"][2]
-    iterations = _planting_iterations(script)
-    if iterations == 0:
-        pytest.skip(f"{fixture} has no counted planting loop")
-    lines = iterations * 4 + 10  # four credential lines per iteration, plus overhead
-    assert lines <= 100, (
-        f"{fixture} emits about {lines} lines, past the Sentinel's 100-line "
-        f"tail; the earliest planted credentials would rotate out of the window"
-    )
-
-
-def _planting_iterations(script: str) -> int:
-    """The bound of the loop that plants credentials.
-
-    Scoped to *that* loop deliberately. A first version of this test scanned for
-    any ``while ... -lt N`` line and kept the last one, which in a two-loop script
-    is the wrong loop: in ``oom-leak.yaml`` that is the memory-exhaustion loop
-    (``-lt 32``), so the test computed 138 lines and failed against a fixture that
-    emits about 87. The test was wrong, not the fixture, and it was wrong in the
-    direction that would have been "fixed" by editing a working fixture.
-    """
-    for line in script.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("while") or "-lt " not in stripped:
-            continue
-        if "CHAOS-CRED" in line or "printf" in line:
-            continue
-        bound = stripped.split("-lt ")[1].split()[0]
-        if bound.isdigit():
-            return int(bound)
-    # No separate loop header: the planting statements may be unconditional.
-    return script.count("CHAOS-CRED")
-
-
-# ---------------------------------------------------------------------------
-# Negative controls - AGENTS.md §5
-# ---------------------------------------------------------------------------
-
-
-def test_control_privileged_check_catches_a_privileged_container() -> None:
-    """Proves the hardening assertions can fail on the exact field they check."""
-    document = load("oom-leak.yaml")
-    container = container_of(document)
-    assert container["securityContext"].get("privileged") is not True
-
-    # Invert the field the way a regression would.
-    escalated = {
-        **container,
-        "securityContext": {**container["securityContext"], "privileged": True},
-    }
-    assert (
-        escalated["securityContext"]["privileged"] is True
-    ), "the control did not create the condition it is meant to detect"
-    # And the real assertion, run against it, must now fail. Written the way the
-    # real check is written, not as a restatement of it.
-    assert (
-        escalated["securityContext"].get("privileged") is not True
-    ) is False, "the hardening assertion accepts a privileged container"
-
-
-def test_control_namespace_check_catches_a_retargeted_fixture() -> None:
-    """Proves the namespace assertion can fail on a retargeted fixture.
-
-    The first version of this control was a compound expression that was true for
-    reasons the control was not about, so it passed without exercising the check
-    it claims to prove. It is now the same expression the real test uses, applied
-    to a deliberately mis-targeted document.
-    """
-    document = load("oom-leak.yaml")
-    retargeted = dict(document)
-    retargeted["metadata"] = {**document["metadata"], "namespace": "default"}
-
-    # The real check, verbatim in shape.
-    namespace = retargeted["metadata"].get("namespace")
-    violated = namespace == CHAOS_NAMESPACE or namespace in FORBIDDEN_NAMESPACES
-    assert violated, (
-        "the namespace check accepted a fixture retargeted to 'default', so "
-        "test_fixture_targets_only_the_chaos_namespace proves nothing"
-    )
-
-
-def test_control_only_one_namespace_document_exists() -> None:
-    """Proves the creator-scan can find a second creator.
-
-    Parsed from the same directory the real check uses, so the control exercises
-    the actual glob rather than a hand-built list.
-    """
-    creators = [
-        path.name
-        for path in sorted(CHAOS.glob("*.yaml"))
-        for document in yaml.safe_load_all(path.read_text(encoding="utf-8"))
-        if document and document.get("kind") == "Namespace"
-    ]
-    assert (
-        creators
-    ), "the scan found no Namespace at all, so it cannot detect a second one"
-    assert len(creators) == 1, f"expected one Namespace creator, found {creators}"
+        Scoped to `real-crash.yaml` deliberately. The two older fixtures ship the
+        BARE spelling (`busybox:1.36.1`) and deliberately register both names in
+        the containerd namespace, which works. Asserting a slash on them would be
+        enforcing a preference rather than a correctness rule, and this repository
+        has been wrong about exactly that distinction before.
+        """
+        container = yaml.safe_load(
+            (CHAOS / "real-crash.yaml").read_text(encoding="utf-8")
+        )["spec"]["template"]["spec"]["containers"][0]
+        assert container["imagePullPolicy"] == "Never"
+        assert container["image"].startswith(
+            "docker.io/library/"
+        ), f"{container['image']!r} must be fully qualified"

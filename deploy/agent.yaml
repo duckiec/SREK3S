@@ -92,6 +92,48 @@ spec:
             - name: SREK3S_MANIFEST_ROOT
               value: /manifests
 
+            # -------------------------------------------------------------------------
+            # GEMINI_API_KEY — THE MODEL CREDENTIAL
+            #
+            # Read from a Secret, never from a literal. A value in this file would be
+            # a committed credential in every clone and every image layer, and would
+            # be readable by anyone with `kubectl get deployment -o yaml` — which the
+            # Role in deploy/rbac.yaml does NOT grant, so the manifest route is the
+            # one that matters here.
+            #
+            # `optional: true` IS THE IMPORTANT PART, and it is not laziness. Without
+            # it, a cluster with no `srek3s-secrets` Secret produces a pod stuck in
+            # `CreateContainerConfigError`, because a missing keyRef is a hard
+            # admission failure — NOT a missing environment variable. That would mean
+            # an operator who wants no model at all cannot run the agent, which is
+            # the wrong default: the deterministic path is complete and needs no
+            # credential. With `optional: true` an absent Secret leaves the variable
+            # unset, `llm.gemini_client_from_env()` returns None, and every tier,
+            # patch and validation flag behaves exactly as it did before this existed.
+            #
+            # CREATE THE SECRET (it is deliberately NOT in this repository):
+            #
+            #   kubectl -n srek3s-system create secret generic srek3s-secrets \
+            #     --from-literal=GEMINI_API_KEY="$(grep -oP '(?<=^GEMINI_API_KEY=).*' .env.local)"
+            #
+            # The read touches a credential, so the value is never echoed. Confirm
+            # presence without printing it:
+            #
+            #   kubectl -n srek3s-system get secret srek3s-secrets \
+            #     -o jsonpath='{.data.GEMINI_API_KEY}' | wc -c   # non-zero = present
+            #
+            # WHY A SINGLE-KEY SECRET NAMED `srek3s-secrets` RATHER THAN A KEY PER
+            # COMPONENT: it is one credential, and a per-component name would imply
+            # more than exists. `srek3s-secrets` also leaves room for the others this
+            # system will eventually need without renaming this mount.
+            # -------------------------------------------------------------------------
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
+
           # ARCH §8: read-only root, no privilege escalation, every capability
           # dropped. The agent needs none of them, so all are dropped rather than
           # selected - an allow-list here would be a list to forget an entry on.
@@ -158,9 +200,26 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 2
 
-          # Long enough for an in-flight triage to finish and be reaped. Shorter
-          # than this and a legitimate request would be killed mid-analysis.
-          terminationGracePeriodSeconds: 30
+      # Long enough for an in-flight triage to finish and be reaped. Shorter than
+      # this and a legitimate request would be killed mid-analysis.
+      #
+      # POD level, not container level, and that distinction is not cosmetic.
+      # `terminationGracePeriodSeconds` is a field of PodSpec and has no
+      # container-level counterpart, so placing it inside the container list makes
+      # the apiserver reject the entire Deployment:
+      #
+      #     strict decoding error: unknown field
+      #     "spec.template.spec.containers[0].terminationGracePeriodSeconds"
+      #
+      # This shipped in the committed manifest and was never caught by a gate,
+      # because the drain-budget assertion reads the value as TEXT. A grep finds
+      # "terminationGracePeriodSeconds: 30" equally well at either indentation, so
+      # the test passed against a manifest the API server would not accept. It was
+      # found here only by applying to a live control plane — the failure mode
+      # `AGENTS.md` §5.7 describes as the cheapest one available: a check that is
+      # satisfied by a document's content without regard to whether the document is
+      # valid.
+      terminationGracePeriodSeconds: 30
 
       volumes:
         - name: tmp
@@ -222,7 +281,9 @@ spec:
         - protocol: TCP
           port: 8000
   egress:
-    # DNS, for the authorised model endpoint. Nothing else is reachable.
+    # -------------------------------------------------------------------------
+    # DNS, to resolve the model endpoint by name.
+    # -------------------------------------------------------------------------
     - to:
         - namespaceSelector:
             matchLabels:
@@ -232,3 +293,56 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # -------------------------------------------------------------------------
+    # THE MODEL ENDPOINT, ON 443.
+    #
+    # This rule was added 2026-10-01, and it is the first and only rule that lets
+    # this pod reach anything outside the cluster. Until it existed, the agent had
+    # NO egress but DNS, which is the correct default and is still the shape of
+    # every other rule here. It also meant a configured Gemini client could not
+    # work: with the key mounted, the pod failed every completion with
+    #
+    #     OSError: [Errno 101] Network is unreachable
+    #
+    # and degraded silently to the deterministic RCA. That is the exact failure
+    # this repository exists to prevent wearing a green log: the agent looked
+    # healthy, /readyz answered 200, and every incident produced a plausible
+    # analysis that no model had contributed to.
+    #
+    # WHY `0.0.0.0/0` AND NOT A NARROWER BLOCK, because the narrower option does
+    # not exist here. A NetworkPolicy `to:` can select a namespace, a set of pods,
+    # or an `ipBlock` — and an ipBlock is CIDR, not a hostname. Google's endpoint
+    # resolves to a large, geographically varying, Anycast-advertised set of
+    # addresses with no stable CIDR an operator can write down:
+    #
+    #     $ getent hosts generativelanguage.googleapis.com
+    #     172.217.114.4        # and 34.x, 35.x, 142.250.x, 2607.f8b0:... on other queries
+    #
+    # So the honest options were (a) a hand-maintained list that silently stops
+    # matching when Google re-announces, reproducing precisely the "ephemeral
+    # address in a committed manifest" defect that `deploy/sentinel.yaml` was
+    # rewritten to eliminate, or (b) 443 to anywhere. (b) is chosen, and its cost
+    # is stated plainly: **this pod can open a TLS connection to any host on 443**.
+    #
+    # WHAT THAT COST IS AND IS NOT. It is not unrestricted egress — the port is
+    # fixed at 443, and UDP/TCP 53 to anywhere else is still refused. It is not an
+    # exfiltration path for cluster secrets, because the agent holds no cluster
+    # credential at all (`automountServiceAccountToken: false`) and its only input
+    # is scrubbed telemetry. It does mean a hypothetical code-execution bug in the
+    # agent could reach an arbitrary HTTPS endpoint.
+    #
+    # THE TIGHTER ALTERNATIVE, if this ever matters: a DNS-based egress gateway, or
+    # a CNI with FQDN policy support (Cilium), which expresses "generativelanguage.
+    # googleapis.com:443" directly. Neither is available on this cluster's default
+    # dataplane, so neither is shipped as the only working path.
+    #
+    # NOTE the contrast with `deploy/sentinel.yaml`, which reaches the apiserver by
+    # `ipBlock` on the Service CIDR. That one CAN be narrow, because the apiserver
+    # is a known address inside the cluster. An external provider is not.
+    # -------------------------------------------------------------------------
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

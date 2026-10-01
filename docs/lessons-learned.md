@@ -25,6 +25,15 @@ then. Sections 14–18 were added afterwards, covering defects found or closed
 later — including the Milestone 4.2 ratification run itself. Where an entry is
 reconstruction rather than verbatim record, it says so in place.
 
+Sections 26–27 were added on 2026-10-01 and record the move to a `Fedora Linux 44`
+/ `linux/aarch64` development host. **§26 is a reconstruction from reading two
+manifests and an authorisation rule; it has not been reproduced at runtime, and it
+says so in the first line of its own body rather than only here.** §27 is about a
+platform transition rather than a defect, and is included because the *documenting*
+of such a transition is where the wrong lesson gets written down. Neither section
+alters any earlier entry: §27 exists specifically to say that the `windows/arm64`
+records throughout this file are correct history and are kept.
+
 ---
 
 ## 1. The Quiet-Failure Trap (Scrubber & CI)
@@ -1020,3 +1029,464 @@ The narrower form, worth more: **a gate must be able to report that it could not
 measure.** This one could not - it had no way to say "I never successfully
 invoked bash" as distinct from "your shell is broken", so it answered a question
 nobody asked with a confidence nobody had earned.
+
+---
+
+## 26. Watch Scope And Grant Disagree, And Neither Test Compares Them (v1.0.1 follow-on)
+
+**Status of this entry, stated before anything else: this is a reconstruction,
+not a verbatim record.** It was produced by reading two manifests and a
+Kubernetes authorisation rule on **2026-10-01**. Nothing was deployed, no pod was
+run, no `LIST` was observed, and **no forbidden response was captured**. The
+mechanism is standard Kubernetes behaviour; the specific behaviour of this
+deployment has not been reproduced. Everything below is a deduction from a
+mechanism, and the corresponding `ROADMAP.md` box `ENV-2.1` is open for that
+reason.
+
+### Watch scope and RBAC grant were never compared to each other (Milestone 3)
+
+- **What happened:** `deploy/sentinel.yaml` sets `WATCH_NAMESPACE: ""`, which
+  selects a cluster-wide informer and issues `LIST /api/v1/pods` against every
+  namespace. `deploy/rbac.yaml` grants a **namespaced** `Role` in
+  `srek3s-system` only - no `ClusterRole`, no `ClusterRoleBinding`, nothing
+  anywhere in `deploy/` that grants a cluster-scoped read. A `Role` in one
+  namespace authorises nothing in another, so the cluster-wide `LIST` the
+  informer issues is unauthorised. The informer retries the forbidden `LIST` on
+  its backoff, which means the visible result is **no incidents and no error** -
+  indistinguishable, from outside, from a healthy Sentinel watching a quiet
+  cluster.
+- **Why it is a problem:** Three properties compound, and the third is the one
+  that should have caught it.
+  1. **The failure is silent, and silence is the system's healthy-looking
+     state.** This is the same family as §12 (log-blindness), §16 (dedup
+     suppression) and §24 (the port-forward that was never there): a defect whose
+     observable result is that a real thing is not reported. Nothing in the
+     running system distinguishes "nothing is wrong" from "I am not able to see".
+  2. **The fix everyone reaches for first is the worst one available.** The
+     obvious repair for "my Sentinel sees nothing" is to widen the grant - add a
+     `ClusterRole`, bind the Role cluster-wide. That would make every existing
+     RBAC test pass while converting the project into the thing `PRD.md` §5.2
+     calls "the single highest-severity change available to this codebase". A
+     trap whose most natural remedy increases blast radius is not a nuisance.
+  3. **Both RBAC tests are individually correct and both pass.** This is the
+     part worth writing down. `TestSentinelRoleGrantsNoMutatingVerb` asserts no
+     write verb - true. `TestSentinelRoleGrantsWhatTheWatcherReads` asserts the
+     grant covers the reads the watcher makes - also true, *for
+     `srek3s-system`*. Both are scoped to the namespace the `Role` lives in, and
+     **neither compares that namespace to the configured watch scope.** Two
+     correct assertions over two correct manifests, wrong only in composition -
+     and no gate in the repository asserts the composition, so no gate can fail.
+- **How we fixed it:** **Not yet. That is the honest answer and it is the point
+  of recording this before fixing it.** What has been done is documentation, so
+  that the next operator meets the trap before it meets them: `PRD.md` A6,
+  `ARCHITECTURE.md` §2.1, the callouts in `README.md` and `docs/runbook.md` §1,
+  and open box `ENV-2.1`. The fix itself is two-sided and deliberately excludes
+  a `ClusterRole`: scope `WATCH_NAMESPACE` to one namespace **and** place a
+  matching `Role` + `RoleBinding` there, referring to the `srek3s-system`
+  ServiceAccount. A deployment procedure that is not a code change is not a fix,
+  and this entry does not claim one.
+
+### The controls that were invalid, which is the part that generalises
+
+AGENTS §5.6 requires recording controls that were invalid and not only the ones
+that worked, so, plainly: **two controls existed, both ran, both passed, and
+neither was about the thing that broke.** That is a different failure from §21,
+where a control failed for the wrong reason. A control that is *silently out of
+scope* is worse, because it produces the comfortable reading - green checks,
+working system - rather than an alarm.
+
+The obvious missing check is a cross-document assertion: read the namespace every
+namespaced `Role` in `deploy/` is created in, read the value of
+`WATCH_NAMESPACE` from `deploy/sentinel.yaml`, and require them to agree. Nothing
+larger than that is required — both values are already in the tree the existing
+manifest tests parse. It is stated here as the candidate, not as something that
+exists.
+
+Two smaller instances of the same shape, recorded because they are the same
+mistake at lower severity:
+
+- `deploy/rbac.yaml`'s comment cited `TestSentinelHasNoMutatingVerbs`, which does
+  not exist (noted in ROADMAP's Definition of Done). A `-run` filter naming a
+  non-existent test exits `0` printing `[no tests to run]` - a green result
+  proving nothing. Already recorded there; repeated here because it is the same
+  pattern: *a reference that reads as evidence and is not.*
+- `ARCHITECTURE.md` §3 named `tests/fixtures/secrets_corpus.txt` and
+  `internal/k8s/classify.go`, neither of which has ever existed, and no gate
+  noticed for two milestones (Definition of Done, and the layout validator that
+  now exists because of it). Same shape at a different layer: documents assert
+  facts about each other, and nothing checks the assertions against reality.
+
+### The generalisable form
+
+*Checks that verify one half of a pair will pass while the pair is incoherent.*
+Write the assertion that names the relationship, not just the parts. Every gate
+here asks "is this manifest correct?" and none asks "do these two manifests agree
+with each other?" - and the defect lives entirely in the agreement.
+
+The sharper version, and the one worth carrying: **the most natural repair for a
+silent permission failure is to widen permissions.** A system whose central safety
+property is least privilege will, under pressure, be told to grant more, because
+granting more is what makes the symptom go away. That is the argument for making
+the *intended* grant legible enough that widening is visibly unnecessary - which
+is what `docs/runbook.md` §1's per-namespace procedure is for.
+
+---
+
+## 27. The Race Detector Was A Host Property, Not A Code Property (v1.0.1 follow-on)
+
+This entry is about a platform transition rather than a bug, and it is recorded
+because the *documentation* of that transition is where the wrong lesson lives.
+
+### `-race` was unavailable because the host was, and the host has changed (Milestones 1-3)
+
+- **What happened:** For two milestones, `go test -race` could not be run on the
+  development host, because the host was `windows/arm64` and the race detector
+  needs ThreadSanitizer and cgo, neither of which exists there. GitHub Actions
+  `ubuntu-latest` was therefore the sole passing authority, and every record -
+  ROADMAP boxes `1.5`, `2.8`, `3.7.3`, `docs/lessons-learned.md` §15, and the
+  `AGENTS.md` §4 note - says so. The gate was left **unticked** locally rather
+  than ticked on an assumption, and that was the correct call: `AGENTS.md` §5.4
+  forbids the alternative.
+
+  The development host is now WSL2 running **`Fedora Linux 44 (aarch64)`**, kernel
+  `6.18.40.1-microsoft-standard-WSL2`, with `gcc.aarch64` 16.2.1 installed. cgo is
+  therefore available, which is the host requirement the race detector had, and
+  `go test -race` is now **runnable and locally verifiable** on this machine. This is
+  the project's first `linux/aarch64` host. What it is *not* yet is a recorded local
+  result: the gate has to be run before anyone cites it. `ROADMAP.md` box `ENV-1.2`
+  claims the **capability** and says so in those words; no box claims a local pass.
+- **Why it is a problem:** Not because the change is bad - it is strictly an
+  improvement - but because the *wording* around it is now wrong in two specific
+  ways, and both are the kind that get copied forward.
+  1. **`-race` availability was never a property of the code.** It was a property
+     of the machine, and the documents described it in the present tense as though
+     it were a standing constraint of the project. "GitHub Actions is the sole
+     authority" reads as an architectural fact and is a statement about Windows.
+     An agent reading it a year from now on a Linux host would report a
+     locally-verifiable gate as blocked - the exact "blocked dependency" fiction
+     `AGENTS.md` §5.4 exists to prevent.
+  2. **The temptation is to delete the historical record.** The clean-looking
+     move is to strike every mention of `windows/arm64` and the standing
+     constraint, leaving a tidy document. That would be the worst outcome. The
+     recorded results are the evidence for how this project has behaved over four
+     milestones, §15 is built entirely on a host/CI divergence, and the CI run
+     IDs are the only proof that the race gate was ever green. Superseding them
+     would destroy the record to improve the prose.
+- **How we fixed it:** By **annotating, not editing**. `AGENTS.md` §4 keeps the
+  original note verbatim and adds a dated amendment that scopes the change to
+  *local runs only*; `AGENTS.md` §5 rule 8 now makes non-destruction of recorded
+  history a standing instruction rather than a habit. The environment of record is
+  pinned as `ENV-1.1`/`ENV-1.2` in `ROADMAP.md` with the platform of every
+  measurement named; `ARCHITECTURE.md` §6.5 carries a note that its `windows/arm64`
+  throughput figures are historical and unaltered, with an explicit refusal to
+  claim a `linux/arm64` number that was not measured; §9.1 states the split
+  authority in a table. **CI on `ubuntu-latest` remains the platform authority for
+  every published figure.** A local pass is additional evidence, never a
+  substitution, and no CI result recorded anywhere in this repository is
+  withdrawn.
+
+  One consequence is deliberately left as an **open** box rather than quietly
+  fixed: the `windows/arm64` throughput figures (`~187,000` lines/sec and the
+  intermediate 7,900 / 18,700) have **not** been re-measured on this host, so no
+  `linux/arm64` performance claim is made anywhere. `ENV-2.10` re-runs the
+  benchmark and records a new figure *with the platform named*, rather than
+  overwriting the old one.
+
+### The generalisable form
+
+*When the environment changes, the question is not "which statements are now
+false" but "which statements were always about the machine rather than the
+system".* The second question is harder, and it is the one worth asking: it
+separates a genuine constraint from a temporary condition that happened to be
+written down in the present tense.
+
+The pairing is with §15, and the two are the same subject from opposite ends. §15
+is a `type: ignore` that was correct on Windows and fatal on Linux - the local
+machine running a configuration the grader never sees. This is the same divergence
+resolved: the local machine now runs a configuration that *is* graded, which is
+why a local pass is worth having and still is not the published number. Both are
+the reason `AGENTS.md` §4 keeps the platform named in every gate command rather
+than letting "locally" stand in for it.
+
+### The requested library and the model name were both already dead (Milestone 3)
+
+- **What happened:** `agent/llm.py` was to be wired to `google-generativeai` with
+  `gemini-1.5-flash`, per an explicit instruction. Both names were already
+  unusable. The package's own metadata carries
+  `Development Status :: 7 - Inactive`, and
+  `ai.google.dev/gemini-api/docs/migrate` says to migrate to `google-genai`. The
+  model is absent from the deprecation table entirely - not even as
+  deprecated-with-a-shutdown-date, which is how already-retired models are still
+  listed - so `gemini-1.5-flash` has been shut down and returns `NOT_FOUND`.
+
+- **Why it is a problem:** Following the instruction literally would have produced
+  code that passes every offline gate and fails on first contact with the API. The
+  `type: ignore` on the import, the lazy-import guard, the timeout, the schema
+  check - all green, because none of them execute the call. A spec that names a
+  dead dependency has a half-life, and the failure surfaces in someone else's
+  incident window.
+
+- **How we fixed it:** Used `google-genai` (GA, and ships `py.typed`, so `mypy
+  --strict` checks the call rather than `Any`), defaulted the model to a 3.x Flash,
+  and made the model name overridable via `GEMINI_MODEL` because fleet
+  availability is Google's fact and not something a repository should hard-code as
+  eternal. The SDK and model choices are documented at their definitions in
+  `agent/llm.py`, each citing what was read and when.
+
+### A missing API key is a blocked dependency, not an invitation (Milestone 3)
+
+- **What happened:** The live LLM detonation was specified as passing
+  `GEMINI_API_KEY` "securely from the host environment". No such variable was set,
+  in no shell profile, in no `.env` file, and no SDK was installed. The host
+  resolves `generativelanguage.googleapis.com`, so the blocker is a missing
+  credential and not a missing network.
+
+- **Why it is a problem:** The two available shortcuts were to fabricate a key
+  (which fails at the provider) or to hand-write a JSON blob and present it as
+  Gemini's output (which is worse - it is fabricated evidence presented as an
+  observation, which is precisely what this repository exists to prevent).
+
+- **How we fixed it:** Every structural property was verified by capturing the
+  outbound request through a stubbed `genai.Client`, which is evidence about *this
+  code*; the live call is reported as **BLOCKED**, and `ARCHITECTURE.md` §5.5.2
+  states in place that no adversarial payload has been sent to Google. Nothing in
+  the committed tree asserts a model response was observed.
+
+- **The distinction worth keeping:** capturing a request proves the code sends
+  what it claims. It says nothing about what the provider does with it. Those are
+  different claims and only one of them was available.
+
+### The injection payload had no path to the model, so the test could not have tested it (Milestone 3)
+
+- **What happened:** An adversarial plan required planting a prompt injection in a
+  stack trace and proving Gemini ignores it. The payload was built and the traps
+  fired as expected at the scrubber (`aws_access_key_id`,
+  `basic_auth_url`, `generic_secret_kv` all found; `AKIA` absent from the
+  report). Then the prompt was inspected - and none of the seven log lines were in
+  it. `evidence_lines()` emits `scrubbed_log_lines=<count>`, a number. The log
+  *text* has never reached the model, by the original shape of that function.
+
+- **Why it is a problem:** The planned test would have passed for the wrong
+  reason. "Gemini ignored the injection" and "the injection was never sent" are
+  indistinguishable from the outside, and only one of them is the property anyone
+  thinks was demonstrated. A vacuous pass here is worse than no test: it would be
+  filed as evidence that the `system_instruction` separation works, and it would
+  be filed without ever having been under load.
+
+- **How we fixed it:** Verified by inspection rather than assumed, then made the
+  fact explicit instead of leaving it to be discovered later: the behaviour is
+  now a named constant, `prompt.LOG_TEXT_EVIDENCE_ENABLED`, documented at
+  `evidence_lines()` with what widens it and what becomes load-bearing when it
+  does. The secret and injection both reach the prompt when the flag is on, and
+  the `system_instruction` separation was re-confirmed to hold in that widened
+  configuration. Separately, `test_the_behavioural_rules_are_not_in_the_prompt`
+  got a negative control that concatenates `SYSTEM_INSTRUCTION` back into the
+  prompt; the guard fired, so the guard is not vacuous.
+
+- **The generalisable form:** Before claiming an adversarial control proved
+  anything, check that the attack **reaches** the thing under test. A test whose
+  subject never receives the payload is a test of the plumbing, and it will read
+  exactly like a pass.
+
+### Four defects that only a live API call could find (Milestone 3)
+
+Every gate was green and the suite passed 768 tests before the first real Gemini
+request was made. None of the four below were visible offline, and none would
+have been.
+
+- **What happened:**
+
+  1. **The narrow schema and the strict decoder were mutually incompatible.**
+     `gemini_response_schema()` permits two fields because the model does not
+     decide authority; `decode_completion` validated against the full
+     `TriageResponse`, which requires eight field groups. A model that obeyed the
+     schema perfectly failed with eleven validation errors. Two halves of one
+     design, never connected.
+  2. **Log text overflowed a schema ceiling.** With `SREK3S_LOG_TEXT_EVIDENCE`
+     enabled, `evidence_lines()` emitted 23 items against `RootCause.evidence`'s
+     `max_length=20`, and the request returned **HTTP 500** with a Pydantic error
+     raised deep inside response construction. No offline test caught it because
+     nothing offline turns the flag on.
+  3. **A working model was reported as a refusal.** 3.x Flash models reason
+     before answering and charge reasoning against `max_output_tokens`. At a tight
+     budget the candidate finished `MAX_TOKENS` with no text part, which the code
+     reported as "it may have refused" — sending an operator hunting a jailbreak
+     that had not happened.
+  4. **An exhausted quota was reported as load-shedding.** A burst of test calls
+     returned `429 RESOURCE_EXHAUSTED`. The retry classifier listed 429 as
+     transient, so it retried three times at 1.5s intervals and then named the
+     cause "the provider is load-shedding" — pointing an operator at the wrong
+     system entirely.
+
+- **Why it is a problem:** All four are invisible to a green suite, and three of
+  them produce a *confidently wrong story* rather than an obvious failure. Defect
+  2 is the worst class: the agent had already decided the incident correctly and
+  then failed to answer because of an unrelated bound. Defects 3 and 4 are worse
+  in a different way — they do not fail loudly, they misattribute.
+
+- **How we fixed it:**
+
+  1. `decode_narrative` + a `ModelNarrative` model, so the decoder validates
+     exactly what the schema asked for. A test asserts the two field sets are
+     equal, with a negative control that widens one side and confirms the guard
+     fires.
+  2. `MAX_EVIDENCE_LINES` and **tail-first** truncation, because a crashing
+     container writes its traceback last. Taking the head would fill the budget
+     with startup banners and drop the exception. Truncation is declared in the
+     output, since a silently shortened log reads to a model as a complete one.
+  3. `thinking_budget=0`, which also restores the meaning of `temperature=0.0`:
+     leaving reasoning enabled lets two runs over identical evidence differ in
+     ways 0.0 does not control. `_diagnose_empty` now reads `finish_reason` and
+     names budget exhaustion, safety blocks, and refusals separately.
+  4. Classification by the SDK's **status name**, not the integer — 429 means
+     both a momentary rate limit and a permanently exhausted quota, and only
+     `RESOURCE_EXHAUSTED` distinguishes them. 429 is no longer retried; the
+     message names quota exhaustion rather than blaming the request or the key.
+
+- **The generalisable form:** A green suite proves the pieces are internally
+  consistent. It says nothing about whether the pieces agree with an *external*
+  contract — an API's schema, its token accounting, its error taxonomy. Those are
+  verified only by calling it. Three of these four were a wrong *explanation* of
+  an observed symptom, which is the failure mode a test suite structurally
+  cannot catch.
+
+### A field that was overwritten two frames later (Milestone 3)
+
+- **What happened:** `triage._escalate` assigns
+  `response.rca_markdown = warroom.render_markdown(dispatch)` — a **wholesale
+  replacement**. The model's analysis was appended inside `_tier2_response`,
+  before that assignment, and was therefore discarded every time. The request
+  returned **HTTP 200** with a complete, correct, deterministic RCA, and the model
+  analysis was simply absent. The summary survived, because it is a different
+  field, which made the bug look like a partial success.
+
+- **Why it is a problem:** Total and silent. The model would have been called,
+  billed for, and paid out on latency, with zero observable effect — a feature
+  that ships working-looking and does nothing. Two independent controls caught it:
+  flake8's F841 on an earlier revision of the same code, and a negative control
+  asserting the fallback path. Neither was the test I would have written.
+
+- **How we fixed it:** The model section is appended in `_escalate`, *after* the
+  dispatch render, and `_model_summary` / `_model_rca_section` fetch separately so
+  neither can be lost to the overwrite. The composite is re-scanned as a whole
+  (I-B6), because a secret can be assembled from a model paragraph and a
+  deterministic line that are each individually innocent.
+
+- **The generalisable form:** When a field is assigned more than once on a path,
+  find every assignment before reasoning about any of them. A value computed in a
+  constructor is not thereby in the object that leaves the function.
+
+### The agent pod could not reach the internet, and the policy said it must not (Milestone 3)
+
+- **What happened:** With `GEMINI_API_KEY` mounted from a Secret, every completion
+  failed with `OSError: [Errno 101] Network is unreachable`.
+  `deploy/agent.yaml`'s `srek3s-agent-egress` NetworkPolicy permitted DNS to
+  kube-system and nothing else — correct for an agent that needs no model, and
+  incompatible with one that has an API key.
+
+- **Why it is a problem:** The degradation is **silent and total**. The agent
+  answered `/healthz` and `/readyz` with 200, triaged every incident, and produced
+  a complete and plausible deterministic RCA — with no model involved and nothing
+  in any log to say so. A credential mounted and a client constructed are both
+  visible in the pod spec and the process; neither implies a request was sent.
+
+  Two hypotheses had to be separated before the cause could be named, and the
+  first was wrong. "Network unreachable" reads like a policy DROP, but a dropped
+  packet **times out**; `EHOSTUNREACH` means the kernel had no route. The
+  distinguishing test was a throwaway pod in the same namespace **without** the
+  SREK3S labels, which the policy's `podSelector` does not match: it reached
+  `generativelanguage.googleapis.com:443` (`TCP_OK`) while the agent could not.
+  That also disproved the second hypothesis, that k3s's default flannel ignores
+  NetworkPolicy — on this cluster the dataplane enforces them.
+
+- **How we fixed it:** Added one egress rule — TCP 443 to `0.0.0.0/0` — to
+  `deploy/agent.yaml`, with the cost stated at the rule: **the pod can now open a
+  TLS connection to any host on 443.** The narrower alternative does not exist
+  here. A NetworkPolicy `to:` selects a namespace, a pod set, or a CIDR, and
+  Google's endpoint is a large geographically-varying Anycast set with no stable
+  CIDR; a hand-maintained list would silently stop matching, which is exactly the
+  "ephemeral address in a committed manifest" defect `deploy/sentinel.yaml` was
+  rewritten to eliminate. `deploy/sentinel.yaml` reaches its apiserver by `ipBlock`
+  on the Service CIDR because that address **is** knowable; an external provider
+  is not. A DNS-based egress gateway or a CNI with FQDN policy (Cilium) is the
+  tighter answer and neither is available on this dataplane.
+
+  Port 443 only, and UDP/TCP 53 elsewhere still refused. The agent holds no
+  cluster credential (`automountServiceAccountToken: false`) and its only input is
+  scrubbed telemetry, so this is not an exfiltration path for cluster secrets.
+
+- **The generalisable form:** A credential in a pod and a client in a process are
+  both *evidence of intent*. Neither is evidence that a request left. When an
+  egress path is newly required, assert the connection rather than inferring it
+  from the manifest.
+
+### A chaos fixture passed every check while demonstrating the wrong failure (Milestone 3)
+
+`deploy/chaos/real-crash.yaml` took four defects to become correct. Every one was
+invisible to the structural gates, and three of the four produced a container that
+crashed, exited non-zero, and emitted a Python traceback — so any assertion about
+"did it fail" passed while the RCA described something else entirely.
+
+1. **`restartPolicy: Never` made it UNDETECTABLE BY CONSTRUCTION.** The pod reached
+   `Failed`, and the Sentinel emitted nothing with a completely clean log:
+   `{"watcher_emitted":0,"dedup_admitted":0,"processed":0}`. Cause, read from
+   source rather than guessed: `internal/k8s/watcher.go:236` deliberately DROPS a
+   `Terminated` with a non-OOM non-zero exit, because Contract A's `reason` admits
+   only `OOMKilled` and `CrashLoopBackOff`. Without a restart there is no
+   CrashLoopBackOff. Correct behaviour, wrong fixture — and the most total
+   possible silent failure.
+2. **A `/tmp` marker file** raised `OSError: [Errno 30] Read-only file system`,
+   because the pod sets `readOnlyRootFilesystem`. Real traceback, wrong cause.
+3. **An apostrophe in a prose comment** — "the kubelet's backoff" — terminated the
+   shell string wrapping `python -c '...'`, producing `IndentationError` in the
+   *fixture* rather than the `KeyError` it exists to produce.
+4. **No `set -e`**, so the shell continued past Python's failure and the trailing
+   `echo` succeeded: a container that raised a `KeyError`, wrote a full traceback,
+   and exited **0**. Found by the new test, not by the cluster.
+
+- **How we fixed it:** `agent/tests/test_chaos_fixtures.py` now **executes** the
+  fixture's inline script locally and asserts the exception type is the one under
+  test, that no incidental error appears, that there are at least two traceback
+  frames, and that the exit code is non-zero. Plus shape assertions for the
+  detectability properties. Four negative controls plant each defect and confirm
+  the guards fire.
+
+- **A negative control that failed for the wrong reason.** The first guard for
+  defect 2 asserted only that `Read-only file system` was absent from the output —
+  and was **vacuous**. On the test host `/tmp` is writable, so the planted
+  `touch` SUCCEEDED, raised nothing, and the guard passed with the defect present.
+  The real error only occurs in-cluster. The guard was replaced with a direct
+  assertion that the script performs no filesystem write at all, which is both the
+  requirement and the thing that was wrong. Recorded because a control that passes
+  for the wrong reason is worse than no control: it reads as a pass.
+
+- **The generalisable form:** An inline script in a manifest is code, and it is not
+  reviewed as code until something executes it. Executing it locally costs
+  milliseconds and would have caught all four before a pod was scheduled. The
+  second lesson is about detection, not fixture shape: **"the workload failed" is
+  not "the workload failed for the reason under test"**, and only the exception
+  type distinguishes them.
+
+### A `valueFrom` env var broke every test that read env as literals (Milestone 3)
+
+- **What happened:** Adding `GEMINI_API_KEY` to `deploy/agent.yaml` via
+  `valueFrom.secretKeyRef` failed two tests with `KeyError: 'value'`. Both built
+  their environment map as `{entry["name"]: entry["value"] for entry in env}`,
+  which raises on the first variable sourced from a Secret or ConfigMap rather
+  than an inline literal.
+
+- **Why it is a problem:** The error pointed at the **manifest**, and the manifest
+  was correct. Anyone reading that failure would have concluded the `valueFrom`
+  block was malformed, "fixed" it by inlining a literal — and committed a
+  credential into a tracked file. The failure mode of the test was a redirect away
+  from the safest available action.
+
+- **How we fixed it:** One `env_map()` helper, used everywhere, which maps a
+  `valueFrom` entry to its **source** rather than crashing or dropping the key. A
+  caller asserting on it now sees what the variable is bound to, which is more
+  useful than either the old crash or a silent omission.
+
+- **The generalisable form:** A helper that assumes the common case becomes a trap
+  the moment the uncommon-but-legal one appears, and it fails in a way that
+  misattributes the cause. `valueFrom` is not exotic; it is how every credential
+  enters a pod.

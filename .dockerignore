@@ -1,52 +1,95 @@
-# Build context exclusions for the agent image (AGENTS.md §2, ARCH §8).
+# Build context exclusions — BASELINE for every Dockerfile in this repository.
 #
-# The context is the repository root because agent/Dockerfile COPYs repo-relative
-# paths. Without this file the daemon uploads everything, including host build
-# artefacts that would otherwise be baked into a production image.
+# This file is the only exclusion list that applies to BOTH builders:
 #
-# __pycache__ matters specifically: it holds bytecode compiled by whatever
-# interpreter the developer happened to use. Copying it into an image built on a
-# different Python version ships stale, useless bytecode and inflates the layer.
+#   * BuildKit additionally honours `<dockerfile-path>.dockerignore`
+#     (agent/Dockerfile.dockerignore, cmd/sentinel/Dockerfile.dockerignore), and
+#     when one exists it REPLACES this file rather than adding to it.
+#   * The classic builder has no such mechanism. It reads this file and nothing
+#     else.
+#
+# That asymmetry is the whole reason this file is a floor and not a policy. It must
+# never exclude a path ANY Dockerfile COPYs, or the Sentinel build breaks on the
+# classic builder while appearing to work on BuildKit. Per-image leanness belongs
+# in the per-Dockerfile files; correctness belongs here.
+#
+# History, because the failure this shape prevents is easy to repeat.
+# ---------------------------------------------------------------------------
+# An earlier version of this file ended with:
+#
+#     # Nothing outside agent/ is consumed by the image
+#     internal/
+#     cmd/
+#
+# That comment is true of agent/Dockerfile and false of
+# cmd/sentinel/Dockerfile, which COPYs `cmd/` and `internal/`. The Sentinel build
+# therefore failed at `COPY internal/ internal/` with
+#
+#     failed to calculate checksum ... "/internal": not found
+#
+# on a repository where the directory plainly existed. Go source is not a
+# credential, and excluding it bought nothing; it only made one of the two images
+# unbuildable. `.github/workflows/e2e-detonation.yaml` builds the Sentinel from this
+# same repository-root context and would fail identically. The claim in the removed
+# comment was true only for the image its author happened to be building, which is
+# precisely why it read as a general rule.
+# ---------------------------------------------------------------------------
 
-# Host build artefacts
-**/__pycache__/
-**/*.py[cod]
-**/.pytest_cache/
-**/.mypy_cache/
-**/.ruff_cache/
-**/*.egg-info/
-**/venv/
-**/.venv/
-
-# Version control
+# ---------------------------------------------------------------------------
+# Version control and CI definitions
+#
+# `.git/` is the largest single item in the context and is also the one most likely
+# to carry credentials: `.git/config` holds remote URLs that may embed a token.
+# ---------------------------------------------------------------------------
 .git/
 .github/
 
-# Credentials. .gitignore already keeps these out of git, which is a different
-# channel entirely: the build context is uploaded to the Docker daemon on every
-# `docker build -f agent/Dockerfile .`, and ci.yaml L212 does exactly that. A file
-# that .gitignore protects is still shipped in the context unless this list says
-# otherwise, so the two have to be kept in step deliberately rather than assumed.
+# ---------------------------------------------------------------------------
+# Credentials and tool configuration
 #
-# No COPY in agent/Dockerfile reaches the repository root - the sources are
-# ${PYTHON_DEPS} and agent/ alone - so none of this was ever baked into a layer.
-# The exposure was the upload itself, which matters more the moment a build runs
-# against a remote or cloud builder instead of the local daemon.
+# `.gitignore` protects these from being committed. That is a DIFFERENT channel.
+# The build context is uploaded to the builder on every `docker build`, so a file
+# that `.gitignore` protects is still shipped unless this file says otherwise.
+# The two must be kept in step deliberately, never assumed to agree.
+#
+# Every pattern below is a credential SHAPE, not a filename of one known asset.
+# `opencode.json` and `.mcp.json` are named explicitly because both are known to
+# carry `GITHUB_PERSONAL_ACCESS_TOKEN`; a first `git add -A` here committed one.
+# ---------------------------------------------------------------------------
 opencode.json
 .mcp.json
+
+# Environment files, matched at any depth rather than only at the root. A first
+# attempt anchored these with a leading slash so `.env.example` would survive by
+# accident; a negative control then showed the cost — a token in `agent/.env` was
+# unprotected, which is just as leaked as one at the root. So: broad pattern,
+# explicit re-admission of the example forms.
 .env*
 !.env.example
 !.env.sample
 !.env.template
+
+# Cluster credentials. The E2E harness reads KUBECONFIG from the environment, so a
+# developer's kubeconfig landing in the repository root is an expected accident.
+# On the current host this is a live risk rather than a hypothetical one:
+# /etc/rancher/k3s/k3s.yaml is root-owned mode 0600 and every kubectl call uses
+# sudo, so a `sudo cp` into the worktree is one careless command away.
 kubeconfig
 kubeconfig.yaml
 *.kubeconfig
+
+# Key material. `*.key` is narrow: this repository has no tracked file matching it
+# today, which was checked rather than assumed, and a Secret fixture named
+# `something.key` would be a manifest test rather than key material.
 *.pem
 *.key
 *.p12
 *.pfx
 id_rsa
 id_ed25519
+
+# Cloud and package credentials, which follow developers into a repository root by
+# habit rather than by intent.
 .aws/
 .gcloud/
 credentials.json
@@ -54,14 +97,92 @@ service-account*.json
 .netrc
 .npmrc
 .pypirc
-secrets.yaml
-secrets.yml
 
-# Test fixtures are not needed at runtime
-tests/
+# ---------------------------------------------------------------------------
+# Kubernetes Secret manifests
+#
+# Deliberately narrow. A redacted Secret fixture is a legitimate thing to commit
+# and blocking it would be wrong, so this is scoped to the repository root and
+# `deploy/**` can still hold reviewed, redacted fixtures for the deploy tests.
+# Nothing tracked matches this today.
+# ---------------------------------------------------------------------------
+/secrets.yaml
+/secrets.yml
 
-# Nothing outside agent/ is consumed by the image
-internal/
-cmd/
-docs/
-*.md
+# ---------------------------------------------------------------------------
+# Local virtual environments
+#
+# `.venv*/` rather than `.venv/`, because the interpreter this project's gates
+# require is a specific minor version: `agent/pyproject.toml` pins
+# `target-version = ["py311"]` and root `setup.cfg` sets `python_version = 3.11`,
+# so the environment is named `.venv311` and is load-bearing rather than
+# incidental. Uploading it would add roughly 300 MB of site-packages to every
+# build context for no benefit.
+#
+# The cost of the glob is recorded rather than hidden: `.venv*/` also matches a
+# hypothetical `.venv311-broken/`. That is the correct trade — an occasional stray
+# directory excluded from a build context is harmless, whereas shipping site-
+# packages is not.
+# ---------------------------------------------------------------------------
+.venv*/
+**/.venv*/
+venv/
+**/venv/
+
+# ---------------------------------------------------------------------------
+# Build artefacts
+#
+# `/bin/` is the Sentinel build output (`go build -o bin/sentinel`). Anchored so a
+# legitimately named `bin/` inside a subproject is not swept up.
+# ---------------------------------------------------------------------------
+/bin/
+/.gotmp/
+/pprof/
+scrubber.test
+*.test
+coverage.*
+*.out
+cpu*.out
+ci-g3-output.txt
+
+# ---------------------------------------------------------------------------
+# Python build and test caches
+#
+# `__pycache__` matters specifically: it holds bytecode compiled by whatever
+# interpreter the developer happened to use. Copying it into an image built on a
+# different Python version ships stale, useless bytecode and inflates the layer.
+# ---------------------------------------------------------------------------
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+
+# ---------------------------------------------------------------------------
+# Editors, OS and local scratch
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+tmpdump/
+probe_*.go
+
+# ---------------------------------------------------------------------------
+# NOT excluded here, deliberately
+#
+# internal/    cmd/       — cmd/sentinel/Dockerfile COPYs both. Excluding them
+#                           breaks the Sentinel build; see the history note above.
+# docs/        *.md       — no image COPYs them, but excluding them here would
+#                           make this file a per-image policy, which is what the
+#                           per-Dockerfile files are for.
+# tests/                   — likewise. The per-Dockerfile files drop it; this
+#                           baseline keeps the floor safe for any builder.
+#
+# Kept out of this file so the baseline stays correct no matter which Dockerfile
+# is built, and so the reason a path is absent is always recorded next to the
+# claim that it should be absent.
+# ---------------------------------------------------------------------------

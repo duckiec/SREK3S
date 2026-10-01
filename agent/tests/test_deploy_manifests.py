@@ -528,16 +528,41 @@ def test_termination_grace_exceeds_the_drain_budget() -> None:
     and the kubelet starts SIGKILLing mid-drain, turning every rolling update into
     a slow-loss event - with no error anywhere, because the loss is silent by
     construction.
+
+    THE PATH MATTERS, and it was wrong here until 2026-10-01.
+
+    This test read the value out of ``spec.template.spec.containers[0]``. That is
+    not a valid location: ``terminationGracePeriodSeconds`` is a field of
+    **PodSpec**, and there is no container-level counterpart. The apiserver rejects
+    the whole Deployment with
+
+        strict decoding error: unknown field
+        "spec.template.spec.containers[0].terminationGracePeriodSeconds"
+
+    which is exactly how it was found - by applying the manifest to a live control
+    plane, after the field had shipped at the wrong level through an entire
+    milestone. The test passed throughout because it asserted on the parsed YAML,
+    where the value is present and plausible at either indentation. A test that
+    cannot tell a valid field from an invalid one is not asserting that the field
+    is usable; it is asserting that a string appears in a document.
+
+    So the assertion below now reads the real path, and a companion test asserts
+    the field is ABSENT from the container, which is the check that would have
+    caught this. See also
+    ``deploy/sentinel.yaml`` for the same note at the field itself.
     """
     source = (REPO_ROOT / "cmd" / "sentinel" / "main.go").read_text(encoding="utf-8")
     assert (
         "ShutdownGrace = " in source
     ), "ShutdownGrace moved; update this test to read it from the same place"
 
-    deployment = one(load("sentinel.yaml"), "Deployment")
-    grace = deployment["spec"]["template"]["spec"]["containers"][0][
-        "terminationGracePeriodSeconds"
-    ]
+    pod_spec = one(load("sentinel.yaml"), "Deployment")["spec"]["template"]["spec"]
+    assert "terminationGracePeriodSeconds" in pod_spec, (
+        "terminationGracePeriodSeconds is a PodSpec field; it must be a sibling of "
+        "`containers`, not a child of a container. A container-level copy is "
+        "silently inert in this test and rejected by the apiserver in a cluster."
+    )
+    grace = pod_spec["terminationGracePeriodSeconds"]
     # 20s in the source, read rather than duplicated so a change on either side
     # shows up here.
     assert grace == 45, (
@@ -545,6 +570,46 @@ def test_termination_grace_exceeds_the_drain_budget() -> None:
         f"ShutdownGrace (20s) so the drain finishes before SIGKILL"
     )
     assert grace > 20
+
+
+def test_termination_grace_is_not_set_on_a_container() -> None:
+    """The field must NOT appear at container level, in either manifest.
+
+    This is the assertion that would have caught the defect above, and it is
+    negative-controlled: it fails when a container-level copy is planted, and passes
+    on a manifest that only carries the valid PodSpec field.
+
+    The distinction is not stylistic. ``terminationGracePeriodSeconds`` sits in
+    PodSpec with no container-level counterpart, so a container-level copy is
+    inert to every YAML parser in this repository and fatal to the apiserver:
+
+        The Deployment "srek3s-sentinel" is invalid:
+        spec.template.spec.containers[0].terminationGracePeriodSeconds:
+          Forbidden: strict decoding error: unknown field
+
+    Both deployments shipped that way and applied to nothing, while every manifest
+    test in this suite was green. The reason is the generalisable one: this
+    repository can parse these documents but cannot validate them, and a check
+    written against the parser inherits that limit. The only instrument that knows
+    whether a field is *usable* is the control plane that consumes it.
+    """
+    for name in ("sentinel.yaml", "agent.yaml"):
+        pod_spec = one(load(name), "Deployment")["spec"]["template"]["spec"]
+        containers = pod_spec["containers"]
+        assert containers, f"{name}: no containers to check"
+        for container in containers:
+            assert "terminationGracePeriodSeconds" not in container, (
+                f"{name}: container {container.get('name')!r} sets "
+                "terminationGracePeriodSeconds. It is a PodSpec field; the apiserver "
+                "refuses the whole Deployment with a strict-decoding error, so this "
+                "manifest cannot be applied at all. Assert it on the pod spec "
+                "instead."
+            )
+        # And the valid location must actually carry a value, so this test cannot
+        # pass on a manifest that simply dropped the field.
+        assert (
+            "terminationGracePeriodSeconds" in pod_spec
+        ), f"{name}: no pod-level terminationGracePeriodSeconds; the drain budget is unprotected"
 
 
 # ---------------------------------------------------------------------------

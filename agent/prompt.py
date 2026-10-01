@@ -18,6 +18,7 @@ see :func:`evidence_lines`, which takes only the payload and the decision.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Final
 
@@ -97,6 +98,68 @@ def _joined_logs(payload: IncidentPayload) -> str:
     return "\n".join(payload.scrubbed_logs)
 
 
+#: Whether ``evidence_lines`` includes the log TEXT, or only the metadata
+#: describing it. See the note on :func:`evidence_lines` — this is the switch that
+#: decides whether attacker-influenced text can reach a model at all.
+#:
+#: Environment-overridable via SREK3S_LOG_TEXT_EVIDENCE, and the environment is
+#: the authority on purpose. Whether an RCA model should see raw log text is a
+#: property of the DEPLOYMENT - a cluster where logs are known-trusted and a
+#: cluster where any workload can print to stdout are different systems - and not
+#: something a source edit should decide for every operator at once. The default
+#: stays False because the safe reading is the one that ships.
+LOG_TEXT_EVIDENCE_ENV: Final[str] = "SREK3S_LOG_TEXT_EVIDENCE"
+
+
+#: The hard ceiling on ``RootCause.evidence``, asserted by the schema as
+#: ``max_length=20``. This module must not depend on that by accident: emitting
+#: 21 lines raises a Pydantic error deep inside response construction, which
+#: surfaces as a 500 on a request the agent already had enough evidence to
+#: answer. Kept as a named constant so the coupling is visible on both sides.
+MAX_EVIDENCE_LINES: Final[int] = 20
+
+
+def _log_evidence(logs: list[str], budget: int) -> list[str]:
+    """The most recent log lines that fit in ``budget``, tail-first.
+
+    TAIL-FIRST IS THE POINT, and it is a correctness decision rather than a
+    formatting one. A crashing container writes its traceback LAST: the failing
+    line, the exception type, and the timestamp that correlates with the
+    restart are all in the final lines, while the first lines are startup
+    banners that describe nothing that went wrong. Taking the head would fill the
+    budget with the least useful evidence available and drop the traceback - the
+    one part of a log an RCA actually needs.
+
+    When lines are dropped, a marker says so and names the count. A silently
+    truncated log reads to a model as a complete one, and "the evidence was
+    bounded" is itself a fact the model needs.
+    """
+    if budget <= 0:
+        return []
+    if len(logs) <= budget:
+        return [f"log={line}" for line in logs]
+    kept = logs[-budget:]
+    # One line of the budget is spent on the marker, so the marker can never
+    # itself overflow the ceiling it is reporting.
+    return [f"log=[... {len(logs) - budget + 1} earlier lines omitted ...]"] + [
+        f"log={line}" for line in kept[1:]
+    ]
+
+
+def log_text_evidence_enabled() -> bool:
+    """Whether ``evidence_lines`` emits log text, resolved at CALL time.
+
+    Call time rather than import time so a value injected after start-up is
+    honoured, and so a test can flip it without reimporting the module.
+    """
+    return os.environ.get(LOG_TEXT_EVIDENCE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def evidence_lines(payload: IncidentPayload) -> list[str]:
     """Build the evidence list, one item per fact present in the payload.
 
@@ -104,6 +167,30 @@ def evidence_lines(payload: IncidentPayload) -> list[str]:
     requires. Nothing is inferred: if a field is absent it is not asserted.
     ``reason`` and ``exit_code`` are always present, so the list is never empty
     and the schema's ``min_length=1`` holds without a synthetic filler.
+
+    LOG TEXT IS EXCLUDED BY DEFAULT, and that default is load-bearing.
+
+    This function is what ``llm.build_prompt`` hands to a model, and by default it
+    describes the logs (``scrubbed_log_lines=7``) without reproducing them. That
+    was not a deliberate privacy win; it was the original shape of the function,
+    and it means a prompt-injection payload planted in a stack trace has **no path
+    to the model at all**. An injection is data the model cannot see, so no prompt
+    engineering is load-bearing against it.
+
+    This is a real limitation, stated rather than hidden: a log is usually the most
+    informative evidence available, and a model shown only metadata reasons about
+    less than it could. Widening it is therefore
+    :func:`log_text_evidence_enabled`, which is off until an operator who has read
+    the consequences turns it on. What must hold when they do:
+
+    * the text is the Sentinel-scrubbed ``scrubbed_logs``, never raw container
+      output, so a secret is already ``[REDACTED]`` upstream of this module; and
+    * the ``system_instruction`` separation in ``llm.py`` becomes load-bearing
+      rather than defence-in-depth, because the rules and the attacker-influenced
+      text would then occupy the same request.
+
+    Both were verified with a negative control before this flag existed; see
+    ``docs/lessons-learned.md``.
     """
     lines: list[str] = [
         f"reason={payload.reason.value}",
@@ -127,6 +214,10 @@ def evidence_lines(payload: IncidentPayload) -> list[str]:
     if payload.cluster_events:
         reasons = sorted({event.reason for event in payload.cluster_events})
         lines.append(f"cluster_event_reasons={','.join(reasons)}")
+    if log_text_evidence_enabled():
+        lines.extend(
+            _log_evidence(payload.scrubbed_logs, MAX_EVIDENCE_LINES - len(lines))
+        )
     return lines
 
 

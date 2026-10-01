@@ -1,0 +1,125 @@
+# Patch: give the agent a real, readable target manifest.
+#
+# Applied by ./kustomization.yaml to the `srek3s-agent` Deployment. This is a
+# strategic-merge patch, so it merges with deploy/agent.yaml rather than replacing
+# it — which is why the container is named `agent` and only the fields that must
+# change are present.
+#
+# Two edits, and both are required for Tier-1 to be reachable in-cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-agent
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          env:
+            # -------------------------------------------------------------------------
+            # SREK3S_TARGET_MANIFEST
+            #
+            # This is a repo-RELATIVE path resolved under SREK3S_MANIFEST_ROOT.
+            #
+            # The shipped default is `deploy/payments/checkout-api.yaml`, which
+            # **does not exist in this repository** — verified, not assumed. Leaving
+            # it unset therefore produces deterministic Tier-2 escalation for a reason
+            # that has nothing to do with the fail-closed design working: the provider
+            # cannot find the file. Two independent causes of all-Tier-2 exist
+            # (empty mount, wrong target), and fixing only the first changes nothing.
+            #
+            # `deploy/chaos/oom-leak.yaml` is chosen because it is the fixture the
+            # incident is generated from, so the proposed diff is falsifiable: raising
+            # the limit in this file must correspond to raising the limit the running
+            # pod is actually being killed against.
+            # -------------------------------------------------------------------------
+            - name: SREK3S_TARGET_MANIFEST
+              value: deploy/chaos/oom-leak.yaml
+
+            # SREK3S_SANDBOX=1 runs each admitted analysis in a disposable child
+            # process. Off by default, and deliberately: the deterministic Milestone-2
+            # analysis is CPU-trivial and a fork costs ~400ms per incident. It matters
+            # here because the I-B2 verification runs `git apply --check` as a
+            # subprocess, and the point of a live Tier-1 run is that the patch really
+            # was verified rather than that verification was skipped.
+            - name: SREK3S_SANDBOX
+              value: "1"
+
+          volumeMounts:
+            # -------------------------------------------------------------------------
+            # /manifests becomes a PROJECTED volume instead of the emptyDir that
+            # deploy/agent.yaml ships.
+            #
+            # PSA `restricted` forbids hostPath outright (see kustomization.yaml for
+            # the full reasoning), and permits `projected`. The ConfigMap reference
+            # resolves to the hash-suffixed name the generator produced, and Kustomize
+            # rewrites that reference — so a changed manifest rolls the pods.
+            #
+            # readOnly is retained from the base manifest and is not incidental: I-B4
+            # requires the agent to be unable to alter the file it diffs against.
+            # -------------------------------------------------------------------------
+            - name: manifests
+              mountPath: /manifests
+              readOnly: true
+
+      # ---------------------------------------------------------------------------
+      # `$patch: replace` IS REQUIRED ON THE VOLUMES LIST. Not stylistic.
+      #
+      # Strategic merge matches list entries by their merge key — `name` for volumes —
+      # and merges the *contents*. The base manifest's `manifests` volume is an
+      # `emptyDir`; this patch sets `projected` on the same entry. Merge therefore
+      # produces a single volume carrying BOTH keys, and the apiserver rejects it:
+      #
+      #     spec.template.spec.volumes[0].projected: Forbidden: may not specify more
+      #       than 1 volume type
+      #     spec.template.spec.containers[0].volumeMounts[0].name: Not found: "manifests"
+      #
+      # The second error is the consequence: the volume fails validation, so the mount
+      # named in volumeMounts resolves to nothing.
+      #
+      # This is the failure mode of strategic merge on a scalar-ish field — the same
+      # class as the `terminationGracePeriodSeconds` misplacement, and caught the same
+      # way: by applying to a real control plane rather than by reading the manifest.
+      # A YAML parser accepts both. Only the apiserver knows a volume carries exactly
+      # one type.
+      # ---------------------------------------------------------------------------
+      volumes:
+        - $patch: replace
+        # ---------------------------------------------------------------------------
+        # `tmp` is CARRIED THROUGH DELIBERATELY, and omitting it is the second half
+        # of the `$patch: replace` cost.
+        #
+        # Replacing the whole list is what lets `manifests` change volume type, but it
+        # also discards every other volume the base declared — so `tmp` must be
+        # restated here verbatim or the pod is rejected with
+        # `volumeMounts[1].name: Not found: "tmp"`.
+        #
+        # `tmp` is not optional even though the agent's own writes go through
+        # `TMPDIR=/tmp`: a read-only root filesystem leaves the interpreter nowhere to
+        # put a temporary file, and both the I-B2 `git apply --check` scratch repo and
+        # the sandbox worker's temp directory live there. Dropping it would produce a
+        # pod that starts and then fails its first real triage.
+        #
+        # `medium: Memory` is kept from the base so /tmp stays off the node's
+        # ephemeral-storage budget, and `sizeLimit` is kept so a runaway write is
+        # capped rather than consuming node disk.
+        # ---------------------------------------------------------------------------
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: manifests
+          projected:
+            sources:
+              - configMap:
+                  name: srek3s-target-manifest
+                  items:
+                    # Key from configMapGenerator is the bare file name; `path` is the
+                    # location it appears at inside the mount. Without this the file
+                    # lands at /manifests/oom-leak.yaml and the provider reports it
+                    # unreadable — a Tier-2 escalation that looks like fail-closed
+                    # behaviour working and is actually a misconfigured mount.
+                    - key: oom-leak.yaml
+                      path: deploy/chaos/oom-leak.yaml
+
+

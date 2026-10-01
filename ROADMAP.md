@@ -1598,6 +1598,205 @@ verification loop. **Satisfies:** PRD F4, AC-1, AC-2, AC-3, AC-4 end-to-end.
 
 ---
 
+## Local Environment Baseline — Fedora 44 / WSL2 / linux-arm64 (recorded 2026-10-01)
+
+**This section is not a milestone and renumbers nothing.** Milestones 1–4 are closed
+above and their recorded evidence is left exactly as it was measured. What follows is the
+delta between the host those milestones were developed on and the host they can now be
+developed on, plus the tasks that delta creates.
+
+**Why it is a section rather than a paragraph.** The previous environment was
+`windows/arm64`, and a large fraction of this roadmap's evidence carries that platform in
+its text: `windows/arm64` appears in the `1.5` throughput tables, in `2.4.2`, in `2.8`, in
+`3.7.3`, and in `docs/lessons-learned.md` §15. Those records are not edited. The constraint
+is restated here as an environment of record instead, so a future agent can tell in one
+place which claims were measured where and which constraints no longer apply.
+
+**Environment of record.** WSL2 on an ARM64 Windows host, distribution
+**`Fedora Linux 44 (aarch64)`**, kernel `6.18.40.1-microsoft-standard-WSL2`, systemd as
+PID 1. k3s **v1.36.4+k3s1**, single node `dwindle2` (`control-plane`, Ready, containerd
+`2.3.4-k3s1.36`, internal IP `172.30.181.188`; 10 CPU, 7908756Ki memory, 110 pods
+allocatable). kubectl **v1.36.4+k3s1** with kustomize **v5.8.1**. Docker **29.8.2**,
+storage driver `overlayfs`, root `/var/lib/docker`, unit `docker` active. CI remains
+`ubuntu-latest` (`amd64`) with k3s **v1.29.9+k3s1**.
+
+### Completed on this host
+
+- [x] `ENV-1.1` Install a native Linux Go toolchain.
+      `golang.aarch64` installed; `go version` reports
+      `go1.26.8-X:nodwarf5 linux/arm64`, which satisfies `go.mod`'s `go 1.23`.
+      A Windows Go exists at `/mnt/c/Program Files/Go/bin/go.exe`, and the Linux path
+      precedes `/mnt/c` in `PATH`, so the native toolchain wins.
+      **`which go` resolves to `/usr/sbin/go`, not `/usr/bin/go`** — `/usr/sbin`, `/usr/bin`,
+      `/sbin` and `/bin` are the same inode on this host, so assert on the `go version`
+      string rather than the path. Confirm with `command -v go && go version` rather than
+      assuming: the `scripts/gotest.ps1` workaround described in box `3.7.3` was a
+      Windows-only artefact and does not apply here.
+      **This box records an installation fact. It asserts no build or test result.** The
+      gates are `ENV-2.x` and the execution phase, and none of them has been run against
+      this host yet.
+- [x] `ENV-1.2` Make the `-race` detector locally available.
+      `gcc.aarch64` 16.2.1 is installed, so cgo is available and `go test -race` is
+      **runnable and locally verifiable** on this host. This is the change that retires
+      the `windows/arm64` standing constraint recorded in boxes `1.5`, `2.8` and `3.7.3`,
+      where the gate was left unticked rather than ticked on an assumption.
+      **Superseded for local runs only.** GitHub Actions `ubuntu-latest` remains the
+      platform authority for every published figure, and no recorded CI result in this file
+      is withdrawn by this amendment. A local pass is additional evidence, never a
+      replacement — and the gate still has to be *run* locally before anything may claim
+      it was.
+
+- [x] `ENV-1.3` Install a 3.11 interpreter and a pinned virtualenv.
+      `python3.11` (3.11.16) installed natively; virtualenv at `~/SREK3S/.venv311` with
+      `agent/requirements.txt` installed. The system default `python3` is **3.14.3** and is
+      **not acceptable** for any gate: AGENTS §2 forbids 3.12+ syntax,
+      `agent/pyproject.toml` pins `target-version = ["py311"]`, and root `setup.cfg` sets
+      `python_version = 3.11`. Every Python gate runs as
+      `~/SREK3S/.venv311/bin/python -m <tool>`. Recorded because the host's default
+      interpreter being wrong is a fact discovered through a confusing E999 rather than
+      through reading a document.
+- [x] `ENV-1.4` Bring up a Docker daemon.
+      Docker 29.8.2 active, `overlayfs`, `/var/lib/docker`, systemd unit `docker`. **Caveat
+      that must be honoured rather than worked around:** user `duckie` (uid 1000) is in
+      `wheel` but **not** in the `docker` group, and `/var/run/docker.sock` is
+      `srw-rw---- root:docker`. Plain `docker` fails with `permission denied while trying
+      to connect to the docker API`. `sudo docker …` works and `sudo` is passwordless.
+      Adding a user to the `docker` group is **not** the fix proposed here: that group
+      confers root-equivalent control of the daemon, and the blast-radius argument this
+      project is built on argues against granting it casually.
+
+- [x] `ENV-1.5` Stand up a live k3s cluster.
+      `v1.36.4+k3s1` running, single node `dwindle2`, Ready, role `control-plane`,
+      containerd `2.3.4-k3s1.36`, internal IP `172.30.181.188`, 10 CPU / 7908756Ki / 110
+      pods allocatable. **Every `kubectl` call requires `sudo`**: the kubeconfig
+      `/etc/rancher/k3s/k3s.yaml` is mode `0600` and root-owned. This is the same class of
+      fact as the containerd socket in CI run `36795230898` (`docs/offline-install.md`,
+      Mechanism A), reached here by configuration rather than by CI accident.
+- [x] `ENV-1.6` Confirm `busybox:1.36.1` is obtainable for `linux/arm64`.
+      The `arm64` manifest is published, which is what the chaos fixtures need:
+      `deploy/chaos/` sets `imagePullPolicy: Never`, so a missing image is a **hard apply
+      failure** rather than a silent pull at container start. This box covers *availability
+      of the manifest*, not registration into this node's containerd — `ENV-2.3` covers
+      that, and so does the `busybox:1.36.1 registered in k3s containerd` assertion
+      recorded in box `4.3.4`. `registry.internal/srek3s-*` has **no** `arm64` manifest
+      anywhere, because no such image has ever been built; it must be built here
+      (`ENV-2.3`) for `linux/arm64`, because CI builds `amd64`.
+
+### Open
+
+- [ ] `ENV-2.1` **Resolve the `WATCH_NAMESPACE` / RBAC scope mismatch.**
+      `deploy/sentinel.yaml` sets `WATCH_NAMESPACE: ""` — watch **all** namespaces —
+      while `deploy/rbac.yaml` grants only a namespaced `Role` in `srek3s-system`, with
+      no `ClusterRole` and no `ClusterRoleBinding`. A cluster-wide `LIST /api/v1/pods` is
+      therefore unauthorised, the informer retries it, and **the visible symptom is
+      silence**: no incidents, no error. The two-sided fix is to set `WATCH_NAMESPACE` to
+      a specific namespace **and** apply a matching `Role` + `RoleBinding` into that
+      namespace, referring to the `srek3s-system` ServiceAccount; procedure and
+      `kubectl auth can-i` confirmation are in `docs/runbook.md` §1. Adding a
+      `ClusterRole` is explicitly **not** the fix.
+      **Status: found by static analysis of the two manifests on 2026-10-01; NOT yet
+      reproduced at runtime.** Neither the forbidden `LIST` nor the resulting silence has
+      been observed, because nothing is deployed. Recorded per AGENTS §5.7: a correct
+      deduction is not an observation, and this box stays open until it is one.
+      Cross-references: `PRD.md` A6, `ARCHITECTURE.md` §2.1, `docs/lessons-learned.md`.
+- [ ] `ENV-2.2` **Wire a GitOps checkout so Tier-1 is reachable in-cluster.**
+      `deploy/agent.yaml` mounts `SREK3S_MANIFEST_ROOT=/manifests` on an `emptyDir`, so
+      `FileManifestProvider.read_manifest` returns `None`,
+      `triage._build_remediation_diff` bails at step 2, and **every** incident escalates
+      to `TIER_2_ARCHITECTURAL` with `git_patch == ""` and `patch_validated == false`.
+      That is invariant I-B2 failing closed and the design working, not a fault — but it
+      is indistinguishable at a glance from a broken agent. Replace the `emptyDir` with a
+      PVC, or an init container that clones the repository, and set
+      `SREK3S_TARGET_MANIFEST` to a repo-relative path inside it. **Both halves are
+      required:** the default target `deploy/payments/checkout-api.yaml` does not exist
+      in this repository, so leaving the variable unset yields the identical 100% Tier-2
+      outcome. Until this is done an in-cluster run demonstrates the Tier-2 war-room path
+      and the no-mutation guarantee, and **cannot** demonstrate AC-3.
+- [ ] `ENV-2.3` **Build both images for `linux/arm64` and register them in `k8s.io`.**
+      `sudo docker build --platform linux/arm64 -t registry.internal/srek3s-agent:0.1.0 -f agent/Dockerfile .`
+      and the same for `-f cmd/sentinel/Dockerfile`, then register under the **exact**
+      fully-qualified names (`registry.internal/srek3s-agent:0.1.0`,
+      `registry.internal/srek3s-sentinel:0.1.0`). The `k8s.io` containerd namespace
+      currently holds only k3s's own images. A name the kubelet cannot resolve is
+      `ImagePullBackOff`, and that message does not distinguish a missing tag from a wrong
+      architecture, so verify with `sudo k3s ctr images ls --namespace k8s.io`.
+- [ ] `ENV-2.4` **Execute mechanism B and close the last image-install gap.**
+      `docs/offline-install.md` separates **A** (`ctr images pull` + `tag`, verified in CI
+      against a real node) from **B** (`ctr images import` of a tarball, **unverified**).
+      This host is now **capable** of verifying B: a native Docker and a live k3s exist,
+      which is exactly what B needs. **B is still not verified** and must not be reported
+      as such until `sudo k3s ctr images import <tarball> --namespace k8s.io` has actually
+      been run and the resulting pods have started. The exact command sequence is staged
+      in `docs/offline-install.md` under its own heading; this box is closed by execution,
+      not by the existence of the commands.
+- [ ] `ENV-2.5` **Apply `deploy/` and record the result.**
+      `srek3s-system` does not exist yet and nothing is deployed; the only namespaces
+      present are `default`, `kube-node-lease`, `kube-public`, `kube-system`, none
+      carrying PSA labels. Apply with `sudo kubectl apply -k deploy/` and confirm the
+      hardening assertions from PRD AC-4. **Note the version skew while doing it:**
+      `deploy/namespace.yaml` sets `pod-security.kubernetes.io/enforce-version: latest`,
+      so PSA is evaluated against k3s **1.36** here and against whatever `latest` means
+      on the CI node's **1.29**. The same manifest can be admitted in one place and
+      refused in the other for a reason that has nothing to do with the code; diagnose the
+      skew before diagnosing the manifest.
+- [ ] `ENV-2.6` **Verify NetworkPolicy enforcement on k3s.**
+      No NetworkPolicy controller *pod* is observable in `kube-system`, which is **not**
+      evidence that enforcement is absent: k3s runs its kube-router netpol controller
+      embedded in the `k3s server` process rather than as a separate pod. Both policies
+      in `deploy/` (`srek3s-sentinel`, `srek3s-agent-egress`) are therefore *expected*
+      to be enforced here, and that expectation is currently **unverified on this host**.
+      Assert it negatively: an egress to a host outside the allow-list must fail. Asserting
+      the policy object exists proves nothing, and asserting a permitted connection works
+      proves nothing either, because that also works with no controller at all.
+- [ ] `ENV-2.7` **Close the `verify.py` wiring gap.**
+      `agent/verify.py` (741 lines) implements PRD F4 and `ARCHITECTURE.md` §5.2 and is
+      covered by `agent/tests/test_verify.py` and `agent/tests/test_verification_e2e.py`,
+      but **no production module imports it** — `main.py` and `triage.py` do not.
+      `triage.py` emits `verification_policy` on the wire and nothing in the service
+      consumes it, so the post-remediation loop is **not reachable from the running HTTP
+      service**. The defect is the absence of an assertion, not the absence of code: no
+      gate in this repository fails when a module is orphaned. A candidate gate is an
+      import-graph assertion from the FastAPI app factory, which would have caught this.
+      Boundary recorded at `ARCHITECTURE.md` §5.5.1; status is known-unwired in
+      `PRD.md` §3.2 and `AGENTS.MD` §2.
+- [ ] `ENV-2.8` **Reconcile the sandbox CPU budget constant.**
+      `agent/sandbox.py`'s docstring says "500 ms of CPU" and box `2.4.2` asks for
+      `500m`, but `DEFAULT_CPU_SECONDS = 1` — one CPU-*second*. `RLIMIT_CPU` counts CPU
+      seconds and cannot express a fraction, so `500m` is not expressible as an rlimit at
+      all; the value was almost certainly rounded up to the smallest unit an rlimit can
+      carry. Either amend the docstring and `2.4.2` to say "1 CPU-second", or express the
+      budget as a cgroup `cpu.max` where a fraction is expressible. Recorded at
+      `ARCHITECTURE.md` §5.5.3. Box `2.4.2` stays ticked and its evidence stands — its
+      substance, that rlimits rather than a cgroup are the real enforcement, is correct.
+      What is wrong is the 500 ms phrasing, by a factor of two, and
+      `ARCHITECTURE.md` §5.5.3 records it rather than propagating it.
+- [ ] `ENV-2.9` **Fix or document the cgroup write position.**
+      `_run_guarded` calls `subprocess.run(...)` and only afterwards calls `_try_cgroup`
+      to write `srek3s-agent/memory.max` / `cpu.max`, so those ceilings are applied
+      after the child they would bound has already exited. Real enforcement is
+      `RLIMIT_AS` / `RLIMIT_CPU` plus the `subprocess` timeout, installed in
+      `preexec_fn` before `exec` and therefore not raisable from inside. Either move the
+      cgroup write so it precedes the child, or amend the docstring to say the cgroup
+      write is a report-only probe of hierarchy presence. As written,
+      `cgroup_enforced=True` can be true and meaningless. Recorded at
+      `ARCHITECTURE.md` §5.5.3; verified by reading source on 2026-10-01, not observed at
+      runtime.
+- [ ] `ENV-2.10` **Re-measure scrub throughput on `linux/arm64`, as a new figure.**
+      The ARCH §6.2 budget and the recorded numbers were measured on `windows/arm64`
+      (`ARCHITECTURE.md` §6.5) and in CI on `amd64`. Run `BenchmarkScrubThroughput` on
+      this host and record the result **with the platform named**, as a new figure. Do not
+      overwrite the existing numbers: they are the record of what was measured on what,
+      and replacing them destroys the evidence the historical `1.5` post-mortem depends
+      on.
+
+> **What this section does not claim.** `ENV-1.1` through `ENV-1.6` are installation and
+> capability facts, measured on 2026-10-01 and stated as such. **No gate from AGENTS §4 has
+> been executed against this host**, so nothing here should be read as a passing build, a
+> passing test suite, or a running deployment. The boxes that would carry those claims are
+> all still open above.
+
+---
+
 ## Milestone Dependency Summary
 
 ```
@@ -1719,4 +1918,30 @@ The MVP is complete when:
 
       Minor, same section: `expected/oom-expected-rca.md` is on disk since
       Milestone 4.4 and is now named in the tree alongside `oom-expected.patch`.
+
+---
+
+## Reading this checklist alongside the environment section
+
+Every box above is `[x]`, and that remains true of the four milestones: no milestone box
+was reopened and no recorded CI result was altered by the change of development host. But
+"all milestones closed" is **not** "nothing outstanding", and the two statements are easy to
+conflate because this checklist is entirely closed boxes.
+
+Ten boxes are open in **Local Environment Baseline** above, and they are not cosmetic. Two
+are functional defects in the shipped deployment:
+
+- `ENV-2.1` — `WATCH_NAMESPACE: ""` against a namespaced `Role`. As committed, the
+  Sentinel is authorised to read only `srek3s-system` and configured to read everything.
+  The result is a silently blind watcher, found by static analysis and **not yet
+  reproduced at runtime**.
+- `ENV-2.2` — the agent's `emptyDir` manifest root plus a default target that does not
+  exist in this repository, so Tier-1 is unreachable in-cluster and 100% Tier-2 is the
+  designed outcome rather than a fault.
+
+The rest are host-remediation work whose completion is claimed only to the extent the
+measurements in that section prove it, plus two `agent/sandbox.py` documentation defects
+(`ENV-2.8`, `ENV-2.9`) that are stated there rather than folded into a ticked milestone box
+to keep the count clean. **A closed milestone is evidence about the milestone; it is not a
+statement about the current tree.**
 

@@ -30,7 +30,7 @@ whole point of keying on the assertion rather than the position.
 | **Fixture behaviour**: whether a chaos manifest produces the failure it claims, cgroup limits and OOM victim selection, backoff timing, kubelet status transitions, pod scheduling | `@chaos-engineer` | The fixture is that agent's artefact, and the questions are about kernel and kubelet behaviour rather than about this repository's code. |
 | **Wire and payload**: Sentinel event extraction, telemetry bounds, redaction, ULID generation, serialisation, `git apply --check`, payload invariants, anything requiring a byte-level diff of a captured payload | `@e2e-verifier` | The question is what the bytes say. A verifier that can diff a payload against the corpus and against the expected wire form answers it directly; anyone else reconstructs the payload from a description of it. |
 | **Capacity and time**: runner CPU starvation, egress buffer drops, load shedding, liveness and readiness timeouts, latency budgets, saturation thresholds | `@sre-profiler` | These are questions about time and capacity, and that agent's method is to generate load and measure. A saturated runner and an over-strict timeout are indistinguishable without that measurement. |
-| **Concurrency**: `go test -race` data races, channel and mutex synchronisation, goroutine accounting, deadlock or livelock | **Primary** | The failure *is* the synchronisation model. Delegating it would mean relaying a detector's report through an agent that did not run the detector, and the interesting part is which of two apparently-symmetric orders was actually wrong. |
+| **Concurrency**: `go test -race` data races, channel and mutex synchronisation, goroutine accounting, deadlock or livelock | **Primary** | The failure *is* the synchronisation model. Delegating it would mean relaying a detector's report through an agent that did not run the detector, and the interesting part is which of two apparently-symmetric orders was actually wrong. Reproducible locally since the move to `linux/aarch64` — see the closing section. |
 
 ### The dividing question
 
@@ -88,3 +88,36 @@ delegating: several of the defects in this project were found by executing the
 code path rather than by reading the report about it, and one of them — a
 credential leak reported by an agent on the wrong regex engine — was entirely
 absent on the engine that ships.
+
+## Local reproduction is now possible for most of this, and still is not the authority
+
+**Added 2026-10-01, and it changes where triage should start.** The development host
+used to be `windows/arm64`, on which `go test -race` could not run at all — no
+ThreadSanitizer, no cgo — so a failing CI step had no local equivalent and every
+investigation started from a CI log. The host is now WSL2 running
+`Fedora Linux 44 (aarch64)` with `gcc.aarch64` installed, plus a live single-node
+k3s v1.36.4, a working Docker daemon (behind `sudo`) and a 3.11 virtualenv at
+`~/SREK3S/.venv311`. That means:
+
+| Failing step | Can it be reproduced locally now? |
+|---|---|
+| `go test -race` (the Concurrency row) | **Yes.** cgo and ThreadSanitizer are available on `linux/aarch64`; this gate was unrunnable locally for two milestones and is now the cheapest triage to attempt, precisely because the failure *is* the synchronisation model |
+| `black` / `flake8` / `mypy` | **Yes**, via `~/SREK3S/.venv311/bin/python -m …`. The system `python3` here is 3.14.3 and is **not** a valid interpreter for these gates — a failure under it is a host artefact until disproved |
+| Container build / runtime smoke | **Yes**, with `sudo docker` and `--platform linux/arm64` |
+| Harness steps: cluster bootstrap, kubeconfig, apiserver readiness, image registration | **Partly** — a live k3s exists, and every `kubectl` needs `sudo` because the kubeconfig is `0600` root-owned. But the local cluster is k3s **1.36.4** where CI is **1.29.9**, and `deploy/namespace.yaml` sets `enforce-version: latest`, so admission is judged by different rules in the two places |
+
+**The authority split, unchanged in substance.** GitHub Actions `ubuntu-latest`
+remains the platform authority for every published figure, and a local pass is
+additional evidence rather than a replacement. What changed is the *order of
+work*: reproducing locally first is now the cheaper and more informative move for
+most failures, because a local run yields the actual assertion message where a CI
+log often yields only a step conclusion — and §12 of `docs/lessons-learned.md`
+records exactly how much that difference was worth during Milestone 4.
+
+**One caution specific to this host, because it will produce a confident wrong
+answer.** The local platform is `arm64` and CI is `amd64`. A failure that only
+reproduces on one of them is a platform signal, not a flake, and the first
+question to ask is which architecture produced the evidence you are reading.
+Likewise, the k3s version skew above will surface as a manifest being admitted in
+one place and refused in the other, which looks like a hardening defect and is
+not.

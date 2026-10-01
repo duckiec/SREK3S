@@ -1,0 +1,51 @@
+# Build context exclusions for the agent image ONLY.
+#
+# Honoured by BuildKit, which looks for a file named `<dockerfile-path>.dockerignore`
+# and uses it INSTEAD of the root `.dockerignore`. The classic builder falls back to
+# the root file, which is why the root file is a floor and never excludes a path any
+# Dockerfile COPYs.
+#
+# What this context must contain, and why:
+#
+#   agent/requirements.txt   agent/Dockerfile line 22, via
+#                            `ARG PYTHON_DEPS=agent/requirements.txt`. Copied before
+#                            the application source so that editing application code
+#                            does not invalidate the dependency layer.
+#   agent/                  agent/Dockerfile line 40, `COPY --chown=10001:10001`.
+#
+# Everything else is dead weight in the upload, and this is where that is expressed.
+# The root `.dockerignore` deliberately cannot exclude `internal/` or `cmd/`, because
+# cmd/sentinel/Dockerfile COPYs both — which is exactly why this per-image file is
+# required rather than decorative. It is what lets the agent build stay lean while
+# the Sentinel build stays correct.
+#
+# Consequence worth stating: the root `.dockerignore` is still consulted for a
+# classic-builder agent build, and it no longer excludes these paths either, so both
+# builders now produce the same image content for a given set of source changes.
+
+# The Go Sentinel is a separate image with a separate build. Nothing in the Python
+# agent reaches into it, and its test files import Go packages only via the Go test
+# harness.
+cmd/
+internal/
+
+# Not needed at runtime by either the app or its test suite. The agent's own tests
+# live in agent/tests/ and are inside the copied `agent/` tree, so excluding the
+# repository-root `tests/` does not remove them.
+tests/
+deploy/
+docs/
+scripts/
+.opencode/
+
+# Documentation and governance files.
+*.md
+
+# Belt and braces on the virtualenv: the root file already excludes `.venv*/`, and
+# this repeats it so the agent context stays lean even if a future edit to the root
+# file relaxes that pattern for an unrelated image.
+.venv*/
+**/.venv*/
+
+# Local scratch that a developer may have left in the worktree.
+tmpdump/

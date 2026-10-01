@@ -1,0 +1,200 @@
+# Real application crash — the end-to-end log-evidence fixture.
+#
+# DIFFERENT IN KIND FROM ITS SIBLINGS. `oom-leak.yaml` and `crashloop.yaml` both
+# prove the Sentinel reads pod STATUS correctly. Neither proves anything about
+# LOGS: an OOMKill and a CrashLoopBackOff both report through
+# `status.containerStatuses`, which the informer already holds.
+#
+# This fixture forces the other path. A real Python application starts, prints a
+# realistic traceback and a credential to stdout, and dies — so the RCA has to be
+# built from text the Sentinel read out of `pods/log` rather than from a status
+# field it already had. That is the path that can leak, and a detection test that
+# never reads logs cannot demonstrate the §1 scrubber catching anything.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: real-crash
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: real-crash
+    app.kubernetes.io/part-of: srek3s
+spec:
+  # ONE replica, and `restartPolicy: Always` below. Both are load-bearing.
+  #
+  # The first revision of this fixture was a bare Pod with `restartPolicy: Never`,
+  # on the reasoning that one crash gives one incident and so tests analysis
+  # rather than dedup. That reasoning was wrong and the cluster proved it: the
+  # Sentinel was watching the namespace, the pod went `Failed` with `exit_code=1`,
+  # and NOTHING was emitted —
+  #
+  #     {"msg":"stats","watcher_emitted":0,"dedup_admitted":0,"processed":0}
+  #
+  # No permission error, no informer error, no error at all. `internal/k8s/
+  # watcher.go:236` DROPS a `Terminated` with a non-zero exit that is not
+  # OOMKilled, deliberately (see the comment there: Contract A's `reason` admits
+  # only OOMKilled and CrashLoopBackOff, and reporting a state the emitter cannot
+  # serialise would poison the dedup key that CrashLoopBackOff needs).
+  #
+  # So `restartPolicy: Never` made the fixture UNDETECTABLE BY CONSTRUCTION. The
+  # kubelet never restarts the container, so it never enters CrashLoopBackOff, and
+  # the one state the Sentinel reports for an application error is unreachable.
+  #
+  # `Always` is REQUIRED for that reason, and it is what lets the kubelet publish
+  # `Waiting{CrashLoopBackOff}` — the state that actually carries the evidence.
+  # Same shape as the sibling crashloop.yaml.
+  #
+  # The cost, stated rather than glossed: the container restarts repeatedly, so the
+  # Sentinel may emit more than one incident. That is correct behaviour under test
+  # and dedup is what should absorb it — so the assertion watches `processed` RISE,
+  # not that it rises by exactly one.
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: real-crash
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: real-crash
+        app.kubernetes.io/part-of: srek3s
+    spec:
+      restartPolicy: Always
+      automountServiceAccountToken: false
+
+      # Pod Security Admission `restricted`, enforced in sentinel-chaos. A fixture
+      # rejected at admission is worse than no fixture: it fails closed and reads
+      # as "the cluster is quiet".
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: payment-gateway
+          # FULLY QUALIFIED, and that is not stylistic.
+          #
+          # `imagePullPolicy: Never` resolves against containerd's local store and
+          # will NOT pull. `ctr images import` stores the ref exactly as named —
+          # `docker.io/library/python:3.11-alpine` — and the bare spelling
+          # `python:3.11-alpine` is a DIFFERENT ref that does not exist locally, so
+          # the pod fails with `Failed to pull image ... not found` rather than an
+          # ImagePullBackOff that points at a registry. The sibling fixtures
+          # register both spellings for this reason; this one uses only the
+          # qualified name so there is no second spelling to keep in sync.
+          image: docker.io/library/python:3.11-alpine
+          imagePullPolicy: Never
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              # A limit ABOVE the request, and deliberately NOT the mechanism of the
+              # failure. The sibling oom-leak.yaml OOMs; this one must crash for a
+              # reason the kubelet had no part in, so "OOMKilled" and "application
+              # error" stay distinguishable in the triage output.
+              memory: "256Mi"
+              cpu: "500m"
+              ephemeral-storage: "64Mi"
+
+          # The application: a real script producing a real Python traceback, not a
+          # `sleep` loop. The frame names and the exception type in the log are
+          # precisely what a model has to reason over.
+          #
+          # NO APOSTROPHES ANYWHERE INSIDE THE `python -c '...'` BLOCK. This is
+          # load-bearing, not style. The whole script is wrapped in shell single
+          # quotes, so the first `'` terminates the string and the remainder is
+          # parsed as shell. A prose comment containing an apostrophe — "the
+          # kubelet's backoff" — did exactly that, and the pod failed with
+          #
+          #     IndentationError: expected an indented block after function definition
+          #     /bin/sh: syntax error: unexpected word (expecting ")")
+          #
+          # which is an IndentationError in the FIXTURE rather than the KeyError it
+          # exists to produce. Every structural check still passed — the container
+          # ran, exited non-zero, and emitted a Python traceback — while the RCA had
+          # nothing to do with the fault under test. That is the third fixture
+          # defect found by deploying rather than by reading, and the generalisation
+          # is that an inline script is not reviewed as code until something executes
+          # it.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # `set -e` IS REQUIRED, and its absence was a real fixture bug found by
+              # running the script rather than reading it. Without it the shell keeps
+              # going after `python` exits 1, so the trailing `echo` succeeds and the
+              # script exits 0 — a container that raised a KeyError, wrote a full
+              # traceback, and then reported success. Every structural assertion
+              # would have passed on the traceback alone.
+              set -e
+
+              echo "payment-gateway v3.1.0 starting (pid $$)"
+              echo "INFO  loading config from /etc/payments/config.yaml"
+              echo "INFO  connecting to ledger database"
+              # The planted credential. This exact value is asserted absent from the
+              # RCA. It is AWS's own documentation example key, not a live secret,
+              # and it matches the scrubber's `aws_access_key_id` rule exactly so
+              # the rule is exercised rather than approximated.
+              echo "DEBUG env: AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE"
+              echo "DEBUG dsn: postgres://checkout:hunter2@ledger.internal:5432/prod"
+              echo "INFO  listening on :8080"
+
+              # The failure. A KeyError from a dict lookup is the commonest shape of
+              # production Python crash and produces a multi-frame traceback naming
+              # the failing line — which is what lets the RCA say more than "it
+              # crashed".
+              #
+              # exit 1, distinct from the kubelet's 137 (OOMKill) and from 0, so a
+              # triage that reports OOMKilled for this pod is demonstrably wrong
+              # rather than merely different.
+              #
+              # `time.sleep` on the first run only: the kubelet's backoff means the
+              # container is restarted with growing delays, and a fixed sleep would
+              # keep every restart cheap enough to loop tightly.
+              python -c '
+              import time
+
+              def charge(customer_id):
+                  # A sleep on every attempt, not just the first.
+                  #
+                  # An earlier revision slept only on the first attempt, tracked by
+                  # writing a marker file to /tmp. That was a fixture bug with a
+                  # misleading symptom: this pod sets readOnlyRootFilesystem, so the
+                  # write raised
+                  #
+                  #     OSError: [Errno 30] Read-only file system: /tmp/.ran
+                  #
+                  # and the container crashed for a reason unrelated to the
+                  # application fault under test. The traceback was real and the exit
+                  # code was real, so every structural assertion still passed while
+                  # the RCA described the wrong failure entirely.
+                  #
+                  # A sleep per attempt costs nothing: the backoff grows on its own,
+                  # so the restart rate is bounded by the kubelet rather than here.
+                  time.sleep(3)
+
+                  totals = {"cust_0001": 4200}
+                  return totals[customer_id]
+
+              charge("cust_8817")
+              '
+              # `set -e` above means this line is unreachable, and that is the point:
+              # it documents what the script is asserting, and if the KeyError ever
+              # stopped happening the container would exit 0 and the fixture would
+              # silently stop demonstrating anything.
+              echo "unreachable: the call above always raises KeyError"

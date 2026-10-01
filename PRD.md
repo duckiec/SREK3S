@@ -129,6 +129,24 @@ Every non-goal below is an explicit architectural commitment, not a deferral.
   `deployments` only. No `ServiceAccount` in `deploy/` carries a mutating verb.
 - **No "autofix" toggle.** There is no flag, env var, or config key that enables direct
   apply. This is not configurable by design.
+- **No model client, and no egress to one.** The analysis engine ships a *validation
+  boundary*, not a model integration. `agent/llm.py` declares `CompletionClient` as a
+  `typing.Protocol` with no implementation, deliberately, and imports no network
+  library. All classification, RCA and diff generation is deterministic: regex,
+  arithmetic, YAML structural parsing, and real `git`. `fastembed`/`onnxruntime` are
+  named in a **comment** in `agent/requirements.txt` and are installed nowhere; the
+  CPU-only constraint in §7 A3 is a ceiling this MVP stays under, not a description of
+  a path that runs. Adding a model call is a change to the trust boundary in
+  `ARCHITECTURE.md` §1 and must be reviewed as one.
+- **No reachable post-remediation loop in the shipped service.** F4 specifies the
+  behaviour and `agent/verify.py` implements it, but no production module imports
+  `verify`; `main.py` and `triage.py` do not. `triage.py` emits `verification_policy`
+  on the wire and nothing in the running service consumes it. F4 is therefore a
+  **specified and tested component that is not on the HTTP request path** — tracked
+  as a known-unwired boundary in `ARCHITECTURE.md` §5.5 and as an open task in
+  `ROADMAP.md`. It is listed here rather than in §5 because it is a wiring gap in
+  work already claimed as delivered, and that is a different kind of debt from a
+  feature deliberately deferred.
 - **No multi-tenancy UI.** See §5.
 - **No multi-cloud IAM federation.** See §5.
 
@@ -179,6 +197,23 @@ not by the model's stated confidence. Tier-2 emits `git_patch: ""` by contract �
 speculative diff for a cascading failure is itself a blast-radius risk, because such a patch
 is most likely to be applied under pressure.
 
+**What an in-cluster deployment demonstrates, and what it cannot.** The shipped agent
+manifest mounts `SREK3S_MANIFEST_ROOT=/manifests` on an **`emptyDir`**, and the default
+target `deploy/payments/checkout-api.yaml` **does not exist in this repository**. So as
+deployed the agent cannot read a target manifest, `FileManifestProvider.read_manifest`
+returns `None`, `_build_remediation_diff` bails at its second step, and **every incident
+escalates to `TIER_2_ARCHITECTURAL` with `git_patch == ""` and `patch_validated ==
+false`.** That is invariant I-B2 failing closed — the design working — but it is visually
+indistinguishable from a broken agent, which is why the empty state is stated in
+`deploy/agent.yaml`, `README.md` and `docs/runbook.md` in the same words.
+
+The consequence for acceptance is concrete: **an in-cluster run of `deploy/` demonstrates
+the Tier-2 war-room path and the no-mutation guarantee. It cannot demonstrate a Tier-1
+patch.** Reaching AC-3 in-cluster requires replacing the `emptyDir` with a real GitOps
+checkout (a PVC, or an init container that clones the repository) and setting
+`SREK3S_TARGET_MANIFEST` to a repo-relative path inside it. Any claim that the in-cluster
+deployment produced a validated patch is a claim about a wiring step, not about a test.
+
 ### F4 — Post-Remediation Health Verification Loop
 
 A proposed patch is not a resolution. After a Tier-1 diff is merged and applied by GitOps,
@@ -194,6 +229,19 @@ the Sentinel re-observes the target workload for a bounded window and classifies
 
 The loop closes on the observation boundary only. The Sentinel does not apply anything to make
 the outcome favourable.
+
+**Wiring status: specified and tested, not reachable.** `agent/verify.py` implements this
+loop (741 lines) and is exercised by `agent/tests/test_verify.py` and
+`agent/tests/test_verification_e2e.py`, including a live-k3s leg recorded in `ROADMAP.md`
+box `4.3.4`. But **no production module imports it**: `main.py` and `triage.py` do not,
+and `triage.py` merely *emits* `verification_policy` on the wire. Nothing in the running
+HTTP service consumes that field, so F4 is **not on the request path**. G5 (the
+no-autofix guarantee) cites `verify.py` as evidence for the *agent's* inability to write,
+which remains true and is unaffected — a component that is not wired in cannot acquire
+authority — but F4's own closing-the-loop claim is not satisfied by the shipped service.
+Recorded as a known-unwired boundary in `ARCHITECTURE.md` §5.5 and as an open task in
+`ROADMAP.md`; §3.2 lists it as a non-goal of the *shipped* service so that no reader
+infers a running loop from the presence of a `verification_policy` field.
 
 ---
 
@@ -238,14 +286,96 @@ multi-cluster fleet management, and natural-language chat interfaces.
 
 - **A1** Cluster target is single-node k3s; image import targets the internal containerd
   namespace (`k3s ctr images import`).
+  - **Environment of record (measured 2026-10-01).** The development host is **WSL2 on
+    an ARM64 Windows host, `Fedora Linux 44 (aarch64)`**, kernel
+    `6.18.40.1-microsoft-standard-WSL2`, systemd as PID 1. Local k3s is
+    **v1.36.4+k3s1**, node `dwindle2` (`control-plane`, Ready, containerd
+    `2.3.4-k3s1.36`, internal IP `172.30.181.188`; 10 CPU, ~7.5Gi memory, 110 pods
+    allocatable). Docker is **29.8.2**, storage driver `overlayfs`, root
+    `/var/lib/docker`, unit `docker` active.
+  - **Images must target `linux/arm64`.** The host is `aarch64`; CI builds `amd64`. A
+    locally built SREK3S image and a CI-built one are not the same artifact, and the
+    architecture has to be stated rather than inferred. `busybox:1.36.1`, which the
+    `deploy/chaos/` fixtures pin, publishes an `arm64` manifest, so the chaos
+    fixtures are usable on this host without a multi-arch build;
+    **no `registry.internal/srek3s-*` image exists anywhere yet**,
+    and both must be built locally and registered into the `k8s.io` containerd
+    namespace under their exact fully-qualified names
+    (`registry.internal/srek3s-agent:0.1.0`, `registry.internal/srek3s-sentinel:0.1.0`)
+    or the pods report `ImagePullBackOff`. The `deploy/chaos/` fixtures use
+    `imagePullPolicy: Never`, which turns a missing image into a hard apply failure
+    rather than a silent pull.
+  - **`sudo` is required for every `kubectl` and every `docker` call**, for two unrelated
+    reasons: the kubeconfig `/etc/rancher/k3s/k3s.yaml` is mode `0600` and root-owned,
+    and user `duckie` is in `wheel` but not in the `docker` group while
+    `/var/run/docker.sock` is `srw-rw---- root:docker`. Neither is a defect in this
+    repository; both are prerequisites for anyone reproducing a run here.
+  - **k3s version skew against CI.** CI runs **v1.29.9+k3s1**; this host runs
+    **v1.36.4+k3s1**. `deploy/namespace.yaml` sets
+    `pod-security.kubernetes.io/enforce-version: latest`, so Pod Security Admission is
+    evaluated against **1.36** here and against whatever `latest` resolves to on the CI
+    node. The same manifests can therefore be admitted in one place and refused in the
+    other for a reason unrelated to the code, and that must be diagnosed as a skew
+    before being diagnosed as a defect.
+  - **No NetworkPolicy controller pod is observable in `kube-system`.** k3s runs its
+    kube-router netpol controller embedded in the `k3s server` process rather than as a
+    separate pod, so the absence of a `kube-router` pod is **not** evidence that
+    NetworkPolicy is unenforced. Both policies in `deploy/`
+    (`srek3s-sentinel`, `srek3s-agent-egress`) are *expected* to be enforced on k3s.
+    That expectation is **unverified on this host** and is recorded as such rather than
+    as a guarantee.
+  - **Cluster state as of 2026-10-01:** namespaces are `default`, `kube-node-lease`,
+    `kube-public`, `kube-system`; **none carries Pod Security Admission labels**, and
+    `srek3s-system` **does not exist yet**. Nothing from `deploy/` is applied. The
+    `k8s.io` containerd namespace holds only k3s's own images (coredns, traefik,
+    metrics-server, local-path-provisioner, klipper-helm, klipper-lb, pause).
 - **A2** Sentinel runs as Go 1.23+ using official `k8s.io/client-go`, `k8s.io/api`,
   `k8s.io/apimachinery`. Standard library first; no unvetted third-party runtime frameworks.
+  - **Local toolchain:** native `golang.aarch64` reporting `go version go1.26.8-X:nodwarf5 linux/arm64`,
+    which satisfies `go.mod`'s `go 1.23`. A Windows Go exists at
+    `/mnt/c/Program Files/Go/bin/go.exe`; the Linux path precedes `/mnt/c` in `PATH`, so
+    the native toolchain wins. This is the **first `linux/aarch64` host** for this
+    project, which is why the `-race` note in `AGENTS.MD` §4 is amended.
+    **Assert on `go version` containing `linux/arm64`, not on the resolved path:** this host
+    resolves `go` to `/usr/sbin/go`, and `/usr/sbin`, `/usr/bin`, `/sbin` and `/bin` are all
+    the same inode here (`/usr/sbin -> bin`), so a check hardcoding `/usr/bin/go` fails
+    spuriously on a correctly installed toolchain.
 - **A3** Analysis engine is Python 3.11-slim, Pydantic v2 + FastAPI, CPU-only inference
   (`fastembed` / `onnxruntime`). **No PyTorch, no CUDA, no GPU-dependent dependency.**
+  - **Correction, stated because the sentence above overstates what runs.** `fastembed`
+    and `onnxruntime` are named only in a **comment** in `agent/requirements.txt` and are
+    **installed nowhere**; the dependency ban is a real, CI-asserted ceiling, and the
+    "CPU-only inference" it guards is the *permitted* future shape, not a live path. See
+    §3.2's "No model client".
+  - **Interpreter of record:** CPython **3.11.16**. The system default `python3` on the
+    `Fedora 44` host is **3.14.3** and is **not acceptable** for any gate: AGENTS §2
+    forbids 3.12+ syntax, `agent/pyproject.toml` pins `target-version = ["py311"]`, and
+    root `setup.cfg` sets `python_version = 3.11`. The supported environment is the
+    virtualenv at `~/SREK3S/.venv311`; every Python gate runs as
+    `~/SREK3S/.venv311/bin/python -m <tool>`.
 - **A4** Every container runs as non-root `UID 10001` / `GID 10001`, with
   `readOnlyRootFilesystem: true` and `cap_drop: ["ALL"]`.
 - **A5** Every blocking operation is bounded by a `context.Context` with an explicit timeout;
   no unbounded goroutines and no unbuffered job channels.
+- **A6** **The Sentinel's watch scope and its grant must agree.** `deploy/sentinel.yaml`
+  sets `WATCH_NAMESPACE: ""`, which selects a cluster-wide informer and issues
+  `LIST /api/v1/pods` against every namespace, while `deploy/rbac.yaml` grants only a
+  namespaced `Role` in `srek3s-system` — no `ClusterRole`, no `ClusterRoleBinding`. As
+  committed these two are **inconsistent**, and the resulting failure is a cluster-wide
+  `LIST` that is unauthorised. The visible symptom is silence: the informer retries the
+  forbidden `LIST` and nothing is reported, which is indistinguishable from a healthy
+  cluster watching nothing. Any in-cluster run must therefore set `WATCH_NAMESPACE` to a
+  specific namespace **and** apply a matching `Role` + `RoleBinding` into that namespace,
+  referring to the `srek3s-system` ServiceAccount; the procedure is in `docs/runbook.md`
+  §1. Found by static analysis of the two manifests on 2026-10-01 and **not yet
+  reproduced at runtime** — see `docs/lessons-learned.md` and the open task in
+  `ROADMAP.md`. A6 is a constraint on any future configuration, not a description of a
+  working default.
+- **A7** **A Tier-1 remediation requires a readable GitOps checkout.** The agent may only
+  emit a patch for a manifest it can read and validate; `SREK3S_MANIFEST_ROOT` must point
+  at a real checkout and `SREK3S_TARGET_MANIFEST` at a path inside it. Absent either, the
+  system fails closed to Tier-2 (see F3). This is a deployment precondition, not a
+  fallback.
 
 ---
 
@@ -294,6 +424,12 @@ command exits `0`.
   binary hunks, and `classification` consistent with the tier (Tier-2 must emit an empty patch).
 - A patch that does not apply is worse than no patch — it manufactures false confidence during
   an incident. It is a hard fail.
+- **Reachability caveat.** AC-3 is satisfied by the offline fixture and golden-file path
+  (`tests/fixtures/expected/`, recorded in `ROADMAP.md` box `4.4.1`). It is **not**
+  satisfiable by the in-cluster deployment as committed, because `SREK3S_MANIFEST_ROOT`
+  is an `emptyDir` and the default target `deploy/payments/checkout-api.yaml` does not exist
+  in this repository (F3, A7). A run of `deploy/` that produced only Tier-2 responses has
+  **not** failed AC-3 — it has failed to test it.
 
 ### AC-4 — Clean non-root container execution
 
@@ -305,6 +441,14 @@ command exits `0`.
   `capabilities.drop: ["ALL"]`, and `seccompProfile.type: RuntimeDefault`.
 - Runtime check: `kubectl exec` reports `id -u` = `10001`; no write occurs to `/`.
 - Additionally: the in-cluster `ServiceAccount` is asserted to hold **no** mutating verb.
+- **Read grants are an acceptance concern too, not only write absence.** Asserting that no
+  mutating verb is held passes trivially when the grant is too narrow to watch anything.
+  The paired checks are therefore both required: `TestSentinelRoleGrantsWhatTheWatcherReads`
+  (converse: an allow-list for writes would pass the deny-check while granting nothing) and
+  a live `kubectl auth can-i list pods` against the namespace the Sentinel is actually
+  scoped to. See A6: a Sentinel authorised for `srek3s-system` and configured with
+  `WATCH_NAMESPACE: ""` satisfies every verb check in this repository and still reports
+  nothing.
 
 ---
 
@@ -330,6 +474,9 @@ command exits `0`.
 | R3 | Incomplete observability (no events, empty logs) leads to speculative RCA | Schema requires explicit presence; missing evidence downgrades confidence and forces Tier-2 |
 | R4 | Remediating toil while hiding an architectural fault | Post-remediation verification loop; recurrence promotes the incident to Tier-2 |
 | R5 | Unbounded goroutine / channel growth under event storm | Fixed worker pool, buffered job channel, context-bounded sends (AGENTS §3.2) |
+| R6 | Watch scope and RBAC grant disagree, so the Sentinel is silently blind (A6) | `WATCH_NAMESPACE` must name a namespace the `Role` covers, and a `Role` + `RoleBinding` must exist there; `docs/runbook.md` §1 gives the procedure and the `kubectl auth can-i` confirmation. **Not yet fixed in the committed manifests** — the pair is inconsistent today, found by static analysis and not yet reproduced at runtime. |
+| R7 | An unwired component is mistaken for a working one — `verify.py` is fully implemented and heavily tested but unreachable from the service, and `agent/llm.py` reads as a model client while being a validation boundary | Named explicitly in `ARCHITECTURE.md` §5.5, `AGENTS.MD` §2, `PRD.md` §3.2 and `README.md`, and carried as open tasks in `ROADMAP.md`. Coverage of a module is not evidence that the module runs; a scaffold that imports nothing and is imported by nothing will pass every gate that only runs its tests. |
+| R8 | Environment-specific claims get copied between hosts — `arm64` images and `amd64` fixtures, k3s 1.36 locally against 1.29 in CI, a `sudo`-scoped kubeconfig, a `docker` group membership that does not exist | Environment of record pinned in §7 A1-A3 and `AGENTS.MD` §2; each divergence is named where it bites (`README.md`, `docs/runbook.md`, `docs/offline-install.md`) rather than left for the next reader to rediscover. |
 
 ---
 
@@ -341,5 +488,7 @@ command exits `0`.
 | F3 graduated autonomy, AC-3 | §4 Incident & RCA Contracts | M2 |
 | G1 detection, AC-1 | §3 Data Flow | M3 |
 | F2 sandbox, AC-4 | §7 Container Hardening | M2, M4 |
-| F4 verification loop | §4 RCA Contract (`verification_policy`) | M4 |
+| F4 verification loop — **specified, not reachable** (§3.2) | §4 RCA Contract (`verification_policy`); §5.5 Known MVP Boundaries | M4; wiring open in the environment section |
 | §5 Out of scope (no writes) | §2 Component Boundary | M3, M4 |
+| A6 scope/grant agreement — **inconsistent as committed** | §2 Component Boundary and Least Privilege | Open in the environment section |
+| A1-A3 environment of record | §9 Technology Constraints (Binding) | Open in the environment section |

@@ -15,6 +15,21 @@ pydantic>=2.6.0
 pyyaml>=6.0.1
 httpx>=0.27.0
 
+# Model client for the Tier-2 RCA narrative (agent/llm.py).
+#
+# An inference CLIENT, not a runtime: it ships no model weights and pulls no
+# torch, no CUDA and no GPU runtime, so the ARCH §2 prohibition is unaffected.
+# The deterministic Tier-1 path never calls it — ARCH §5.3 keeps tier selection
+# ahead of any model consultation — and it is imported LAZILY inside
+# GeminiCompletionClient.complete(), so a host without it, or without a
+# GEMINI_API_KEY, still imports agent/llm.py, still triages, and still answers
+# /healthz. A missing model degrades the narrative, never the service.
+#
+# `google-genai` is the GA client and the one whose own package metadata does not
+# say `Development Status :: 7 - Inactive`, which the older `google-generativeai`
+# spelling does. See the SDK-choice note in agent/llm.py.
+google-genai>=2.0.0
+
 # --- quality gates (AGENTS.md §4: G4, G5, G6) ---------------------------
 # These are gates, not optional extras. They are pinned here so the local
 # environment and CI install the same tools.

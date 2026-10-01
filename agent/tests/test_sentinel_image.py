@@ -82,11 +82,47 @@ def _instructions(text: str) -> str:
     return re.sub(r"\\\s*\n\s*", " ", without_comments)
 
 
+#: A ``FROM`` line with the optional ``--platform=`` flag consumed.
+#:
+#: The flag is matched and DISCARDED rather than captured, and that is the entire
+#: fix. A previous revision used ``(\S+)`` for the image, so a line written as
+#:
+#:     FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+#:
+#: parsed the image as the literal string ``--platform=$BUILDPLATFORM`` and the
+#: stage name as ``golang:1.23-bookworm``. Every downstream assertion then failed
+#: for the wrong reason: "no stage is named 'build'", and "the runtime stage is
+#: '--platform=$TARGETPLATFORM'; expected a distroless static image".
+#:
+#: Worth naming because the tests were not wrong about the Dockerfile — the
+#: Dockerfile had changed shape under a parser that assumed the older shape, and
+#: the failure text pointed at the image rather than at the parser.
+_FROM_RE = re.compile(
+    r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?",
+    re.M | re.I,
+)
+
+
 def _stages(text: str) -> list[tuple[str, str]]:
-    """``[(base_image, stage_name)]`` for every ``FROM`` in the file."""
-    return re.findall(
-        r"^\s*FROM\s+(\S+)(?:\s+AS\s+(\S+))?", _instructions(text), re.M | re.I
-    )
+    """``[(base_image, stage_name)]`` for every ``FROM`` in the file.
+
+    Tolerant of ``--platform=``, which is mandatory for a multi-arch build and so
+    is now on every FROM line in this repository.
+    """
+    return _FROM_RE.findall(_instructions(text))
+
+
+def _platform_flags(text: str) -> list[str]:
+    """Every ``--platform=`` value in the file, in order.
+
+    Exposed so the multi-arch assertions can state which stage builds for which
+    platform rather than inferring it: the Go stage MUST use ``$BUILDPLATFORM``
+    (so the compiler is the host's) and the runtime stage MUST use
+    ``$TARGETPLATFORM`` (so the shipped layers match the tag). Those are opposite
+    values on purpose, and getting them the wrong way round produces an image
+    that builds cleanly and is wrong.
+    """
+    return re.findall(r"--platform=(\S+)", _instructions(text))
 
 
 def _directives(text: str, keyword: str) -> list[str]:
@@ -182,6 +218,82 @@ def test_the_image_declares_uid_10001_and_a_strict_entrypoint(
     )
 
 
+def test_the_build_stage_compiles_for_the_host_and_the_runtime_defaults_to_target(
+    dockerfile: str,
+) -> None:
+    """Exactly ONE explicit ``--platform``, and it is on the build stage.
+
+    The two stages make OPPOSITE decisions about the same word, and both are
+    load-bearing:
+
+    * build stage **must** say ``--platform=$BUILDPLATFORM``. The Go toolchain runs
+      on the host's own CPU and emits a foreign binary with the toolchain's own
+      cross-compiler — no emulation, no binfmt handler, and fast.
+    * runtime stage **must not** say anything. The final stage already defaults to
+      ``$TARGETPLATFORM``, so writing it produces BuildKit's
+      ``RedundantTargetPlatform`` warning on every build. An earlier revision wrote
+      it for explicitness and it was removed, because a warning printed on every
+      build trains people to ignore warnings — and this Dockerfile's warnings are
+      the ones worth reading.
+
+    Getting either wrong produces an image that builds and is wrong, which is why
+    this is asserted rather than left to review. The build stage on
+    ``$TARGETPLATFORM`` without binfmt fails visibly and immediately; the runtime
+    stage on ``$BUILDPLATFORM`` succeeds silently and ships host-architecture
+    layers under a target tag.
+    """
+    flags = _platform_flags(dockerfile)
+    assert len(flags) == 1, (
+        f"expected exactly one --platform, found {len(flags)}: {flags}. Only the "
+        "build stage needs it; the runtime stage's default is already correct and "
+        "naming it is a BuildKit warning on every build."
+    )
+    assert flags[0] == "$BUILDPLATFORM", (
+        f"the --platform is on the wrong stage, or set to {flags[0]}. It must be "
+        "$BUILDPLATFORM on the build stage so the compiler is the host's own."
+    )
+
+
+def test_the_target_arguments_are_declared_before_use(
+    dockerfile: str,
+) -> None:
+    """``ARG TARGETOS``/``ARG TARGETARCH`` must precede the ``go build``.
+
+    An undeclared ``ARG`` expands to the empty string, and an empty ``GOARCH``
+    makes ``go build`` use the host's. That is the failure mode this whole
+    refactor exists to remove, so it is asserted: the declarations must be
+    present, and they must come before the RUN that consumes them.
+    """
+    instructions = _instructions(dockerfile)
+
+    # BOTH declarations must precede the build, and each must be REFERENCED by it.
+    #
+    # An earlier version of this test compared only `ARG TARGETARCH` against
+    # `GOARCH=${TARGETARCH}`, which was too narrow in a way its own negative
+    # control found: swapping the two ARG lines still satisfied it, so the guard
+    # passed with a defect planted. The property worth asserting is that every
+    # ARG the build reads is already in scope AND is actually read — a declaration
+    # that is never referenced is dead weight that reads as though the cross-build
+    # were wired up.
+    used_at = instructions.upper().find("GO BUILD")
+    assert used_at != -1, "no `go build` found; the assertions below are vacuous"
+
+    for name in ("TARGETOS", "TARGETARCH"):
+        match = re.search(rf"^\s*ARG\s+{name}\s*$", instructions, re.M)
+        assert match, (
+            f"ARG {name} is not declared. BuildKit sets it automatically for a "
+            "--platform build, but a Dockerfile must declare it to reference it; "
+            "an undeclared one expands to the empty string."
+        )
+        declared_at = match.start()
+        assert (
+            declared_at < used_at
+        ), f"ARG {name} is declared AFTER the `go build` that consumes it"
+        assert (
+            f"${{{name}" in instructions[declared_at:used_at]
+        ), f"ARG {name} is declared before the build but never referenced there"
+
+
 def test_the_binary_is_copied_to_the_path_the_manifest_probes(
     dockerfile: str,
 ) -> None:
@@ -219,7 +331,26 @@ def test_the_build_disables_cgo_and_strips_local_paths(
     """
     runs = "\n".join(_directives(dockerfile, "RUN"))
     assert "CGO_ENABLED=0" in runs, "the build does not set CGO_ENABLED=0"
-    assert "GOOS=linux" in runs, "the build does not pin GOOS; the image is linux"
+    # The assertion moved from a literal `GOOS=linux` to the BuildKit spelling.
+    # `GOOS=linux` was correct and is now WRONG: a `--platform=linux/arm64` build
+    # inherits GOOS from the target anyway, but hard-coding it would ignore a
+    # legitimate windows/amd64 target, and — more importantly — the pairing of
+    # GOOS with GOARCH is what the cross-compile depends on, so asserting on GOOS
+    # alone missed the half that actually varies per architecture.
+    assert "GOOS=" in runs, (
+        "the build does not pin GOOS; the image is linux by default and the "
+        "variable keeps a cross-build honest"
+    )
+    assert "${TARGETOS:-linux}" in runs or "GOOS=linux" in runs, (
+        "GOOS must come from TARGETOS with a linux fallback. The fallback is what "
+        "lets the CLASSIC builder (which sets no TARGETOS) still work; without it "
+        "that build expands to GOOS= and fails on the host OS."
+    )
+    assert "GOARCH=${TARGETARCH}" in runs, (
+        "the build does not set GOARCH from TARGETARCH. Without it `go build` "
+        "falls back to the host, producing an image labelled for one architecture "
+        "and containing another — which fails at pod start, not before."
+    )
     assert "-trimpath" in runs, "the build does not pass -trimpath"
     assert "-ldflags" in runs and "main.version" in runs, (
         "the build does not stamp the version; `sentinel -version` would always "

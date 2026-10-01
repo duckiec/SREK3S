@@ -1,0 +1,101 @@
+# Scoped read-only RBAC for the Sentinel inside `sentinel-chaos`.
+#
+# This is the grant-side half of the fix for the watch-scope mismatch. The
+# scope-side half is ./patch-sentinel-scope.yaml. Neither half works alone:
+#
+#   scope without grant -> the Sentinel is unauthorised here and the informer
+#                          retries a forbidden LIST forever (silence)
+#   grant without scope -> the Sentinel holds a grant it never uses, and the
+#                          cluster-wide watch in deploy/sentinel.yaml is still
+#                          unauthorised, so nothing improves
+#
+# ---------------------------------------------------------------------------
+# SHAPE, AND WHY IT IS THIS SHAPE
+# ---------------------------------------------------------------------------
+# A `Role` in the TARGET namespace, bound to the ServiceAccount that lives in
+# `srek3s-system`. That keeps ONE ServiceAccount — one identity to audit, one
+# token, one thing to revoke — while the GRANT stays narrow. The alternative, a
+# ClusterRoleBinding, would give a watcher authority over every namespace on the
+# cluster, which is the opposite of the property this system is built around.
+#
+# `roleRef` is immutable in Kubernetes. That is a feature here: a privilege-
+# escalation attempt has to edit this file, and a file is reviewable. A live API
+# patch to the binding would be rejected outright.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+rules:
+  # ---------------------------------------------------------------------------
+  # Pods: the informer's list and watch, plus the log reads the worker performs
+  # per incident.
+  #
+  # `pods/log` is a SEPARATE SUBRESOURCE and must be listed explicitly. A rule on
+  # `pods` alone does not grant it, and the omission would not error — it would
+  # make every incident arrive with no logs. The RCA would then be generated from
+  # resource limits alone and look entirely plausible, which is the worst possible
+  # shape for a silent failure.
+  # ---------------------------------------------------------------------------
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    # ENUMERATED, not wildcarded. An allow-list cannot accidentally cover a future
+    # write verb; a deny-list of writes can.
+    verbs: ["get", "list", "watch"]
+
+  # Events: joined to the incident by involvedObject.uid (internal/k8s/telemetry.go).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  # Deployments and ReplicaSets: read-only, for attributing an incident to a
+  # workload rather than to a bare pod name. Present but read-only, and visible in
+  # review — if the Sentinel ever needs more, this file changes and the change is
+  # diffable.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  # ---------------------------------------------------------------------------
+  # DELIBERATELY ABSENT, and the absence is the guarantee:
+  #
+  #   * secrets          — the Sentinel never reads cluster Secrets. Note that the
+  #                        mounted ServiceAccount token lives in a Secret, and this
+  #                        rule does not grant reading it back; the kubelet projects
+  #                        it into the pod directly.
+  #   * configmaps       — no need.
+  #   * any wildcard     — `resources: ["*"]` or `verbs: ["*"]` would cover every
+  #                        current and future write verb, which is exactly the
+  #                        accident this enumeration exists to prevent.
+  #
+  # Asserted live before any detection test, in both directions. The negative
+  # control matters as much as the positive: without `can-i get secrets -> no`, a
+  # `no` on `can-i create pods` is equally consistent with a ServiceAccount holding
+  # NO permissions at all — a completely broken configuration that would satisfy
+  # every assertion while proving nothing.
+  # ---------------------------------------------------------------------------
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+subjects:
+  # Points back at srek3s-system. One ServiceAccount, one identity to audit; the
+  # grant stays per-namespace.
+  - kind: ServiceAccount
+    name: srek3s-sentinel
+    namespace: srek3s-system
+roleRef:
+  # MUST be Role. A ClusterRole here would be the single highest-severity change
+  # available to this codebase, and it would be one word.
+  kind: Role
+  name: srek3s-sentinel
+  apiGroup: rbac.authorization.k8s.io

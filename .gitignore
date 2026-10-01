@@ -29,6 +29,14 @@ coverage.xml
 htmlcov/
 .venv/
 venv/
+# The pinned-Python-3.11 interpreter environment. A separate entry rather than a
+# `.venv*` glob: the name is load-bearing, not incidental. `agent/pyproject.toml`
+# pins `target-version = ["py311"]` and `setup.cfg` sets `python_version = 3.11`,
+# so this environment is what makes the G4/G5/G6 gates run against the interpreter
+# the runtime image uses rather than against whatever `python3` resolves to. A glob
+# would also swallow a future `.venv311-broken/`, which is the kind of accident a
+# version-named directory invites.
+.venv311/
 
 # Editors / OS
 .DS_Store
@@ -75,7 +83,7 @@ opencode.json
 !.env.example
 !.env.sample
 !.env.template
-
+.env.local
 # Cluster credentials. The E2E workflow reads KUBECONFIG from the environment,
 # so a developer's kubeconfig landing at the repo root is an expected accident.
 kubeconfig

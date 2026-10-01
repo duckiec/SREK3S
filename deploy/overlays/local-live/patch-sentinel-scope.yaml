@@ -1,0 +1,61 @@
+# Patch: make the Sentinel's watch scope agree with its RBAC grant.
+#
+# Applied by ./kustomization.yaml to the `srek3s-sentinel` Deployment.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FIXES
+# ---------------------------------------------------------------------------
+# `deploy/sentinel.yaml` ships:
+#
+#     env:
+#       - name: WATCH_NAMESPACE
+#         value: ""          # empty = ALL namespaces
+#
+# while `deploy/rbac.yaml` grants a Role in `srek3s-system` only. An empty value
+# selects a cluster-wide informer, whose initial LIST is `GET /api/v1/pods` across
+# every namespace — a request the namespaced Role does not authorise. The informer
+# retries the forbidden LIST, and the visible symptom is **no incidents and no
+# error**: a watcher that looks healthy and is watching nothing.
+#
+# The failure is silent by construction, which is why it survived: the two
+# manifest tests that exist (`TestSentinelRoleGrantsNoMutatingVerb` and
+# `TestSentinelRoleGrantsWhatTheWatcherReads`) are each correct checks over a
+# SINGLE manifest, and neither compares the watch scope against the grant. A pair
+# of individually-correct checks over a pair of individually-correct files.
+#
+# This patch changes only the scope. The other half of the fix is ./chaos-rbac.yaml.
+# Setting the scope alone leaves the Sentinel unauthorised in sentinel-chaos;
+# granting the Role alone leaves it watching everything it cannot read.
+#
+# ---------------------------------------------------------------------------
+# WHY NOT A ClusterRole
+# ---------------------------------------------------------------------------
+# A ClusterRole would make the mismatch disappear and would be the single
+# highest-severity change available to this codebase. A watcher's entire authority
+# is the set of things it can read; a cluster-wide grant reads every namespace,
+# including those holding other people's secrets. Scoping the grant keeps the blast
+# radius of a compromised Sentinel equal to one namespace rather than the cluster.
+# Covering many namespaces means many narrow Roles to review, not one wide Role.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-sentinel
+spec:
+  template:
+    spec:
+      containers:
+        - name: sentinel
+          env:
+            # The namespace ./chaos-rbac.yaml binds the read verbs into.
+            #
+            # Kept as an env var rather than the `-namespace` flag so the manifest
+            # remains the single source of truth for how the pod is configured: the
+            # flag is read by `cmd/sentinel/main.go` as
+            # `os.Getenv("WATCH_NAMESPACE")`, so the two are the same input and
+            # setting it here changes what the flag would report anyway. The startup
+            # log line echoes the scope the WATCHER reports, not the flag's value —
+            # asserting on that line is the only check that would catch a scope that
+            # was set but not applied, which is the exact defect that
+            # `internal/k8s`'s namespace tests exist to prevent.
+            - name: WATCH_NAMESPACE
+              value: sentinel-chaos

@@ -1,0 +1,136 @@
+# Base for local live-validation overlays.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Kustomize's default load restrictor ("RootOnly") refuses to read files from OUTSIDE
+# the directory being built. `deploy/overlays/local-live/kustomization.yaml` needs to
+# consume the base manifests in `deploy/`, which are its PARENT directory, so a plain
+# `resources: - ../../namespace.yaml` fails with:
+#
+#     error: accumulating resources: ... file 'deploy/namespace.yaml' is not in or below
+#            'deploy/overlays/local-live': must build at directory: ...
+#
+# Relaxing the restrictor to `LoadRestrictionsNone` in the overlay would fix the error
+# and is the common suggestion, but it is the wrong trade here: it disables a
+# containment boundary for every resource the overlay builds, in exchange for
+# convenience. A load restrictor exists to stop an overlay from reaching into a
+# sibling tree and pulling something in silently.
+#
+# Instead this file is a BASE. Declaring the resources here, one level up, means the
+# overlay consumes a directory rather than reaching above itself — which the default
+# restrictor permits, because `../../..`-relative references are still disallowed but a
+# *sibling directory* inside the root is not.
+#
+# Nothing here is applied by itself. `deploy/kustomization.yaml` remains the base of
+# record for the production set and is untouched by this file; the overlay references
+# `./base/` instead of `../`, so the two never share a definition and cannot drift into
+# a shared bug.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# THE LOAD RESTRICTOR IS NOT RELAXED IN THIS FILE, and that is deliberate
+# ---------------------------------------------------------------------------
+# The default restrictor ("RootOnly") resolves paths relative to the kustomization's
+# own directory and refuses anything outside it. This file lives in `deploy/base/`
+# precisely so it could consume the manifests in `deploy/`, and that is exactly what
+# RootOnly forbids:
+#
+#     security; file 'deploy/namespace.yaml' is not in or below 'deploy/base'
+#
+# Three mechanisms for relaxing it were tried, and two of them are wrong:
+#
+#   1. `loadRestrictions: LoadRestrictionsNone` in this file. REJECTED — it is a
+#      kustomize CLI field, not a schema field. Under v1beta1 the apiserver's
+#      schema check fails with `json: unknown field "loadRestrictions"`. Writing it
+#      here produces a file that cannot be rendered by ANY invocation.
+#   2. The same field under the legacy apiVersion. Would work, but it pins this
+#      file to a deprecated schema and buys a capability the CLI already exposes.
+#   3. `--load-restrictor LoadRestrictionsNone` on the COMMAND. This is the one used,
+#      and it is recorded here so nobody re-adds the field.
+#
+# Why the CLI flag is the right mechanism rather than a workaround: the relaxation
+# is a property of ONE INVOCATION, not of a committed file. A file that permanently
+# disables containment is inherited by every future `kubectl apply -k` that touches
+# it, including by someone who did not read this comment. A flag has to be typed at
+# the moment it is needed, which is where the judgement belongs.
+#
+# Consequence for operators: rendering or applying the overlay REQUIRES the flag.
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/overlays/local-live
+#   kubectl apply -k --load-restrictor LoadRestrictionsNone deploy/overlays/local-live
+# Omitting it fails with a `security;` error naming the path — which is the
+# restrictor working, not a broken overlay.
+#
+# `deploy/kustomization.yaml` needs none of this: it references files in its own
+# directory, so RootOnly is sufficient and is retained.
+
+namespace: srek3s-system
+
+commonLabels:
+  app.kubernetes.io/part-of: srek3s
+
+resources:
+  # Order is load-bearing, not alphabetical: namespace, then credentials, then
+  # workloads, then the Service that points at one of them. See deploy/kustomization.yaml.
+  #
+  # Paths are `../<file>`, not `<file>`. A kustomization resolves its resource paths
+  # relative to ITS OWN directory, and this one lives in `deploy/base/` rather than in
+  # `deploy/`. Writing bare filenames here resolves to deploy/base/namespace.yaml,
+  # which does not exist — and the resulting error is nested two levels deep
+  # ("recursed accumulation"), which reads as a restrictor problem when it is a path
+  # one. The correct read is the innermost `lstat ... no such file or directory`.
+  - ../namespace.yaml
+  - ../rbac.yaml
+  - ../sentinel.yaml
+  - ../agent.yaml
+  - ../service.yaml
+
+# ---------------------------------------------------------------------------
+# THE TARGET-MANIFEST CONFIGMAP LIVES HERE, NOT IN THE OVERLAY
+# ---------------------------------------------------------------------------
+# It was defined in the overlay first, and the pods failed to start with
+# `MountVolume.SetUp failed for volume "manifests": configmap
+# "srek3s-target-manifest" not found`.
+#
+# The cause is a namespace, and it is a consequence of a fix for a different bug.
+# The overlay originally set `namespace: srek3s-system`, which collided with the
+# second namespace it also contains (the chaos Namespace got renamed to
+# srek3s-system — see deploy/overlays/local-live/kustomization.yaml). Removing the
+# field fixed the collision and introduced this: the `configMapGenerator` is declared
+# in the OVERLAY, and with no `namespace:` in scope a generated ConfigMap carries no
+# `metadata.namespace` at all. `kubectl apply` then places it in the current context's
+# namespace — `default`. The pod, correctly, looks for it in `srek3s-system`.
+#
+# Declaring it HERE resolves it, because this kustomization already sets
+# `namespace: srek3s-system` and its ONLY Namespace object is `srek3s-system` — so
+# the namespace transform rewrites that name to the value it already has, which is a
+# no-op. There is no second namespace here for the transform to collide with.
+#
+# The generalisable form: a global `namespace:` transform is only safe in a
+# kustomization whose Namespace objects already carry the target name. Adding a
+# second namespace forces a choice between a collision (transform on) and an
+# unnamespaced object (transform off), and the correct answer is usually neither —
+# it is to scope each generator to a kustomization where the transform is safe.
+configMapGenerator:
+  - name: srek3s-target-manifest
+    # The rollout trigger that a content hash would provide is unreachable here: the
+    # volume reference lives in a strategic-merge patch in the overlay, and kustomize's
+    # name-reference transformer runs before patches are merged, so the hash suffix
+    # would never be applied to the reference. A pod referencing a ConfigMap that does
+    # not exist does not start. See deploy/overlays/local-live/patch-agent-manifests.yaml.
+    options:
+      disableNameSuffixHash: true
+    files:
+      # The chaos OOM fixture: `resources.limits.memory: 64Mi` for container
+      # `oom-canary`, which is the shape Tier-1 patch synthesis looks for. Diffing a
+      # live incident against the fixture that caused it is the point — the patch is
+      # falsifiable, because applying it must raise the limit the running pod is
+      # actually being killed against.
+      #
+      # Path arithmetic: this kustomization lives in deploy/base/, so `../` is deploy/
+      # and the fixture is chaos/oom-leak.yaml under it. Writing
+      # `../deploy/chaos/...` resolves to deploy/deploy/chaos/... and fails with
+      # `open .../deploy/deploy/chaos/oom-leak.yaml: no such file or directory` — an
+      # error that names a doubled path, which is the only clue that the reference was
+      # over-qualified rather than absent.
+      - oom-leak.yaml=../chaos/oom-leak.yaml

@@ -77,6 +77,32 @@ def one(documents: list[dict[str, Any]], kind: str) -> dict[str, Any]:
     return found[0]
 
 
+def env_map(document: dict[str, Any]) -> dict[str, Any]:
+    """``{name: value}`` for a container's env, tolerating ``valueFrom``.
+
+    A previous revision wrote this as a plain comprehension:
+
+        {entry["name"]: entry["value"] for entry in container["env"]}
+
+    which raises ``KeyError: 'value'`` on the first environment variable sourced
+    from a Secret or ConfigMap rather than an inline literal. That is not
+    hypothetical: adding ``GEMINI_API_KEY`` via ``valueFrom.secretKeyRef`` to
+    deploy/agent.yaml broke every test using this comprehension, and the failure
+    looked like a manifest defect rather than a test defect.
+
+    ``valueFrom`` entries map to their source instead of a literal, so a caller
+    asserting on them sees *what the variable is bound to* rather than a KeyError.
+    That is more useful than either the old crash or silently dropping the key.
+    """
+    result: dict[str, Any] = {}
+    for entry in document["spec"]["template"]["spec"]["containers"][0].get("env") or []:
+        if "valueFrom" in entry:
+            result[entry["name"]] = entry["valueFrom"]
+        else:
+            result[entry["name"]] = entry["value"]
+    return result
+
+
 def named(documents: list[dict[str, Any]], kind: str, name: str) -> dict[str, Any]:
     """The one object of `kind` called `name`.
 
@@ -440,19 +466,13 @@ def test_the_patch_supplies_exactly_what_the_manifest_provider_reads(
     standing between "the agent had a manifest root" and "the agent escalated
     everything and the run still passed".
     """
-    shipped_env = {
-        entry["name"]: entry["value"]
-        for entry in agent_deployment["spec"]["template"]["spec"]["containers"][0][
-            "env"
-        ]
-    }
+    shipped_env = env_map(agent_deployment)
     assert shipped_env.get("SREK3S_MANIFEST_ROOT"), (
         "deploy/agent.yaml no longer sets SREK3S_MANIFEST_ROOT; the patch must "
         "not become the only place it is declared"
     )
 
-    container = one(patch, "Deployment")["spec"]["template"]["spec"]["containers"][0]
-    env = {entry["name"]: entry["value"] for entry in container["env"]}
+    env = env_map(one(patch, "Deployment"))
     assert "SREK3S_MANIFEST_ROOT" not in env, (
         "the patch restates SREK3S_MANIFEST_ROOT; it belongs to deploy/agent.yaml "
         "alone, and a second declaration is a second thing to keep in sync"
@@ -797,16 +817,14 @@ def test_control_the_manifest_root_assertion_fails_on_an_unset_variable(
     patch owns. A control that names the wrong document proves nothing about
     either.
     """
-    container = agent_deployment["spec"]["template"]["spec"]["containers"][0]
-    env = {entry["name"]: entry["value"] for entry in container["env"]}
+    env = env_map(agent_deployment)
     assert "SREK3S_MANIFEST_ROOT" in env
     without = {
         name: value for name, value in env.items() if name != "SREK3S_MANIFEST_ROOT"
     }
     assert "SREK3S_MANIFEST_ROOT" not in without
 
-    patched = one(patch, "Deployment")["spec"]["template"]["spec"]["containers"][0]
-    patch_env = {entry["name"]: entry["value"] for entry in patched["env"]}
+    patch_env = env_map(one(patch, "Deployment"))
     assert (
         "SREK3S_TARGET_MANIFEST" in patch_env
     ), "the target manifest is declared by the patch, not by deploy/agent.yaml"

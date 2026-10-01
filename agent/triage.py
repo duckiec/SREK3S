@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 import classifier
+import llm
 import patch as patch_engine
 import prompt
 import rescan
@@ -238,6 +239,135 @@ def _rescanned_rca(
     return cleaned[0]
 
 
+def _narrative_overlay(
+    payload: IncidentPayload,
+) -> llm.ModelNarrative | None:
+    """Ask the model for a narrative, or return None and keep the deterministic one.
+
+    THE MODEL IS NOT AUTHORITATIVE HERE, and the shape of this function is the
+    reason. It returns a narrative or it returns nothing: there is no path by
+    which a model response replaces the classification, the tier, the risk level,
+    the patch, or the verification policy. Those are all decided upstream in
+    ARCH §5.3 and are written into the response literal regardless of what comes
+    back. Only prose is substitutable.
+
+    Every failure is a fallback, deliberately and without exception:
+
+    * no API key -> None (the shipped default; the agent runs identically)
+    * SDK absent -> None
+    * transport failure after retries -> None
+    * a refusal, a safety block, or malformed output -> None
+
+    The agent has already decided what happened and what to do about it by the
+    time this runs, so a model that is slow, down, or compromised costs the
+    operator a paragraph - never a verdict, never a patch, never a delay past the
+    caller's budget. An RCA that is merely less fluent is a better outcome than
+    an RCA that is late.
+
+    Threading note: this is synchronous and runs on the worker's thread, never on
+    the event loop (AGENTS.md §3.1), so the ``time`` it spends cannot stall
+    ``/healthz`` or ``/readyz``.
+
+    CALL TWICE, ON PURPOSE. :func:`_model_summary` and :func:`_model_rca_section`
+    both call this, so a Tier-2 escalation issues at most two model calls and
+    pays for the narrative twice. That is a deliberate trade and it is worth
+    stating rather than hiding: the alternative was a single call whose result had
+    to be threaded through ``_escalate`` into the response constructor, which is
+    where an earlier revision lost the long-form text entirely because the
+    dispatch render overwrites ``rca_markdown`` after construction. Caching would
+    fix the cost and reintroduce the coupling. Two calls cost two tokens of
+    latency on a path that is already asynchronous with respect to the operator;
+    losing the analysis costs the operator the reason they escalated. If call
+    volume ever makes this matter, the fix is a per-request cache keyed on
+    ``incident_id`` — not a hidden parameter.
+    """
+    client = llm.gemini_client_from_env()
+    if client is None:
+        return None
+    try:
+        raw = client.complete(llm.build_prompt(payload))
+    except llm.ModelOutputError:
+        # Deliberately swallowed. The exception type is not logged with its
+        # message because provider errors can echo the request, and the request is
+        # incident telemetry (AGENTS.md §1: sanitise before egress).
+        return None
+    try:
+        return llm.decode_narrative(raw)
+    except llm.ModelOutputError:
+        return None
+
+
+#: ``RootCause.summary`` requires 20 characters, so anything shorter than this is
+#: unusable as a summary regardless of what else is true about it.
+MIN_MODEL_SUMMARY_CHARS: Final[int] = 20
+
+#: Ceiling on model prose, matching the looser of the two schema ceilings
+#: (``rca_markdown`` allows 20000). Exceeding it would raise during response
+#: construction, so it is clipped here instead.
+MAX_MODEL_PROSE_CHARS: Final[int] = 20_000
+
+
+def _prefer_model_prose(model_text: str, fallback: str) -> str:
+    """Use the model's prose only when it is actually usable, else ``fallback``.
+
+    Three guards, each tied to a failure that actually happened:
+
+    * **Length floor.** ``RootCause.summary`` requires 20 characters. A short or
+      empty narrative must not break response construction - that is precisely how
+      the 2026-10-01 live run produced a 500 on a request the agent already had
+      the evidence to answer.
+    * **Sensitivity.** If the prose trips the re-scan, the fallback wins. A model
+      can echo a secret back out of its own context, and this is the last point
+      before the response leaves the process.
+    * **Length ceiling.** ``rca_markdown`` allows 20000 characters; a longer
+      model reply would raise during construction. Clipped rather than rejected -
+      a truncated paragraph is still useful, and a 500 is not.
+
+    Passing ``""`` as the fallback is legitimate and returns ``""``, so a caller
+    can treat a falsy result as "the model offered nothing usable".
+    """
+    candidate = model_text.strip()
+    if len(candidate) < MIN_MODEL_SUMMARY_CHARS:
+        return fallback
+    if len(candidate) > MAX_MODEL_PROSE_CHARS:
+        candidate = candidate[: MAX_MODEL_PROSE_CHARS - 3].rstrip() + "..."
+    cleaned, report = rescan.redact(candidate)
+    if not report.clean or not cleaned[0].strip():
+        return fallback
+    return cleaned[0]
+
+
+def _model_summary(payload: IncidentPayload, deterministic_rationale: str) -> str:
+    """The model's one-line root cause, or the deterministic rationale.
+
+    Split from the long-form prose because the two are consumed at different
+    points in different functions, and conflating them is what made an earlier
+    revision lose the long-form text: `_escalate` overwrites ``rca_markdown``
+    wholesale when it renders the war-room dispatch, so anything appended inside
+    the response constructor is discarded. The summary survived that overwrite only
+    because it is a separate field - which is why the two are now fetched
+    separately and appended separately.
+    """
+    narrative = _narrative_overlay(payload)
+    if narrative is None:
+        return deterministic_rationale
+    return _prefer_model_prose(narrative.summary, deterministic_rationale)
+
+
+def _model_rca_section(payload: IncidentPayload) -> str | None:
+    """The model's long-form analysis, or ``None``.
+
+    Called from :func:`_escalate` AFTER the dispatch render, because that render
+    replaces ``rca_markdown`` outright. Appending before it loses the text
+    silently - the request still returns 200, the model is still billed, and the
+    operator simply never sees the analysis.
+    """
+    narrative = _narrative_overlay(payload)
+    if narrative is None:
+        return None
+    return _prefer_model_prose(narrative.rca_markdown, "") or None
+
+
 def _tier2_response(
     payload: IncidentPayload,
     result: classifier.ClassificationResult,
@@ -259,6 +389,7 @@ def _tier2_response(
         else TriageStatus.ESCALATED
     )
     evidence = prompt.evidence_lines(payload)
+    summary = _model_summary(payload, result.rationale)
     return TriageResponse(
         schema_version=SCHEMA_VERSION,
         incident_id=payload.incident_id,
@@ -268,7 +399,7 @@ def _tier2_response(
         confidence=confidence,
         blast_radius_tier=BlastRadiusTier.TIER_2_ARCHITECTURAL,
         root_cause=RootCause(
-            summary=result.rationale,
+            summary=summary,
             evidence=evidence,
             affected_scope=classifier.affected_scope(payload),
         ),
@@ -286,16 +417,47 @@ def _tier2_response(
             patch_validated=False,
         ),
         verification_policy=_verification_policy(BlastRadiusTier.TIER_2_ARCHITECTURAL),
+        # NOTE: this markdown is DISCARDED and re-rendered by `_escalate` with the
+        # war-room dispatch. It is built here only because the dispatch renderer
+        # reads it. The model's long-form prose is appended in `_escalate`, after
+        # that render - see the comment there. An earlier revision appended here
+        # and lost it, which is exactly the kind of silent total failure worth
+        # writing down.
+        #
+        # The summary passed to the renderer is `summary`, not `result.rationale`,
+        # so the model's account also appears in the deterministic body.
         rca_markdown=_rescanned_rca(
             payload,
             result.classification,
             BlastRadiusTier.TIER_2_ARCHITECTURAL,
-            result.rationale,
+            summary,
             evidence,
         ),
         analysis_latency_ms=latency_ms,
         agent_version=AGENT_VERSION,
     )
+
+
+def _compose_rca(deterministic: str, model_section: str | None) -> str:
+    """Append the model's account to the deterministic document, re-scanned.
+
+    The re-scan runs over the COMBINED text, not over the model section alone. A
+    secret can be assembled from a model paragraph and a deterministic line that
+    are each individually innocent, which is the reason I-B6 scans the rendered
+    document in the first place.
+    """
+    if not model_section:
+        return deterministic
+    combined = (
+        f"{deterministic}\n\n"
+        "### Model analysis\n\n"
+        "_Generated by the configured model from the scrubbed evidence above. "
+        "Advisory only; the verdict above is deterministic and was not produced "
+        "by the model._\n\n"
+        f"{model_section}"
+    )
+    cleaned, _report = rescan.redact(combined)
+    return cleaned[0]
 
 
 def _escalate(
@@ -332,7 +494,19 @@ def _escalate(
     # I-B1 model validator against the rendered text. `model_copy` would not,
     # and a field that is re-validated by an update but not by a construction
     # is a field nobody can reason about.
+    #
+    # This render REPLACES rca_markdown wholesale. Anything the model contributed
+    # inside _tier2_response is therefore discarded here, and an earlier revision
+    # of this function appended it too early and lost it: the summary survived only
+    # because it is a different field. The model section is appended after this
+    # assignment instead, so the dispatch - which carries the DO-NOT-APPLY marker
+    # and the escalation reasons - is never at risk of being overwritten by, or
+    # overwriting, model prose.
     response.rca_markdown = warroom.render_markdown(dispatch)
+    response.rca_markdown = _compose_rca(
+        response.rca_markdown,
+        _model_rca_section(payload),
+    )
     return TriageOutcome(
         response=response,
         tier=BlastRadiusTier.TIER_2_ARCHITECTURAL,
