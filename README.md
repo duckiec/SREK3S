@@ -5,7 +5,7 @@ analysis, and — when the cause is unambiguous and the fix is a one-line resour
 change — emits a verified unified `git diff` for a human to merge. It never
 writes to the cluster. That is enforced by the cluster, not by convention.
 
-**Status:** MVP sealed — 724 Python tests + 178 Go test functions green, all CI
+**Status:** MVP sealed — 727 Python tests + 178 Go test functions green, all CI
 gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
 [`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
 along the way, including the ones a passing gate failed to catch.
@@ -41,26 +41,17 @@ subtree.
 kubectl apply -k deploy/
 ```
 
-> **Known gap — read before you rely on this.** The deploy set creates no
-> `Service` for the agent, but `deploy/sentinel.yaml` sets
-> `SREK3S_AGENT_URL=http://srek3s-agent:8000` and its comment calls that "the
-> agent's Service". As shipped there is nothing by that name, so the Sentinel
-> cannot resolve it and the two pods will not connect. Separately, the
-> `-agent-url` flag default is `http://srek3s-agent:8080`, while the agent binds
-> `0.0.0.0:8000` — so the default is wrong on the port too, independently of the
-> missing Service.
->
-> Nothing catches this. `agent/tests/test_deploy_manifests.py` asserts RBAC,
-> hardening, namespaces and volumes, but no test cross-references the Sentinel's
-> configured agent URL against the resources the set actually creates. CI never
-> exercises it either: the E2E applies only `deploy/chaos/*` and runs both
-> processes on the host with `-agent-url http://127.0.0.1:8001` via
-> `kubectl port-forward`, which sidesteps name resolution entirely.
->
-> Until a Service manifest lands, port-forward and point the Sentinel at
-> `http://127.0.0.1:8001` — which is what CI does — or add the Service yourself.
+`deploy/service.yaml` publishes the agent on `srek3s-agent:8000`, which is the
+Sentinel's built-in `-agent-url` default. The two are asserted equal — along
+with the Service's selector against the agent's pod labels, and its
+`targetPort` against the port the agent actually binds — by
+`test_the_agent_service_routes_the_sentinels_default_endpoint`. That check
+exists because v1.0.0 shipped a deploy set whose Sentinel pointed at a Service no
+manifest created, on a port nothing listened to. It applied cleanly, every
+manifest test passed, and the two pods could not talk. The E2E never caught it
+either: it port-forwards around name resolution entirely.
 
-The manifests also reference `registry.internal/srek3s-{agent,sentinel}:0.1.0`.
+The manifests reference `registry.internal/srek3s-{agent,sentinel}:0.1.0`.
 Those tags are placeholders the release pipeline rewrites in the committed file,
 so applying the set against a cluster that cannot pull them yields
 `ImagePullBackOff`. For the verified `pull` + `tag` path into a local
@@ -72,7 +63,7 @@ None of this needs a cluster.
 
 ```bash
 go test ./...                     # Go units. Add -race; CI-only where TSan is absent.
-pytest agent/tests/ -q            # 724 passed, 2 skipped
+pytest agent/tests/ -q            # 727 passed, 2 skipped
 black --check agent/ tests/
 flake8 agent/ tests/
 mypy --strict agent/ tests/
@@ -424,7 +415,7 @@ chain — including that a planted secret did not survive scrubbing, that
 scrubbing *did* mask something, and that masking preserved diagnostic evidence.
 "Masked everything" and "masked nothing" are both failures, and both are asserted.
 
-Two of the 724 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+Two of the 727 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. `go test -race` and the container build are
 likewise CI-only on hosts without ThreadSanitizer or a Docker daemon; this is
 reported as blocked rather than checked off.
@@ -445,13 +436,14 @@ reported as blocked rather than checked off.
 | AC-2 | Corpus replay | 46 cases, 32 maskable |
 | AC-4 | Container build + runtime smoke | Asserts UID 10001, imports `main:app` |
 | Layout | `test_architecture_layout.py` | `ARCHITECTURE.md` ↔ filesystem parity, both directions |
+| Routing | `test_the_agent_service_routes_the_sentinels_default_endpoint` | Service ↔ pod labels ↔ bind port ↔ Sentinel default |
 | Workflow | `scripts/audit_workflow.py` | CI definition audit |
 
-What the gate set does **not** cover, as of this commit: the deploy set has no
-cross-reference test. Nothing asserts that the endpoints the manifests configure
-resolve to resources the same manifests create — which is how the missing agent
-`Service` shipped. The layout validator covers the document side of that idea
-and nothing covered the manifest side.
+Most of these assert a property of a single file. `Routing` asserts a property of
+the *set*: that the endpoint the Sentinel is configured with resolves, through a
+Service these manifests create, to a port the agent actually binds. v1.0.0
+shipped without it, which is how a deploy set applied cleanly and routed
+nowhere passed every gate it had.
 
 The layout validator deserves a note, because it exists because a document was
 wrong three separate times and no gate noticed. `ARCHITECTURE.md` named
@@ -471,7 +463,8 @@ internal/k8s/          read-only clientset, informers, classification, telemetry
 internal/worker/       bounded worker pool; every send selected on ctx.Done()
 internal/emitter/      ULID incident ids, wire validation, ctx-bounded HTTPS
 agent/                 FastAPI + Pydantic v2 triage engine, sandbox, verification
-deploy/                k3s manifests; chaos/ holds the deliberate-failure fixtures
+deploy/                k3s manifests; service.yaml routes to the agent;
+                       chaos/ holds the deliberate-failure fixtures
 tests/fixtures/        incident corpus, chaos manifests, golden expected output
 scripts/               audit_workflow.py — audits the CI definition itself
 docs/                  runbook, lessons learned, offline install, CI triage

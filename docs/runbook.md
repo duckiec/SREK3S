@@ -50,7 +50,7 @@ The Sentinel takes six flags, each also settable by environment variable:
 | Flag | Env | Default | Notes |
 |---|---|---|---|
 | `-namespace` | `WATCH_NAMESPACE` | *(empty — watches all)* | **Set this.** See below. |
-| `-agent-url` | `SREK3S_AGENT_URL` | `http://srek3s-agent:8080` | Base URL only. No path — the emitter appends `/v1/incidents` itself. |
+| `-agent-url` | `SREK3S_AGENT_URL` | `http://srek3s-agent:8000` | Base URL only. No path - the emitter appends `/v1/incidents` itself. The default is the `srek3s-agent` Service in `deploy/service.yaml`. |
 | `-workers` | — | pool default | Fixed-size worker pool. Not a queue. |
 | `-log-level` | `LOG_LEVEL` | `info` | |
 | `-kubeconfig` | — | in-cluster | For running outside the cluster. |

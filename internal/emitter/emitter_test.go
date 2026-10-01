@@ -813,7 +813,7 @@ func TestEmitRefusesAPayloadThatViolatesTheContract(t *testing.T) {
 }
 
 func TestNewRejectsAnUnusableBaseURL(t *testing.T) {
-	for _, base := range []string{"", "   ", "srek3s-agent:8080", "ftp://agent"} {
+	for _, base := range []string{"", "   ", "srek3s-agent:8000", "ftp://agent"} {
 		if _, err := New(Config{BaseURL: base}); err == nil {
 			t.Errorf("New(%q) succeeded; a misconfigured endpoint must fail at "+
 				"startup, not on the first incident", base)

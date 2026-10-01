@@ -49,7 +49,9 @@ const baseRetryDelay = 250 * time.Millisecond
 
 // Config configures a [Client].
 type Config struct {
-	// BaseURL is the agent's root, e.g. "http://srek3s-agent:8080".
+	// BaseURL is the agent's root, e.g. "http://srek3s-agent:8000". No path:
+	// the client appends [IncidentsPath] itself, so a value carrying one yields
+	// ".../v1/incidents/v1/incidents".
 	BaseURL string
 
 	// Timeout overrides [DefaultTimeout].

@@ -45,7 +45,7 @@ func TestUnknownFlagIsAnErrorNotAnExit(t *testing.T) {
 // common misconfiguration (a bare hostname with no scheme) without requiring a
 // live agent.
 func TestAgentURLIsValidatedAtStartup(t *testing.T) {
-	for _, url := range []string{"", "srek3s-agent:8080", "not a url at all"} {
+	for _, url := range []string{"", "srek3s-agent:8000", "not a url at all"} {
 		flags := flag.NewFlagSet("sentinel", flag.ContinueOnError)
 		flags.SetOutput(discardWriter{})
 		// The clientset is expected to fail first in this environment (no

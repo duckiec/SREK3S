@@ -136,6 +136,7 @@ SREK3S/
 │   ├── rbac.yaml                 # read-only Role + RoleBinding (no mutating verbs)
 │   ├── sentinel.yaml             # Go daemon: 10001/10001, RO rootfs, cap_drop ALL
 │   ├── agent.yaml                # FastAPI: same hardening
+│   ├── service.yaml              # agent ClusterIP; target of SREK3S_AGENT_URL
 │   ├── kustomization.yaml
 │   └── chaos/                    # Milestone 4 synthetic chaos fixtures
 │       ├── oom-leak.yaml

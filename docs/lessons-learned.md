@@ -744,3 +744,82 @@ in run `36785083401`; the audit reports
 `GREP_Q_PIPE: M4.3 - Live Post-Remediation Verification Loop: line 28` and exits
 1. On the corrected workflow it reports nothing, so it is not simply flagging
 every pipeline in the repository.
+
+## 23. Sixteen Green Manifest Tests, And A Deployment That Routed Nowhere (v1.0.1)
+
+Found while writing the v1.0.0 README, not by a gate. `deploy/` shipped without
+a `Service`, while `deploy/sentinel.yaml` set `SREK3S_AGENT_URL` to
+`http://srek3s-agent:8000` and described it in a comment as "the agent's
+Service". Nothing created that name, so the Sentinel could not resolve the agent
+it was configured to call. Compounding it, the `-agent-url` flag default was
+`http://srek3s-agent:8080` — a port nothing listens on, while the agent binds
+`0.0.0.0:8000`.
+
+`kubectl apply -k deploy/` succeeded. Every pod started. Neither pod could reach
+the other.
+
+### Why sixteen tests missed it
+
+Every check in `test_deploy_manifests.py` asserted a property of **one
+document**: the Role grants no mutating verb, the containers carry the hardening
+block, the namespace enforces restricted PSA, `/tmp` is the only writable volume.
+All true. All worth having. None of them can observe that a value in file A
+refers to a resource that file B was supposed to create and does not.
+
+A check that only ever opens one file cannot fail on a defect that spans two.
+The missing Service was a disagreement *between* documents, and the suite had no
+notion of a disagreement.
+
+### Why the E2E missed it too
+
+The detonation workflow applies only `deploy/chaos/*`, then runs the Sentinel and
+the agent as host processes with `-agent-url http://127.0.0.1:8001` over a
+`kubectl port-forward`. That path sidesteps name resolution completely — no
+Service, no DNS, no ClusterIP. So the one workflow that runs the real binaries
+against a real cluster exercises precisely the part of the deployment that was
+broken, by routing around it.
+
+This is the more expensive half of the lesson. A test harness that substitutes a
+convenient transport for the real one is not a weaker test; for the code path
+concerned, it is **no test at all**, and it is worse than no test because it
+occupies the slot where the real coverage would go.
+
+### What changed
+
+`test_the_agent_service_routes_the_sentinels_default_endpoint` asserts the four
+facts that must agree, and reads each from its authoritative source rather than
+hardcoding it:
+
+1. the Service is named `srek3s-agent` — the DNS name the Sentinel dials;
+2. its `selector` matches `agent.yaml`'s **pod template** labels — a selector
+   that matches nothing yields a *timeout*, not a *refusal*, which is much
+   harder to diagnose from a log;
+3. its `targetPort` and `port` equal the port parsed out of the Dockerfile's
+   `ENTRYPOINT`, not a constant in the test;
+4. the Sentinel's `-agent-url` default, parsed out of `main.go` with a regex
+   anchored on the `envOr("SREK3S_AGENT_URL", …)` call, equals
+   `http://<service name>:<service port>` — with no path, because
+   `internal/emitter` appends `/v1/incidents` itself.
+
+A second test asserts the two NetworkPolicies admit that port, on the reasoning
+that a ClusterIP does not change policy evaluation (the policy applies to the
+post-DNAT destination, which is the pod) — true today, and worth pinning before
+someone adds an `ipBlock`.
+
+All seven ways of breaking the coupling are mutation-tested against the real
+files: targetPort moved, selector mistyped, default reverted to `:8080`, default
+given a path, Dockerfile port moved, `service.yaml` dropped from the
+kustomization, Service published on a port no policy admits. Every one fails the
+build.
+
+### The generalisable form
+
+*A suite of per-file assertions has a blind spot exactly the width of the space
+between files.* Adding more per-file checks does not narrow it. When a defect
+class is "these two things must agree", the check has to hold both in hand, and
+it has to read each side from the place a future edit would actually change.
+
+The corollary is about the harness. When an end-to-end workflow replaces the
+production transport with a convenient one, ask what the substitution made
+unobservable — and check that the answer is not "the thing that was broken".
+Here it was, and the workflow passed for a full milestone.

@@ -99,8 +99,22 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	// definition - and a panic in a test looks exactly like a defect in the code
 	// under test. `flags.String` binds to the set the caller owns.
 	var (
-		kubeconfig  = flags.String("kubeconfig", "", "path to a kubeconfig; empty uses in-cluster config")
-		agentURL    = flags.String("agent-url", envOr("SREK3S_AGENT_URL", "http://srek3s-agent:8080"), "base URL of the analysis agent")
+		kubeconfig = flags.String("kubeconfig", "", "path to a kubeconfig; empty uses in-cluster config")
+		// Base URL only, no path. internal/emitter appends IncidentsPath
+		// ("/v1/incidents") to this, so a value carrying a path produces
+		// ".../v1/incidents/v1/incidents" and every POST 404s.
+		//
+		// The default is deploy/service.yaml's name and port. It was ":8080"
+		// until v1.0.1, which matched nothing: the agent binds 0.0.0.0:8000
+		// and, before that fix, no Service existed under this name at all. The
+		// coupling is asserted by test_deploy_manifests.py, which parses this
+		// fallback out of this file and compares it against the Service's name
+		// and port - so the two cannot drift apart silently again. The check
+		// lives in the Python suite rather than here for a reason worth
+		// stating: nothing in Go can read a YAML manifest, and a Go test that
+		// hardcoded "8000" would agree with a wrong default for as long as
+		// both were edited together.
+		agentURL    = flags.String("agent-url", envOr("SREK3S_AGENT_URL", "http://srek3s-agent:8000"), "base URL of the analysis agent, no path")
 		namespace   = flags.String("namespace", os.Getenv("WATCH_NAMESPACE"), "namespace to watch; empty watches all")
 		workers     = flags.Int("workers", worker.DefaultPoolSize, "number of worker goroutines")
 		logLevel    = flags.String("log-level", envOr("LOG_LEVEL", "info"), "debug, info, warn or error")

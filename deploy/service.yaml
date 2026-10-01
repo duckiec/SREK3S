@@ -1,0 +1,71 @@
+# SREK3S - the agent's Service.
+#
+# Why this file exists. Until v1.0.1 there was no Service in this set, and
+# deploy/sentinel.yaml pointed SREK3S_AGENT_URL at "http://srek3s-agent:8000"
+# while describing it in a comment as "the agent's Service". Nothing created
+# that Service, so the name did not resolve and the two pods could not talk.
+#
+# The defect survived because nothing checked for it. test_deploy_manifests.py
+# asserts RBAC, container hardening, namespace and volume invariants - all of
+# them properties of a single document - but nothing cross-referenced the
+# endpoint one manifest configures against the resources the set as a whole
+# creates. The E2E workflow never exercised it either: it applies only
+# deploy/chaos/* and runs the Sentinel and the agent as host processes with
+# -agent-url http://127.0.0.1:8001 over a kubectl port-forward, which bypasses
+# name resolution entirely. A green E2E and a green manifest suite, and a
+# deployment that could not route traffic.
+#
+# test_the_agent_service_routes_the_sentinels_default_endpoint (in
+# agent/tests/test_deploy_manifests.py) now asserts the coupling directly: that
+# this Service exists, that its selector matches the agent Deployment's pod
+# template labels, that its targetPort equals the port the agent actually binds,
+# and that the Sentinel's built-in -agent-url default is this Service's name and
+# port. Change any one of those four and the build fails.
+#
+# Note what is NOT here, and why.
+#
+#   * No second port. The agent serves exactly one endpoint set (/v1/incidents,
+#     /healthz, /readyz) on 8000. A Service exposing more would widen reachability
+#     for no consumer.
+#
+#   * No NodePort and no LoadBalancer. This is pod-to-pod traffic inside one
+#     namespace. Publishing it outside the cluster would put the triage endpoint
+#     on a routable interface, which is the opposite of the egress boundary the
+#     rest of this design is built around. type is stated explicitly rather than
+#     left to the default so that a reader does not have to know the default.
+#
+#   * No sessionAffinity. The agent is stateless per request; the emitter
+#     retries with backoff and treats any connection failure as retryable, so
+#     pinning a client to a replica would add a failure mode without adding a
+#     guarantee.
+#
+#   * No publishNotReadyAddresses. The Sentinel must not be routed to a replica
+#     that has not passed its readiness probe; the emitter's retry budget is for
+#     transient failures, not for bypassing health checks.
+apiVersion: v1
+kind: Service
+metadata:
+  name: srek3s-agent
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/name: srek3s-agent
+    app.kubernetes.io/part-of: srek3s
+spec:
+  type: ClusterIP
+  # Must match deploy/agent.yaml's spec.template.metadata.labels, or the Service
+  # selects nothing and every connection fails with a timeout rather than a
+  # refusal - a much harder failure to diagnose. Asserted by
+  # test_the_agent_service_routes_the_sentinels_default_endpoint.
+  selector:
+    app.kubernetes.io/name: srek3s-agent
+  ports:
+    - name: http
+      protocol: TCP
+      # 8000 is the agent's bind address (agent/Dockerfile ENTRYPOINT:
+      # uvicorn --host 0.0.0.0 --port 8000) and its declared containerPort.
+      # It is also the port the Sentinel's default -agent-url names. All four
+      # of those are asserted equal by the same test, because the failure mode
+      # when they disagree is a deployment that applies cleanly and silently
+      # routes nowhere.
+      port: 8000
+      targetPort: 8000

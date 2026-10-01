@@ -4,7 +4,16 @@
 # resources, and `kubectl apply -k` sends them in the order the API receives them,
 # so a namespace that does not exist yet makes every namespaced resource in the set
 # fail with "namespace not found". namespace.yaml first, then rbac (the Role and
-# ServiceAccount the Deployment references), then the workloads.
+# ServiceAccount the Deployment references), then the workloads, then the Service
+# that points at one of them.
+#
+# service.yaml is last because its ordering constraint is weaker than the
+# others'. A Service with no ready endpoints is still a valid object, so applying
+# it before agent.yaml is not an error - it simply resolves to nothing until the
+# pods appear. It goes last anyway: "the thing that routes to the workload" reads
+# better after the workload, and the emitter retries with backoff (internal/emitter
+# DefaultMaxAttempts), so a brief window of no endpoints at boot is handled rather
+# than merely tolerated.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -14,11 +23,13 @@ commonLabels:
   app.kubernetes.io/part-of: srek3s
 
 resources:
-  # Order: namespace, then credentials, then workloads. See the note above.
+  # Order: namespace, then credentials, then workloads, then the Service.
+  # See the note above.
   - namespace.yaml
   - rbac.yaml
   - sentinel.yaml
   - agent.yaml
+  - service.yaml
 
 # No `images:` block on purpose. The image tags in the manifests are the
 # placeholders `registry.internal/...:0.1.0`, and a kustomize `images:` override
