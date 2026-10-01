@@ -345,6 +345,51 @@ def test_every_production_source_file_is_named_in_the_layout_tree() -> None:
     )
 
 
+def _source_directories() -> list[str]:
+    """Every directory under the roots the tree enumerates, caches excluded."""
+    found: list[str] = []
+    for top in _ENUMERATED_ROOTS:
+        for path in sorted((_ROOT / top).rglob("*")):
+            if not path.is_dir():
+                continue
+            relative = path.relative_to(_ROOT)
+            if any(
+                part in _IGNORED_DIR_PARTS or part.startswith(".")
+                for part in relative.parts
+            ):
+                continue
+            found.append(relative.as_posix())
+    return found
+
+
+def test_every_source_directory_is_named_in_the_layout_tree() -> None:
+    """A package the tree omits is a package the document does not describe.
+
+    The file-level reverse check above cannot see a test-only package, and that
+    is not a hypothetical gap. `internal/deploy/` holds nothing but `_test.go`
+    files - including `rbac_hardening_test.go`, the test that parses
+    `deploy/rbac.yaml` and fails the build on a mutating verb, which is the
+    guarantee the whole no-autofix story rests on. `_production_sources()`
+    filters `_test.go` by design, and the forward direction only inspects paths
+    the tree already names, so between them the two checks were blind to an
+    entire package. It was undocumented, and the gate that exists to catch
+    undocumented packages reported green.
+
+    Checking directories closes it. A layout diagram is still not a file
+    inventory - the tree keeps its `*_test.go` glob rather than listing each test
+    - but every package gets named, and naming the package is what makes a
+    reader able to find it.
+    """
+    tree = _tree()
+    undocumented = [path for path in _source_directories() if path not in tree]
+    assert not undocumented, (
+        "these directories exist but ARCHITECTURE.md's layout tree does not name "
+        "them. A package the document omits is a package the document does not "
+        "describe - and a package of nothing but test files is invisible to the "
+        "file-level check above.\n  " + "\n  ".join(undocumented)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Controls
 # ---------------------------------------------------------------------------
@@ -426,13 +471,13 @@ def test_the_existence_check_fails_on_a_planted_glob_matching_nothing() -> None:
 
 
 def test_the_reverse_check_fails_on_an_undocumented_file() -> None:
-    """Negative control for the reverse direction.
+    """Negative control for the file-level reverse direction.
 
     Drops one real production file from the documented set and requires the
     check to report it. Proves the reverse check detects drift in the direction
     that forward parity cannot see - a document that silently omits a file is
     invisible to every existence assertion, so this is the only thing standing
-    between the tree and a package that ships undocumented.
+    between the tree and a module that ships undocumented.
     """
     sources = _production_sources()
     tree = _tree()
@@ -445,6 +490,28 @@ def test_the_reverse_check_fails_on_an_undocumented_file() -> None:
         f"removing {dropped!r} from the documented set did not make it "
         "undocumented, so the reverse check cannot fail"
     )
+
+
+def test_the_directory_check_fails_on_an_undocumented_package() -> None:
+    """Negative control for the directory-level reverse direction.
+
+    The file-level control above cannot fail for a test-only package, because
+    every file in one is filtered out of `_production_sources()`. This control
+    drops a real *directory* from the documented set instead, which is the only
+    way to show the directory check is load-bearing rather than decorative -
+    and it is the case that actually occurred with `internal/deploy/`.
+    """
+    tree = _tree()
+    directories = _source_directories()
+    assert not [
+        path for path in directories if path not in tree
+    ], "control is vacuous: the check already fails"
+    named = next(path for path in directories if path in tree)
+    without = {path: flag for path, flag in tree.items() if path != named}
+    assert named not in without
+    assert named in [
+        path for path in _source_directories() if path not in without
+    ], f"removing {named!r} from the documented set did not make it undocumented"
 
 
 def test_the_tree_block_is_located_by_content_not_by_line_number() -> None:

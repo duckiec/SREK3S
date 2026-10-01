@@ -102,6 +102,8 @@ SREK3S/
 │   │   ├── guard.go              # defensive pointer helpers (nil-safe accessors)
 │   │   └── *_test.go
 │   │
+│   ├── deploy/                   # MANIFEST HARDENING TESTS (test-only package)
+│   │   └── *_test.go           # rbac_hardening_test.go, manifests_test.go
 │   ├── worker/                   # BOUNDED CONCURRENCY
 │   │   └── pool.go               # fixed-size pool; sends selected against ctx.Done()
 │   └── emitter/                  # EGRESS BOUNDARY
@@ -126,7 +128,8 @@ SREK3S/
 │   ├── sandbox_worker.py         # disposable analysis worker entrypoint
 │   ├── triage.py                 # HTTP surface: classify, route, remediate
 │   ├── pyproject.toml
-│   └── requirements.txt          # no torch, no cuda, no gpu extras (asserted in CI)
+│   ├── requirements.txt          # no torch, no cuda, no gpu extras (asserted in CI)
+│   └── tests/                    # pytest suite; includes the layout validator
 │
 ├── deploy/                       # k3s MANIFESTS
 │   ├── namespace.yaml

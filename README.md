@@ -1,23 +1,115 @@
 # SREK3S — Autonomous Reliability Firewall
 
-**Status:** MVP sealed. 722 Python tests + 178 Go test functions green; all CI
-gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
-[`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
-along the way, including the ones a passing gate failed to catch.
-
 SREK3S watches a Kubernetes cluster for container failures, produces a root-cause
 analysis, and — when the cause is unambiguous and the fix is a one-line resource
 change — emits a verified unified `git diff` for a human to merge. It never
 writes to the cluster. That is enforced by the cluster, not by convention.
 
+**Status:** MVP sealed — 724 Python tests + 178 Go test functions green, all CI
+gates passing. [`ROADMAP.md`](ROADMAP.md) records per-milestone evidence;
+[`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
+along the way, including the ones a passing gate failed to catch.
+
+---
+
+## Getting started
+
+### Prerequisites
+
+| | |
+|---|---|
+| Go | 1.23+ (`go.mod` pins 1.23) |
+| Python | **3.11, strictly.** 3.12+ syntax is not permitted; formatting is pinned to `target-version = ["py311"]`. |
+| Cluster | Any conformant cluster. CI uses k3s. |
+| `git` | Required in the agent image — patch validation runs `git apply --check`. |
+| Docker | Only for building the agent image. |
+
+### Build
+
+```bash
+go build -o bin/sentinel ./cmd/sentinel
+docker build -t srek3s-agent:0.1.0 -f agent/Dockerfile .
+```
+
+The agent image's build context is the **repository root**, not `agent/` — the
+Dockerfile needs `agent/` and its config, and assumes nothing outside its own
+subtree.
+
+### Deploy
+
+```bash
+kubectl apply -k deploy/
+```
+
+> **Known gap — read before you rely on this.** The deploy set creates no
+> `Service` for the agent, but `deploy/sentinel.yaml` sets
+> `SREK3S_AGENT_URL=http://srek3s-agent:8000` and its comment calls that "the
+> agent's Service". As shipped there is nothing by that name, so the Sentinel
+> cannot resolve it and the two pods will not connect. Separately, the
+> `-agent-url` flag default is `http://srek3s-agent:8080`, while the agent binds
+> `0.0.0.0:8000` — so the default is wrong on the port too, independently of the
+> missing Service.
+>
+> Nothing catches this. `agent/tests/test_deploy_manifests.py` asserts RBAC,
+> hardening, namespaces and volumes, but no test cross-references the Sentinel's
+> configured agent URL against the resources the set actually creates. CI never
+> exercises it either: the E2E applies only `deploy/chaos/*` and runs both
+> processes on the host with `-agent-url http://127.0.0.1:8001` via
+> `kubectl port-forward`, which sidesteps name resolution entirely.
+>
+> Until a Service manifest lands, port-forward and point the Sentinel at
+> `http://127.0.0.1:8001` — which is what CI does — or add the Service yourself.
+
+The manifests also reference `registry.internal/srek3s-{agent,sentinel}:0.1.0`.
+Those tags are placeholders the release pipeline rewrites in the committed file,
+so applying the set against a cluster that cannot pull them yields
+`ImagePullBackOff`. For the verified `pull` + `tag` path into a local
+containerd, see [`docs/offline-install.md`](docs/offline-install.md).
+
+### Run the tests
+
+None of this needs a cluster.
+
+```bash
+go test ./...                     # Go units. Add -race; CI-only where TSan is absent.
+pytest agent/tests/ -q            # 724 passed, 2 skipped
+black --check agent/ tests/
+flake8 agent/ tests/
+mypy --strict agent/ tests/
+python scripts/audit_workflow.py  # audits the CI definition itself
+```
+
+`mypy --strict` must be run against `agent/` **and** `tests/` together — against
+`agent/` alone it reports spurious `import-not-found` errors for the test
+fixtures.
+
+The 2 skips are live-cluster tests that print `BLOCKED DEPENDENCY, not a pass`.
+They need `kubectl` and a reachable cluster; the offline half of that file is
+what ran.
+
+### Where to go next
+
+- **Operating it** — [`docs/runbook.md`](docs/runbook.md): deploying, reading
+  logs, interpreting a Tier-2 dispatch, reviewing a Tier-1 PR, and the
+  No-Autofix guarantee.
+- **Understanding it** — [`ARCHITECTURE.md`](ARCHITECTURE.md) is the single
+  source of truth for schemas, invariants, and layout. Code and spec
+  disagreeing is treated as a stop-the-line discrepancy, not a documentation
+  bug.
+- **Deploy manifests** — [`deploy/`](deploy/): `namespace.yaml`, `rbac.yaml`,
+  `sentinel.yaml`, `agent.yaml`, `kustomization.yaml`, plus `chaos/` for the
+  deliberate-failure fixtures.
+- **Requirements** — [`PRD.md`](PRD.md).
+- **Why any of this exists** — [below](#the-problem-the-llm-blast-radius-gap).
+
 ---
 
 ## Table of contents
 
+- [Getting started](#getting-started)
 - [The problem: the LLM blast-radius gap](#the-problem-the-llm-blast-radius-gap)
 - [What SREK3S actually does](#what-srek3s-actually-does)
 - [Data flow](#data-flow)
-- [Getting started](#getting-started)
 - [Engineering deep dive](#engineering-deep-dive)
   - [1. Zero cluster mutation is structural](#1-zero-cluster-mutation-is-structural)
   - [2. The in-memory scrubber](#2-the-in-memory-scrubber)
@@ -116,25 +208,6 @@ never applied looks identical to a patch that fixed nothing, until you check.
                                   post-remediation
                                   verification loop
 ```
-
-## Getting started
-
-**Operator runbook:** [`docs/runbook.md`](docs/runbook.md) — deploying the
-Sentinel, reading its logs, interpreting a Tier-2 dispatch, reviewing a Tier-1
-PR, and the No-Autofix guarantee.
-
-**Deployment manifests:** [`deploy/`](deploy/) — `namespace.yaml`, `rbac.yaml`,
-`sentinel.yaml`, `agent.yaml`, `kustomization.yaml`, and `chaos/` for the
-deliberate-failure fixtures. Apply with `kubectl apply -k deploy/`.
-
-**Architecture:** [`ARCHITECTURE.md`](ARCHITECTURE.md) is the single source of
-truth for schemas, invariants, and layout. Code and spec disagreeing is treated
-as a stop-the-line discrepancy, not a documentation bug.
-
-**Requirements and acceptance criteria:** [`PRD.md`](PRD.md).
-
-**Offline install:** [`docs/offline-install.md`](docs/offline-install.md) — what
-is verified (image `pull` + `tag` into a k3s containerd) and what is not.
 
 ---
 
@@ -351,7 +424,7 @@ chain — including that a planted secret did not survive scrubbing, that
 scrubbing *did* mask something, and that masking preserved diagnostic evidence.
 "Masked everything" and "masked nothing" are both failures, and both are asserted.
 
-Two of the 722 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+Two of the 724 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. `go test -race` and the container build are
 likewise CI-only on hosts without ThreadSanitizer or a Docker daemon; this is
 reported as blocked rather than checked off.
@@ -365,8 +438,8 @@ reported as blocked rather than checked off.
 | `G1` | `go vet ./...` | Go static analysis |
 | `G2` | `gofmt -l .` (empty) | Go formatting |
 | `G3` | `go test -race -timeout 30s ./...` | Go units + data races |
-| `G4` | `black --check agent/` | Python formatting |
-| `G5` | `flake8 agent/` | Python style |
+| `G4` | `black --check agent/ tests/` | Python formatting |
+| `G5` | `flake8 agent/ tests/` | Python style |
 | `G6` | `mypy --strict agent/ tests/` | Strict typing |
 | M3 | Terminal validation | `TestNilPointerSafety`, `TestNoGoroutineLeak`, `TestIncidentPayloadContract` |
 | AC-2 | Corpus replay | 46 cases, 32 maskable |
@@ -374,8 +447,11 @@ reported as blocked rather than checked off.
 | Layout | `test_architecture_layout.py` | `ARCHITECTURE.md` ↔ filesystem parity, both directions |
 | Workflow | `scripts/audit_workflow.py` | CI definition audit |
 
-`mypy --strict` must be run against `agent/` **and** `tests/` together; `agent/`
-alone yields spurious `import-not-found` errors for the test fixtures.
+What the gate set does **not** cover, as of this commit: the deploy set has no
+cross-reference test. Nothing asserts that the endpoints the manifests configure
+resolve to resources the same manifests create — which is how the missing agent
+`Service` shipped. The layout validator covers the document side of that idea
+and nothing covered the manifest side.
 
 The layout validator deserves a note, because it exists because a document was
 wrong three separate times and no gate noticed. `ARCHITECTURE.md` named
