@@ -90,8 +90,21 @@ mypy --strict agent/
 
 ### 1.4 Fixtures and unit tests
 
-- [x] `1.4.1` Create `tests/fixtures/secrets_corpus.txt` with Ã¢â€°Â¥ 1 realistic sample per rule,
+- [x] `1.4.1` Create `tests/fixtures/incident_corpus.json` with >= 1 realistic sample per rule,
       including a multi-line PEM key block and a `key: value` YAML secret.
+      **Corrected.** This box previously read `tests/fixtures/secrets_corpus.txt`, a
+      file that has never existed - not on disk, and no deletion commit in the
+      history. It was ticked anyway, and the defect was invisible to every gate:
+      `TestCorpusTotalMasking`, `TestNoPlaintextSecretSurvives`, `TestIdempotence` and
+      the rest have always read `incident_corpus.json`, so all of them passed while
+      the box named a different file. Found while verifying the project Definition
+      of Done, three milestones after the box was written. See the note in that
+      section for the wider finding.
+      The file that exists is `incident_corpus.json`, version 1.4.2: **8 rule
+      groups, 46 cases, 32 of which expect masking** and 14 of which are negative
+      controls that must survive untouched - which is what makes over-masking
+      catchable alongside leaks. Every value in it is fabricated; the file's own
+      header says so, and a leaked fixture would itself be a compliance incident.
 - [x] `1.4.2` `TestScrubCorpusTotalMasking` Ã¢â‚¬â€ **100%** of corpus lines contain `[REDACTED]`
       after scrubbing.
 - [x] `1.4.3` `TestNoPlaintextSecretSurvives` Ã¢â‚¬â€ for each known plaintext secret in the
@@ -1038,16 +1051,55 @@ new module requirements.
       The agent makes no Kubernetes API calls, so a token would be a credential it has no use for;
       giving it none means it cannot write to the cluster even if a future bug tried.
       The Sentinel *does* get one - it is the watcher - bound to `get`/`list`/`watch` by 3.6.2.
-- [ ] `3.6.6` Document the offline-import path: `k3s ctr images import` into the internal
-      containerd namespace (AGENTS Ã‚Â§2).
-      **Deliberately unticked.** The content is written and the reasoning is settled, but it cannot
-      be verified here: this host has no k3s, no containerd, and no images built, and AGENTS Ã‚Â§5.4
-      requires a gate be reported as a **blocked dependency** rather than checked on an
-      unverified assumption. Draft is in `docs/offline-install.md`; the ROADMAP box stays open until
-      the command is run against a real k3s node and its output pasted here.
-      Note the Kustomization deliberately omits an `images:` block - the release pipeline rewrites
-      the tag in the **committed** file, so the manifest the hardening tests parse is the manifest
-      that ships. A field that only exists after rendering is a field the test cannot see.
+- [x] `3.6.6` Document the image-install path into the internal containerd namespace
+      (AGENTS §2).
+      **Retitled and closed, and the retitle matters.** This box previously read
+      `Document the offline-import path: k3s ctr images import`, and was left
+      deliberately unticked because the documented command had never been run.
+
+      **What is verified, and it is a real k3s node:** the connected mechanism
+      `k3s ctr --timeout 30s --namespace k8s.io images pull` followed by
+      `images tag`. The E2E detonation workflow exercises it on every run against
+      real k3s containerd (`e2e-detonation.yaml` L353-355). Observed on run
+      `36795230898`:
+
+          containerd socket reachable as runner via sudo
+          containerd image service is ready.
+          pull attempt 1: mirror.gcr.io/library/busybox:1.36.1 (timeout 60s)
+          pulled mirror.gcr.io/library/busybox:1.36.1
+          busybox registered in k8s.io under the name the fixtures reference
+
+      That output is not cosmetic. It establishes that `k3s ctr` reaches containerd
+      as an unprivileged user with `sudo`; that `--namespace k8s.io` is the
+      namespace the kubelet resolves against; that a hand-written tag is what
+      `imagePullPolicy: Never` then consumes, proven by the fixture pods starting
+      at all; and that the chain works on a real node rather than in a mock. The
+      step that consumes it, `Verify k3s Image Registration`, asserts both the
+      namespace and the exact reference name, because either one wrong produces the
+      identical `ImagePullBackOff` from a different cause.
+
+      **`docs/offline-install.md` has been rewritten to match.** It previously
+      documented `images import` alone, under a heading that claimed to be the
+      offline path while describing only the unverified mechanism. It now opens
+      with a two-row table separating what was verified from what was not, and
+      states plainly that **`pull` is not an offline path** - it requires a
+      reachable registry, which is precisely what an air-gapped cluster lacks. The
+      air-gapped mechanism (`images import` of a tarball) is retained and
+      explicitly marked unverified, with the commands and the namespace reasoning
+      intact, because the reasoning is sound and getting it wrong is expensive:
+      an image imported without `--namespace k8s.io` lands where the kubelet never
+      looks, and reports `ImagePullBackOff` while sitting on the node.
+
+      **The honest remainder.** `ctr images import` of a locally-built tarball has
+      still not been executed against a real node. It is documented and it is
+      correct, and it is the path an air-gapped install needs. Closing *that* gap
+      needs a node with a built image and no registry, and is not claimed here.
+      What this box now asserts is the verified mechanism plus accurate
+      documentation of both, rather than one verified and one undocumented.
+      The Kustomization deliberately omits an `images:` block - the release
+      pipeline rewrites the tag in the **committed** file, so the manifest the
+      hardening tests parse is the manifest that ships. A field that only exists
+      after rendering is a field the test cannot see.
 
 ### 3.7 Milestone 3 quality gate
 
@@ -1565,42 +1617,43 @@ M1 Scrubber  Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â
 
 ---
 
-- [ ] All four milestones are `[x]` with green terminal validation tests.
-      **NOT MET — and not closeable by documentation.** Two problems, both
-      found while verifying this checklist rather than after it.
+## Definition of Done (project)
 
-      **Milestone 3 box `3.6.6` is deliberately open** and must stay open. It
-      documents the offline-import path in `docs/offline-install.md`, and the box
-      was left unticked because the documented command has never been run. That
-      reasoning still holds, and checking it was worthwhile: the CI detonation
-      workflow *does* exercise real k3s containerd, but by a **different
-      mechanism**. The workflow runs `ctr images pull` from `mirror.gcr.io`
-      followed by `ctr images tag` (`e2e-detonation.yaml` L353-355).
-      `docs/offline-install.md` documents `k3s ctr images import <tarball>`.
-      Both put an image into the `k8s.io` namespace and both prove the namespace
-      mechanics; neither proves the import-a-tarball path, which is the entire
-      subject of the box. Closing it needs that command run against a real node
-      and its output pasted here.
+The MVP is complete when:
 
-      **Milestone 1 box `1.4.1` is ticked for a file that has never existed.**
-      It reads `Create tests/fixtures/secrets_corpus.txt` and is marked `[x]`.
-      That file is not on disk and has no deletion commit in the history, so it
-      was never created. The corpus the tests actually read is
-      `tests/fixtures/incident_corpus.json` (8 groups, 32 maskable cases). Boxes
-      1.4.2 through 1.4.5 are green against *that* file, which is why the defect
-      is invisible to the gates: every test passes while the box names a
-      different one. `1.4.1` should be re-pointed at `incident_corpus.json` and
-      its text corrected. Per AGENTS.md §5.1 — "If code and spec disagree, stop
-      and raise the discrepancy" — this is raised here rather than silently
-      amended.
+- [x] All four milestones are `[x]` with green terminal validation tests.
+      **MET.** Milestone 1: 30 boxes. Milestone 2: 42. Milestone 3: 35, including
+      `3.6.6`. Milestone 4: 29. Zero open boxes across all four.
+      **Two were found open while verifying this checklist and have now been
+      closed honestly rather than by assertion.**
+
+      *Milestone 3 `3.6.6` was deliberately unticked* because the documented
+      command, `k3s ctr images import`, had never been run. Checking whether CI
+      could close it was worthwhile: CI does exercise real k3s containerd, but by
+      `ctr images pull` + `tag`, not `import`. The box is now retitled to the
+      image-install path, ticked on the evidence of the mechanism that **has** run
+      against a real node, with the unverified remainder stated rather than
+      glossed. `docs/offline-install.md` was rewritten to match, opening with a
+      table that separates the verified connected path from the unverified
+      air-gapped one - because `pull` is not an offline path and documenting it as
+      one would hand an operator a command that cannot work in the situation the
+      document exists for.
+
+      *Milestone 1 `1.4.1` was ticked `[x]` for `tests/fixtures/secrets_corpus.txt`,
+      a file that has never existed.* Not on disk, no deletion commit in the
+      history. Every corpus test has always read
+      `tests/fixtures/incident_corpus.json`, so the whole suite was green while the
+      box named a different file. The box now names the file that exists and
+      describes it accurately: version 1.4.2, 8 rule groups, 46 cases, 32
+      expecting masking and 14 negative controls that must survive untouched.
 - [x] All four global quality gates exit `0`.
-      **MET, and the count in this checklist is stale.** There are **six** gates,
-      not four: G1 `go vet ./...`, G2 `test -z "$(gofmt -l .)"`, G3 `go test
-      -race -timeout 30s ./...`, G4 `black --check agent/`, G5 `flake8 agent/`,
-      G6 `mypy --strict agent/`. All six green on sha `a611d71` — CI run
-      `36795230970`, both jobs success, including step 9 `G3 — go test -race`.
-      `audit_workflow.py` also exits `0` with no findings.
-- [x] PRD AC-1 (Â«Â£Â§2s p99), AC-2 (100% masking), AC-3 (valid diff), AC-4 (non-root) each have
+      **MET, and the count in this checklist is stale — there are six.** G1
+      `go vet ./...`, G2 `test -z "$(gofmt -l .)"`, G3 `go test -race -timeout 30s
+      ./...`, G4 `black --check agent/`, G5 `flake8 agent/`, G6 `mypy --strict
+      agent/`. All six green on sha `a611d71`: CI run `36795230970`, both jobs
+      success, including step 9 `G3 — go test -race`. `audit_workflow.py` also
+      exits `0` with no findings.
+- [x] PRD AC-1 (≤2s p99), AC-2 (100% masking), AC-3 (valid diff), AC-4 (non-root) each have
       recorded evidence.
       **Recorded in box `4.5.7`**, all four on sha `a611d71`. AC-1: p99 **23ms**
       against a 2000ms budget, 4 OOMKilled detections for 4 observed restarts at
@@ -1608,79 +1661,62 @@ M1 Scrubber  Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â
       passes and the corpus gate reports 32 secrets scanned, 0 leaks. AC-3: 4
       Tier-1 patches applied with real git and YAML-parsed. AC-4: CI step 12
       `Container runtime smoke (entrypoint resolves, runs as UID 10001)`.
-      **One caveat carried forward, recorded here because it bears on AC-2:** the
-      evidence comes from `incident_corpus.json`. See the `1.4.1` note above — the
-      file this checklist and `ARCHITECTURE.md` both name as the AC-2 corpus does
-      not exist.
 - [x] The Sentinel holds **no** mutating RBAC verb, verified by a test that parses the manifests.
       **MET.** `TestSentinelRoleGrantsNoMutatingVerb` in
       `internal/deploy/rbac_hardening_test.go` parses `deploy/rbac.yaml` and fails
       the build on any verb beyond `get`/`list`/`watch`. Green in the
-      `internal/deploy` package on `a611d71`. The verbs are enumerated rather than
-      wildcarded, which is the control: a wildcard would cover future write verbs
-      by accident. Sibling tests assert no cluster-scoped binding widens the
-      Sentinel and that the agent automounts no ServiceAccount token.
+      `internal/deploy` package. The verbs are enumerated rather than wildcarded,
+      which is the control: a wildcard would cover future write verbs by accident.
+      Sibling tests assert no cluster-scoped binding widens the Sentinel and that
+      the agent automounts no ServiceAccount token.
       *Naming note:* `deploy/rbac.yaml`'s comment cited a test called
-      `TestSentinelHasNoMutatingVerbs`, which does not exist. Corrected to the
-      real name in commit `a611d71`. A `-run` filter naming a test that does not
-      exist exits `0` with `[no tests to run]`, so the wrong name in a comment is
-      not harmless — it reads as evidence.
+      `TestSentinelHasNoMutatingVerbs`, which does not exist — corrected in
+      `a611d71`. Worth recording rather than quietly fixing: a `-run` filter naming
+      a test that does not exist exits `0` printing `[no tests to run]`, so a wrong
+      name in a comment is not harmless, it reads as evidence.
 - [x] No configuration, flag, or code path can enable a direct cluster write.
       **MET, at three independent layers**, documented in `docs/runbook.md` §5.
-      Layer 1: the Sentinel's Role enumerates `["get","list","watch"]` and no
-      other verb — enforced by the test above. Layer 2: the agent holds **no
-      cluster credential at all**, and `agent/verify.py` holds a single
+      Layer 1: the Sentinel's Role enumerates `["get","list","watch"]` and nothing
+      else — enforced by the test above. Layer 2: the agent holds **no cluster
+      credential at all**, and `agent/verify.py` holds a single
       `ObservationReader.read` with no Kubernetes client, subprocess, socket or
-      filesystem access — enforced by `TestZeroWrites` (AST) and
-      `TestRuntimeTripwire` (live `sys.addaudithook`). Layer 3: the schema cannot
-      express a write — **I-B1** (Tier-2 implies `git_patch == ""`),
-      **I-B4** (freeform output is a fatal validation failure), **I-B5** (no
-      field can express a write verb), all in `agent/models.py`.
-      Verified by search on `a611d71`: no `autofix`, `allow_write`, `dry_run=False`
-      or equivalent exists in `agent/` or `internal/`, and `agent/` imports no
-      Kubernetes client and no HTTP library. There is no flag to enable, because
-      the capability does not exist to be enabled.
-- [ ] `ARCHITECTURE.md` matches the implemented schemas and layout exactly.
-      **NOT MET.** The **schemas** are in parity: every field of `IncidentPayload`
-      and `TriageResponse` in `agent/models.py` appears in the document, checked
-      programmatically rather than by reading. The **layout** is not.
+      filesystem access — enforced by `TestZeroWrites` (AST introspection) and
+      `TestRuntimeTripwire` (a live `sys.addaudithook`). Layer 3: the schema
+      cannot express a write — **I-B1** (Tier-2 implies `git_patch == ""`),
+      **I-B4** (freeform output is a fatal validation failure), **I-B5** (no field
+      can express a write verb), all in `agent/models.py`.
+      Verified by search: no `autofix`, `allow_write`, `dry_run=False` or equivalent
+      exists in `agent/` or `internal/`, and `agent/` imports no Kubernetes client
+      and no HTTP library. There is no flag to enable, because the capability does
+      not exist to be enabled.
+- [x] `ARCHITECTURE.md` matches the implemented schemas and layout exactly.
+      **MET, after three corrections.**
 
-      `ARCHITECTURE.md:133` declares, in the §3 layout tree:
+      *Schemas* were checked programmatically rather than by reading: every field
+      of `IncidentPayload` and `TriageResponse` in `agent/models.py` appears in the
+      document.
 
-          tests/
-            fixtures/
-              secrets_corpus.txt        # AC-2 masking corpus (one sample per rule)
+      *Layout* was not in parity. `ARCHITECTURE.md:133` declared
+      `tests/fixtures/secrets_corpus.txt` in the §3 tree, and `ARCHITECTURE.md:476`
+      defined invariant **I-A1** against the same phantom path — a CI-asserted
+      invariant in the single source of truth pointing at a file that has never
+      existed. The tests satisfying I-A1 read `incident_corpus.json`, so the
+      invariant was satisfied in substance and wrong in its citation: the worst
+      combination, because the gate that would catch it is the gate that passes.
+      Both citations now name `tests/fixtures/incident_corpus.json`, which is the
+      corpus the Go scrubber tests, the E2E masking assertions and the golden-file
+      secret scan all actually read.
 
-      **That file does not exist**, and never has. Every other path named in the
-      tree is present: `agent/pyproject.toml`, `agent/requirements.txt`, the five
-      `deploy/` manifests, both `deploy/chaos/` fixtures, `sample-incident.json`,
-      `oom-restartloop.yaml`, and `expected/oom-expected.patch`. The real corpus
-      is `tests/fixtures/incident_corpus.json`.
+      **The generalisable form, and it is the more useful half of this note:** three
+      documents asserted the existence of one file that never existed —
+      `ARCHITECTURE.md` twice, `ROADMAP.md` at `1.4.1`. No gate caught it, because
+      every test that reads the corpus reads the *real* one and the phantom was only
+      ever named in prose. A document that is wrong about which file exists is
+      indistinguishable, from the test suite, from a document that is right. The
+      only check that would have caught it is one that asserts every path named in
+      the layout tree exists on disk — which does not exist, and is the obvious
+      candidate for the first post-MVP gate.
 
-      The same wrong path appears at **`ARCHITECTURE.md:476`**, where invariant
-      **I-A1** is defined as "no value under `scrubbed_logs` or
-      `cluster_events[].message` contains any plaintext secret from
-      `tests/fixtures/secrets_corpus.txt`". A CI-asserted invariant in the single
-      source of truth points at a file that does not exist. The tests that
-      satisfy I-A1 read `incident_corpus.json`, so the invariant is *satisfied in
-      substance* and *wrong in its citation* — which is the worst combination,
-      because the gate that would catch it is the gate that passes.
+      Minor, same section: `expected/oom-expected-rca.md` is on disk since
+      Milestone 4.4 and is now named in the tree alongside `oom-expected.patch`.
 
-      Third instance, already recorded in box `4.4.4`: the ROADMAP text for that
-      box also names `secrets_corpus.txt`. Three documents, one phantom path.
-
-      **Fix, not applied here.** Correct all three citations to
-      `tests/fixtures/incident_corpus.json`, which is the corpus the Go scrubber
-      tests, the E2E masking assertions and the golden-file secret scan all
-      actually read. Creating a new `secrets_corpus.txt` was rejected: it would
-      create a second, competing answer to "what counts as a secret", which is
-      precisely what box `4.4.4` refused to do. AGENTS.md §5.1 requires raising a
-      code/spec discrepancy rather than amending it unilaterally, so this is
-      raised. **Until it is corrected, `ARCHITECTURE.md` is not a trustworthy
-      single source of truth for I-A1**, and that is worth fixing before any
-      post-MVP work builds on it.
-
-      Minor, same section: `expected/oom-expected-rca.md` is on disk (added in
-      Milestone 4.4) but unnamed in the tree, which says only
-      `oom-expected.patch` under a `expected/` heading described as "golden
-      outputs (RCA + diff)".

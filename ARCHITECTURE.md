@@ -130,11 +130,12 @@ SREK3S/
 │
 └── tests/
     └── fixtures/
-        ├── secrets_corpus.txt        # AC-2 masking corpus (one sample per rule)
+        ├── incident_corpus.json      # AC-2 masking corpus (8 rule groups, 32 maskable cases)
         ├── sample-incident.json      # canonical valid Incident Payload
         ├── oom-restartloop.yaml      # manifest an OOM diff must patch
         └── expected/                 # golden outputs (RCA + diff) for regression
             └── oom-expected.patch
+            └── oom-expected-rca.md
 ```
 
 ### 3.1 Layout Rules
@@ -237,7 +238,7 @@ string field; there is no flag to disable scrubbing.
 ### 4.2 Invariants (CI-asserted)
 
 1. **I-A1** No value under `scrubbed_logs` or `cluster_events[].message` contains any
-   plaintext secret from `tests/fixtures/secrets_corpus.txt`.
+   plaintext secret from `tests/fixtures/incident_corpus.json`.
 2. **I-A2** If `reason == "OOMKilled"` then `exit_code == 137` and `resource_limits.memory_limit`
    is non-null.
 3. **I-A3** If `reason == "CrashLoopBackOff"` then `exit_code` may be `null` but
