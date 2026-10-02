@@ -41,6 +41,7 @@ import classifier
 import llm
 import patch as patch_engine
 import prompt
+import providers
 import rescan
 import warroom
 from classifier import (
@@ -281,7 +282,7 @@ def _narrative_overlay(
     volume ever makes this matter, the fix is a per-request cache keyed on
     ``incident_id`` — not a hidden parameter.
     """
-    client = llm.gemini_client_from_env()
+    client = providers.provider_from_env()
     if client is None:
         return None
     try:

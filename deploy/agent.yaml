@@ -93,6 +93,37 @@ spec:
               value: /manifests
 
             # -------------------------------------------------------------------------
+            # MODEL TRANSPORT SELECTION (ARCH §5.5.4)
+            #
+            # The model is advisory: it can only write the prose in a Tier-2
+            # explanation a human already has to read. Tier, patch and every
+            # validation flag are computed deterministically and are unaffected
+            # by anything below.
+            #
+            # `LLM_PROVIDER` picks the transport and defaults to `gemini`, which
+            # is the behaviour that shipped before the abstraction existed —
+            # an operator who changes nothing sees nothing change.
+            #
+            # `LLM_BASE_URL` repoints the OpenAI-protocol adapter at a self-hosted
+            # server, e.g. `http://ollama.srek3s-system.svc:11434/v1` or a vLLM
+            # endpoint. THIS IS NOT WIRE-THROUGH BY DEFAULT: the NetworkPolicy at
+            # the bottom of this file permits egress on TCP 443 to 0.0.0.0/0 and
+            # nothing else, so a local server on Ollama's default 11434 or vLLM's
+            # 8000 is refused by the network, not by this code. Widening that rule
+            # is an egress decision with a real blast radius, so it is stated here
+            # rather than made silently. An empty value means "the provider's own
+            # default endpoint" and is the correct setting for a hosted API.
+            #
+            # No key is required for a local endpoint. One IS required for a
+            # hosted one, and `provider_from_env()` returns nothing without it,
+            # which degrades the narrative and never the service.
+            # -------------------------------------------------------------------------
+            - name: LLM_PROVIDER
+              value: gemini
+            - name: LLM_BASE_URL
+              value: ""
+
+            # -------------------------------------------------------------------------
             # GEMINI_API_KEY — THE MODEL CREDENTIAL
             #
             # Read from a Secret, never from a literal. A value in this file would be
@@ -108,8 +139,14 @@ spec:
             # an operator who wants no model at all cannot run the agent, which is
             # the wrong default: the deterministic path is complete and needs no
             # credential. With `optional: true` an absent Secret leaves the variable
-            # unset, `llm.gemini_client_from_env()` returns None, and every tier,
+            # unset, `providers.provider_from_env()` returns None, and every tier,
             # patch and validation flag behaves exactly as it did before this existed.
+            #
+            # `OPENAI_API_KEY` is the same idea for the OpenAI-protocol adapter and
+            # belongs in this same Secret when that provider is selected. It is not
+            # declared here because an operator using `LLM_PROVIDER=openai` adds
+            # the reference in the same commit that changes the provider, so the
+            # two settings can never disagree silently.
             #
             # CREATE THE SECRET (it is deliberately NOT in this repository):
             #

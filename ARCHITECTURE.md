@@ -178,7 +178,8 @@ SREK3S/
 │   ├── main.py                   # FastAPI app factory; lifespan; hardening
 │   ├── models.py                 # ★ SCHEMA SOURCE OF TRUTH (Pydantic v2)
 │   ├── classifier.py             # deterministic tier routing
-│   ├── llm.py                    # constrained-decoding client
+│   ├── llm.py                    # constrained-decoding client; the model boundary
+│   ├── providers.py              # model adapters: Gemini + OpenAI-protocol (LLM_PROVIDER)
 │   ├── patch.py                  # unified diff synthesis + apply-check validation
 │   ├── sandbox.py                # ephemeral worker, cgroup budget, monotonic deadline
 │   ├── warroom.py                # Tier-2 dispatch payload
@@ -548,6 +549,12 @@ Open task in `ROADMAP.md`. Do not write work that assumes the loop is live.
 
 ### 5.5.2 `agent/llm.py` is a validation boundary with an optional Gemini client
 
+> **Annotated 2026-10-01.** The description below is the record of how this module shipped, and is
+> left as written. The transport has since moved to `agent/providers.py` and is selectable with
+> `LLM_PROVIDER`; `llm.py` is now provider-agnostic and delegates client construction to that
+> module. Every property asserted in this section still holds, and §5.5.4 records what is new.
+> `GeminiCompletionClient` remains in `llm.py` as the historical entry point.
+
 `agent/llm.py` owns the boundary a model crosses. **As shipped and as wired on 2026-10-01,
 the model is not on the decision path**: the deterministic Tier-1 classifier and the tier
 router both run ahead of any model consultation (§5.3), and the Gemini client is reached only
@@ -681,6 +688,40 @@ degrades to a bad paragraph inside a Tier-2 escalation that a human already owns
 real client was a change to the §1 trust boundary and was reviewed as one; it is recorded here
 because a reader who meets the client in `agent/llm.py` needs to know it exists and what it
 is not allowed to decide.
+
+### 5.5.4 The model transport is an adapter, and the boundary is upstream of it
+
+Added 2026-10-01. `agent/llm.py` remains the boundary; `agent/providers.py` holds the transports
+and holds nothing else.
+
+**Why.** The section above is explicit that the model is advisory — it can only write Tier-2
+prose. An advisory component still being welded to one vendor's SDK is a coupling with no upside:
+two hosted providers exist, self-hosted ones are common in clusters with no outbound egress, and a
+swap that requires editing `agent/` is a swap that will not happen. `LLM_PROVIDER` makes it a
+deployment value.
+
+**What did not change, and is the reason this is safe to add at all.** Four properties are
+enforced identically by every adapter, and each is structural rather than advisory:
+
+| Property | Enforcement |
+|---|---|
+| Rules never share a string with the evidence | The provider's *own* system field — `system_instruction=` for Gemini, a `role: "system"` message for the OpenAI protocol. Untrusted telemetry is attacker-controlled text; "put the rules first in the prompt" is not a defence. |
+| The model can return only prose | Both dialects are derived from `llm.NARRATIVE_FIELDS`, not typed out per provider, so they cannot drift. A model has no field in which to return a tier or a patch. |
+| The decoder is the last line | `llm.decode_narrative` validates the result regardless of what the provider honoured. A provider behaviour is not a safety property this repository takes on trust. |
+| Every failure is the same failure | Each adapter raises `llm.ModelOutputError` for every cause; the caller returns nothing and the deterministic prose stands. |
+
+`LLM_BASE_URL` repoints the OpenAI-protocol adapter at a local Ollama, vLLM or LM Studio endpoint.
+**A caveat that is not a code change:** `deploy/agent.yaml` grants egress on **TCP 443 to
+`0.0.0.0/0`** and nothing else, so a local server on Ollama's default `11434` or vLLM's `8000` will
+be refused by the NetworkPolicy. Widening that rule is an egress decision with a blast radius, so it
+is stated here rather than made silently in the manifest.
+
+**Two honest limitations of the OpenAI adapter.** Local servers differ in whether they honour
+`response_format` at all; where they ignore it, the request still carries it and the decoder still
+validates the result, so the outcome degrades to a validated unconstrained answer rather than an
+unvalidated one. And this protocol has no equivalent of Gemini's `thinking_budget`, so a reasoning
+model would spend the shared token ceiling the way the Gemini comment in `providers.py` warns
+about.
 
 ### 5.5.3 Sandbox enforcement: rlimits are primary, and the cgroup write lands too late
 

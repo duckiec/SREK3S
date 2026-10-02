@@ -30,6 +30,22 @@ httpx>=0.27.0
 # spelling does. See the SDK-choice note in agent/llm.py.
 google-genai>=2.0.0
 
+# Model client for the OpenAI-protocol adapter (agent/providers.py), which is
+# what removes the vendor lock-in: it also covers any self-hosted server
+# speaking the same chat-completions protocol.
+#
+# `LLM_BASE_URL` repoints it at a local Ollama, vLLM or LM Studio endpoint, so a
+# cluster with no outbound egress can still produce the Tier-2 narrative. No
+# weights ship and no GPU runtime is pulled, so the ARCH §2 prohibition is
+# unaffected — the CI job greps for GPU dependencies and this line does not
+# match any of them.
+#
+# Both SDKs are imported LAZILY inside their adapter's `complete()`, so a host
+# with neither installed, or with no API key, still imports agent/llm.py, still
+# triages, and still answers /healthz. A missing model degrades the narrative,
+# never the service.
+openai>=1.40.0
+
 # --- quality gates (AGENTS.md §4: G4, G5, G6) ---------------------------
 # These are gates, not optional extras. They are pinned here so the local
 # environment and CI install the same tools.
