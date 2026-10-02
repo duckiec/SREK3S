@@ -1656,32 +1656,86 @@ jobs:
           # 127.0.0.1 - so this is the only thing in the repository that would
           # have failed on v1.0.0.
           #
-          # The probe exits 0 on success and 1 after its own 120s deadline, so a
-          # DNS failure or a policy refusal is a pod that never reaches Ready and
-          # is reported as such. `rollout status` is the check; the probe's own
-          # stdout carries the status code and body for the receipt.
-          if ! kubectl -n srek3s-system rollout status deployment/srek3s-route-probe \
-               --timeout=300s; then
-            echo "::error::the routing probe never succeeded against http://srek3s-agent:8000"
-            echo "--- probe logs ---"
-            kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=40 || true
-            echo "--- agent logs ---"
-            kubectl -n srek3s-system logs deployment/srek3s-agent --tail=40 || true
-            exit 1
-          fi
+          # WAIT FOR THE PROBE'S RESULT. Do not use `rollout status` as the check.
+          #
+          # The previous version of this step did exactly that, and its comment
+          # claimed it worked: "a DNS failure or a policy refusal is a pod that
+          # never reaches Ready and is reported as such. `rollout status` is the
+          # check." That is false. The probe has no readinessProbe, so its pod is
+          # Ready the moment the container starts - it cannot be "not Ready", and
+          # rollout status never waits for the answer the probe exists to give.
+          #
+          # Measured against a real cluster with a pod of the same shape (no
+          # readinessProbe, sleeps, prints one JSON line):
+          #
+          #     rollout status returned after 2s
+          #     logs: '<empty>'
+          #     grep for '"ok": true' -> no match
+          #     ... 60s later the line appears
+          #
+          # So the step asserted against an empty stream and failed. Not
+          # intermittently - the probe cannot finish in the milliseconds between
+          # rollout returning and the grep running. The probe's own deadline is
+          # 120s and this step read its output at t+2s.
+          #
+          # The probe's stdout IS the check, so the workflow waits for it. The
+          # deadline here exceeds the probe's own 120s so the probe is always
+          # allowed to report, including a failure, rather than being cut off.
+          probe_deadline=$((SECONDS + 180))
+          probe_line=""
+          while [ "$SECONDS" -lt "$probe_deadline" ]; do
+            # Current container, then the previous one: the probe exits 1 on
+            # failure and this Deployment restarts it (restartPolicy Always), so
+            # a reported failure can be one restart behind by the time this runs.
+            probe_line=$(kubectl -n srek3s-system logs deployment/srek3s-route-probe \
+                           --tail=20 2>/dev/null || true)
+            if [ -z "$probe_line" ]; then
+              probe_line=$(kubectl -n srek3s-system logs deployment/srek3s-route-probe \
+                             --previous --tail=20 2>/dev/null || true)
+            fi
+            case "$probe_line" in *'"ok":'*) break ;; esac
+            sleep 5
+          done
+
+          case "$probe_line" in
+            *'"ok":'*) ;;
+            *)
+              echo "::error::the routing probe produced no verdict within 180s"
+              echo "--- probe logs (current) ---"
+              kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=40 || true
+              echo "--- probe logs (previous) ---"
+              kubectl -n srek3s-system logs deployment/srek3s-route-probe --previous --tail=40 || true
+              echo "--- agent logs ---"
+              kubectl -n srek3s-system logs deployment/srek3s-agent --tail=40 || true
+              echo "--- probe pod state ---"
+              kubectl -n srek3s-system get pods -l srek3s.io/probe=true -o wide || true
+              exit 1
+              ;;
+          esac
 
           echo "--- probe output ---"
-          kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=5
+          echo "$probe_line"
 
           # And the direct contract, so the receipt carries a real status code
           # rather than only a rollout result.
-          kubectl -n srek3s-system logs deployment/srek3s-route-probe \
-            | grep -q '"ok": true' || {
+          #
+          # Matched with `case`, never `echo | grep -q`: grep -q exits the moment
+          # it matches, echo takes SIGPIPE, and under `pipefail` the pipeline then
+          # reports failure. That is not hypothetical - the workflow auditor names
+          # it as GREP_Q_PIPE and cites this repository's own history, where it
+          # reported a present image as missing. A verdict that can be inverted by
+          # a signal is not a verdict.
+          case "$probe_line" in
+            *'"ok": true'*)
+              echo "in-cluster DNS resolved srek3s-agent and the agent answered /healthz"
+              ;;
+            *)
               echo "::error::the probe reported failure"
-              kubectl -n srek3s-system logs deployment/srek3s-route-probe --tail=20 || true
+              echo "--- agent logs ---"
+              kubectl -n srek3s-system logs deployment/srek3s-agent --tail=40 || true
               exit 1
-            }
-          echo "in-cluster DNS resolved srek3s-agent and the agent answered /healthz"
+              ;;
+          esac
 
       - name: "E2E-IN: build and import the Sentinel image into k3s containerd"
         timeout-minutes: 20

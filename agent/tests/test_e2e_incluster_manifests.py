@@ -295,6 +295,75 @@ def test_every_configmap_the_overlay_mounts_is_one_the_workflow_creates() -> Non
     )
 
 
+def _e2e_step(fragment: str) -> str:
+    """The `run:` body of the one e2e job step whose name contains `fragment`."""
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "e2e-detonation.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    matches = [
+        step["run"]
+        for job in (workflow.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+        if fragment in step.get("name", "")
+    ]
+    assert (
+        len(matches) == 1
+    ), f"expected one step matching {fragment!r}, got {len(matches)}"
+    body: str = matches[0]
+    return body
+
+
+def test_the_route_probe_verdict_is_waited_for_and_not_assumed() -> None:
+    """The probe reports by stdout, so the workflow has to wait for the stdout.
+
+    The probe is a one-shot script that retries for up to 120s and then prints
+    one JSON line. It has no readinessProbe, and that is not an oversight to be
+    tidied — it means its pod is Ready the moment the container starts, so
+    `rollout status` returns in about two seconds with nothing to say about
+    whether the agent answered.
+
+    The step did exactly that and then grepped the logs. Measured on a real
+    cluster with a pod of the same shape: rollout returned at t+2s, the logs were
+    empty, and the probe's line appeared sixty seconds later. So the assertion
+    read an empty stream and failed. Deterministically — the probe cannot finish
+    in the gap between rollout returning and the grep running.
+
+    The step's own comment asserted the opposite, which is why it survived
+    review: "a DNS failure or a policy refusal is a pod that never reaches Ready
+    and is reported as such. `rollout status` is the check." A pod with no
+    readinessProbe cannot fail to reach Ready.
+
+    So this asserts the agreement rather than the symptom: if the probe signals
+    by stdout, the workflow must poll for that stdout, and must not name
+    `rollout status` as the verdict.
+    """
+    probe = next(
+        document
+        for document in load(OVERLAY / "extra-resources.yaml")
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "srek3s-route-probe"
+    )
+    containers = probe["spec"]["template"]["spec"]["containers"]
+    assert not any("readinessProbe" in c for c in containers), (
+        "the route probe now has a readinessProbe, so `rollout status` would "
+        "genuinely gate on its verdict. This test is what forced the workflow to "
+        "poll instead; if the probe gained a readinessProbe, update both."
+    )
+
+    step = _e2e_step("assert in-cluster DNS routes")
+    assert "rollout status deployment/srek3s-route-probe" not in step, (
+        "the step treats `rollout status` as the probe's verdict, but the probe "
+        "has no readinessProbe so rollout returns before the probe has printed "
+        "anything; the grep then runs against an empty stream"
+    )
+    assert "sleep 5" in step and "probe_deadline" in step, (
+        "the step must poll for the probe's verdict with a bounded deadline; "
+        "reading the logs once asserts against whatever happens to be there yet"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The base is the real deploy set
 # ---------------------------------------------------------------------------
