@@ -66,8 +66,16 @@ kind: Kustomization
 
 namespace: srek3s-system
 
-commonLabels:
-  app.kubernetes.io/part-of: srek3s
+# includeSelectors: false, for the reason spelled out at length in
+# deploy/kustomization.yaml. `commonLabels` implies `includeSelectors: true`,
+# which rewrites NetworkPolicy `podSelector` and `ingress[].from[].podSelector`
+# as a side effect of wanting a convenience label. A transform that can decide
+# who may reach the triage endpoint is not a convenience.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: srek3s
+    includeSelectors: false
+    includeTemplates: true
 
 resources:
   # Order is load-bearing, not alphabetical: namespace, then credentials, then

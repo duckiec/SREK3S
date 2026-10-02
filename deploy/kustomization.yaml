@@ -19,8 +19,51 @@ kind: Kustomization
 
 namespace: srek3s-system
 
-commonLabels:
-  app.kubernetes.io/part-of: srek3s
+# app.kubernetes.io/part-of: srek3s, WITH EXPLICIT BOUNDS.
+#
+# `commonLabels` was here until 2026-10-02. It is sugar for
+#
+#     labels: [{pairs: {...}, includeSelectors: true}]
+#
+# and `includeSelectors: true` is the whole problem. It rewrites every selector
+# in the rendered output: Service `spec.selector`, Deployment
+# `spec.selector.matchLabels`, and — the one that bites — NetworkPolicy
+# `podSelector` and `ingress[].from[].podSelector`.
+#
+# It cost two debugging cycles to find, and it did so silently, in a security
+# boundary, twice:
+#
+#   1. It widened the agent Service's selector to require
+#      `app.kubernetes.io/part-of: srek3s`, a label the raw deploy files do not
+#      carry. Every test reads the raw files, so every test described a selector
+#      no cluster is given. Mixing the two apply paths then produced a Service
+#      selecting on two labels and pods carrying one: both agent pods Running,
+#      uvicorn on 0.0.0.0:8000, `get endpoints` returning `<none>`, and every
+#      connection refused with Errno 111.
+#
+#   2. It widened the agent's ingress rule to
+#      `from: {name: srek3s-sentinel, part-of: srek3s}`. The e2e route probe
+#      impersonates the Sentinel precisely so that rule admits it — it carries
+#      `app.kubernetes.io/name: srek3s-sentinel` and nothing else. The probe was
+#      therefore not admitted, and the leg that exists to prove the Sentinel can
+#      reach the agent could not reach the agent.
+#
+# Both are the same defect: a selector whose contents are decided by a transform
+# rather than by the file that owns the object. `includeSelectors: false` makes
+# every selector in this repository exactly what the file says it is.
+#
+# includeTemplates stays true, so `part-of` still reaches pod template labels —
+# which is a convenience, not a boundary, and is harmless because nothing
+# selects on it implicitly any more.
+#
+# The rule this enforces, and which test_no_kustomization_injects_into_selectors
+# now holds the door open on: A SELECTOR NEVER DEPENDS ON A TRANSFORM. If a
+# selector needs a label, the file that owns the object writes it.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: srek3s
+    includeSelectors: false
+    includeTemplates: true
 
 resources:
   # Order: namespace, then credentials, then workloads, then the Service.

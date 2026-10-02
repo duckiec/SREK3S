@@ -86,12 +86,21 @@ kind: Kustomization
 # global `namespace:` in an overlay that spans two namespaces is always a bug waiting
 # for the second namespace to be added.
 #
-# commonLabels is likewise applied to both namespaces, which is intended: the chaos
-# namespace carries app.kubernetes.io/part-of: srek3s so a `part-of=srek3s` sweep
-# finds the fixtures alongside the components.
+# app.kubernetes.io/part-of: srek3s, applied to BOTH namespaces and — this is the
+# part that matters — to no selector in either. `includeSelectors: false`, for
+# the reason spelled out at length in deploy/kustomization.yaml: `commonLabels`
+# implies `includeSelectors: true`, and a transform that rewrites NetworkPolicy
+# selectors is a transform that can silently decide who may reach the agent.
+#
+# The chaos namespace still gets `part-of: srek3s` so a `part-of=srek3s` sweep
+# finds the fixtures alongside the components. That is the whole of what is
+# wanted from it.
 
-commonLabels:
-  app.kubernetes.io/part-of: srek3s
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: srek3s
+    includeSelectors: false
+    includeTemplates: true
 
 # ---------------------------------------------------------------------------
 # WHY THE BASE IS A SIBLING DIRECTORY, NOT `../..`

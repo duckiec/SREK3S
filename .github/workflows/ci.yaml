@@ -223,6 +223,21 @@ jobs:
           cache: pip
           cache-dependency-path: agent/requirements.txt
 
+      - name: Set up kustomize (renders the manifests the tests assert on)
+        uses: azure/setup-kustomize@v4
+        with:
+          # Pinned, like every other action in this file. The tests render
+          # deploy/ and assert against the OUTPUT rather than the raw files,
+          # because kustomize transforms what a cluster is given and reading the
+          # input cannot see it. `commonLabels` hid two defects in NetworkPolicy
+          # selectors that way — one of which made the e2e route probe unable to
+          # reach the agent it exists to prove it can reach.
+          #
+          # If this step is removed, the render-based tests FAIL rather than skip.
+          # A silently skipped render would be the false green this was added to
+          # eliminate.
+          kustomize-version: v5.4.3
+
       - name: Install agent dependencies
         run: |
           python -m pip install --upgrade pip

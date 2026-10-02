@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shutil
+import subprocess
 from typing import Any
 
 import pytest
@@ -218,87 +220,228 @@ def _is_servable_api_version(value: object) -> bool:
     return value.count("/") == 1 and all(part for part in value.split("/"))
 
 
-def _common_label_keys() -> set[str]:
-    """Keys from the deploy base's `commonLabels`, which kustomize injects.
+def _kustomize_command() -> list[str]:
+    """The render command, or a loud failure.
 
-    `commonLabels` is `labels: [{pairs: ..., includeSelectors: true}]`. It is
-    added to object metadata, to pod template labels, AND — the part that matters
-    — to every `spec.selector`: a Service's and a Deployment's.
+    These tests assert on what kustomize PRODUCES, because the two defects that
+    mattered most in this leg were both invisible in the source files: a
+    Service selector and a NetworkPolicy `from` rule that a transform had widened
+    behind the tests' back. Reading the input cannot see that.
+
+    Deliberately not a skip. A render-based assertion that quietly degrades to a
+    no-op when the binary is absent is exactly the false green this replaced —
+    the tests would keep passing while asserting nothing. `ci.yaml` installs
+    kustomize explicitly so this never fires there; it fires for a developer who
+    has not, and it tells them what to install.
     """
-    base = yaml.safe_load((DEPLOY / "kustomization.yaml").read_text(encoding="utf-8"))
-    return set(base.get("commonLabels") or {})
+    for command in (["kustomize", "build"], ["kubectl", "kustomize"]):
+        if shutil.which(command[0]):
+            return command
+    raise AssertionError(
+        "neither `kustomize` nor `kubectl` is on PATH, so these tests cannot "
+        "assert on rendered output. They FAIL rather than skip, because a "
+        "silently-unrendered assertion is the false green this suite exists to "
+        "prevent. Install kustomize (https://kubectl.docs.kubernetes.org/"
+        "installation/kustomize/) and re-run."
+    )
 
 
-def test_common_labels_are_already_present_where_kustomize_will_inject_them() -> None:
-    """The rendered selector must be the one the raw-file tests can read.
+def render(directory: pathlib.Path) -> list[dict[str, Any]]:
+    """Every object kustomize produces for `directory`."""
+    completed = subprocess.run(
+        [*_kustomize_command(), str(directory)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"kustomize failed on {directory.relative_to(REPO_ROOT)}:\n"
+        f"{completed.stderr.strip()}"
+    )
+    return [doc for doc in yaml.safe_load_all(completed.stdout) if doc]
 
-    deploy/kustomization.yaml sets `commonLabels: {app.kubernetes.io/part-of:
-    srek3s}`. Kustomize injects that key into every selector, so the Service the
-    cluster is actually given selects on
 
-        {app.kubernetes.io/name: srek3s-agent, app.kubernetes.io/part-of: srek3s}
+@pytest.fixture(scope="module")
+def rendered_overlay() -> list[dict[str, Any]]:
+    """The incluster overlay as the cluster receives it."""
+    return render(OVERLAY)
 
-    while deploy/service.yaml as a file says
 
-        {app.kubernetes.io/name: srek3s-agent}
+def _netpol(documents: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    return next(
+        d
+        for d in documents
+        if d.get("kind") == "NetworkPolicy" and d["metadata"]["name"] == name
+    )
 
-    Those are different selectors. Every assertion in this repository reads the
-    raw files, so all of them describe a selector that no cluster is given, and
-    none of them can notice that the effective selector is a second label wider.
 
-    That gap is not theoretical. Applying deploy/agent.yaml directly and then
-    applying the overlay — both perfectly valid things to do — yields a Service
-    selecting on two labels and pods carrying one, because kustomize cannot widen
-    a Deployment's `spec.selector` (it is immutable) and so updates only half the
-    pair. Result on a real cluster: both agent pods Running and Ready, uvicorn on
-    0.0.0.0:8000, `get endpoints` returning `<none>`, and every connection refused
-    with `Errno 111` — which is what kube-proxy returns for a ClusterIP with no
-    ready endpoints, and is *not* what this NetworkPolicy stack produces for a
-    policy denial (that is a timeout, measured).
+def _workload_labels(documents: list[dict[str, Any]], name: str) -> dict[str, str]:
+    return next(
+        d["spec"]["template"]["metadata"]["labels"]
+        for d in documents
+        if d.get("kind") == "Deployment" and d["metadata"]["name"] == name
+    )
 
-    The invariant is therefore that the commonLabels keys already exist wherever
-    kustomize is going to put them. When they do, the raw selector and the
-    rendered selector are the same selector, so a test that reads the file is
-    testing the thing that ships.
+
+def _selected_by(selector: dict[str, Any], labels: dict[str, Any]) -> bool:
+    return bool(selector) and all(labels.get(k) == v for k, v in selector.items())
+
+
+def test_no_kustomization_may_inject_anything_into_a_selector() -> None:
+    """A selector's contents are decided by its own file. Always runs.
+
+    `commonLabels` is sugar for `labels: [{includeSelectors: true}]`, and
+    `includeSelectors: true` rewrites Service selectors, Deployment selectors,
+    NetworkPolicy `podSelector`, and NetworkPolicy `ingress[].from[].podSelector`
+    — the last being a security boundary nobody chose to change.
+
+    It cost two debugging cycles here. Once on the agent Service, producing a
+    ClusterIP with no ready endpoints (`Errno 111`) behind a perfectly healthy
+    agent; once on the agent's ingress rule, so the e2e route probe — which
+    impersonates the Sentinel precisely to be admitted — was not admitted, and
+    the leg that exists to prove the Sentinel can reach the agent could not
+    reach the agent.
+
+    This asserts the absence of the mechanism in every kustomization in the
+    repository, with no kustomize binary required, so it cannot be defeated by a
+    tool being absent.
     """
-    common = _common_label_keys()
-    assert common, "the deploy base declares no commonLabels; this test is inert"
+    offenders: list[str] = []
+    for path in sorted(REPO_ROOT.rglob("kustomization.yaml")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        where = path.relative_to(REPO_ROOT)
 
-    missing: list[str] = []
+        if "commonLabels" in document:
+            offenders.append(
+                f"{where}: commonLabels implies includeSelectors: true and "
+                "rewrites every selector in the rendered output"
+            )
+        for entry in document.get("labels") or []:
+            if entry.get("includeSelectors") is not False:
+                offenders.append(
+                    f"{where}: labels entry {entry.get('pairs')} does not say "
+                    "includeSelectors: false, so kustomize may rewrite selectors"
+                )
+    assert not offenders, "; ".join(offenders)
+
+
+def test_the_rendered_agent_admits_the_rendered_impersonating_fixtures(
+    rendered_overlay: list[dict[str, Any]],
+) -> None:
+    """The admission test, against the output rather than the input.
+
+    This replaces an assertion that read deploy/agent.yaml and
+    extra-resources.yaml and passed while the probe was refused. It passed
+    because `commonLabels` had widened the rule to
+    `from: {name: srek3s-sentinel, part-of: srek3s}` in the rendered output while
+    both raw files still said one label. The rule that decides who may reach the
+    triage endpoint was therefore never the thing the test looked at.
+
+    Rendered, it is the thing that exists in the cluster.
+    """
+    policy = _netpol(rendered_overlay, "srek3s-agent-egress")
+    admitted = policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+
+    # Both fixtures impersonate the Sentinel to be admitted. The probe exists to
+    # prove in-cluster DNS reaches the agent; the capture proxy exists to stand
+    # between the Sentinel and the agent so the chain is observable.
+    for fixture in ("srek3s-route-probe", "srek3s-capture"):
+        labels = _workload_labels(rendered_overlay, fixture)
+        assert _selected_by(admitted, labels), (
+            f"the rendered agent ingress rule selects on {admitted}, and the "
+            f"rendered {fixture} carries {labels}. It would be refused by the "
+            "cluster. A fixture that impersonates the Sentinel must satisfy the "
+            "rule as RENDERED, not as written."
+        )
+
+    # And the rule must still be narrow: it admits the Sentinel, and nothing else.
+    assert admitted == {"app.kubernetes.io/name": "srek3s-sentinel"}, (
+        f"the agent's rendered ingress rule is {admitted}; it is expected to "
+        "admit exactly the Sentinel. Anything wider is a change to who may reach "
+        "the triage endpoint and must be a deliberate edit, not a side effect."
+    )
+
+
+def test_every_rendered_service_selector_matches_rendered_pod_labels(
+    rendered_overlay: list[dict[str, Any]],
+) -> None:
+    """A Service selecting nothing is a valid object and a total outage.
+
+    Rendered, because that is where the selectors come from.
+    """
+    workloads = {
+        d["metadata"]["name"]: d["spec"]["template"]["metadata"].get("labels", {})
+        for d in rendered_overlay
+        if d.get("kind") in ("Deployment", "StatefulSet", "DaemonSet")
+    }
+    orphans = []
+    for service in (d for d in rendered_overlay if d.get("kind") == "Service"):
+        selector = service["spec"].get("selector") or {}
+        matched = [n for n, l in workloads.items() if _selected_by(selector, l)]
+        if not matched:
+            orphans.append(f"{service['metadata']['name']} selects on {selector}")
+    assert not orphans, (
+        "rendered Services that select on no rendered pod, so they publish no "
+        f"endpoints and every connection is refused: {orphans}"
+    )
+
+
+def test_no_selector_changes_between_its_file_and_the_render(
+    rendered_overlay: list[dict[str, Any]],
+) -> None:
+    """The general form of the bug: the render must not widen a selector.
+
+    This is the assertion that would have caught both halves. It compares every
+    Service selector and NetworkPolicy selector in deploy/ against the same
+    selector in the rendered overlay. Any future transform that touches one shows
+    up here as a difference, by name.
+    """
+    raw_selectors: dict[tuple[str, str], Any] = {}
     for path in sorted(DEPLOY.glob("*.yaml")):
         if path.name == "kustomization.yaml":
             continue
         for document in load(path):
-            kind = document.get("kind")
-            name = document.get("metadata", {}).get("name", "?")
-            where = f"{path.relative_to(REPO_ROOT)} {kind}/{name}"
-
+            kind, name = document.get("kind"), document.get("metadata", {}).get("name")
             if kind == "Service":
-                selector = document.get("spec", {}).get("selector") or {}
-                absent = sorted(common - set(selector))
-                if absent:
-                    missing.append(
-                        f"{where}: selector is missing {absent}; kustomize will "
-                        "add them, so the rendered Service selects on more than "
-                        "this file says and no test reads the real selector"
-                    )
-            if kind in ("Deployment", "StatefulSet", "DaemonSet"):
-                labels = (
-                    document.get("spec", {})
-                    .get("template", {})
-                    .get("metadata", {})
-                    .get("labels", {})
-                )
-                absent = sorted(common - set(labels))
-                if absent:
-                    missing.append(
-                        f"{where}: pod template labels are missing {absent}, so a "
-                        "Service that selects on them matches nothing"
-                    )
+                raw_selectors[("Service", name)] = document["spec"].get("selector")
+            elif kind == "NetworkPolicy":
+                spec = document["spec"]
+                raw_selectors[("NetworkPolicy.podSelector", name)] = spec.get(
+                    "podSelector", {}
+                ).get("matchLabels")
+                for rule in spec.get("ingress") or []:
+                    for peer in rule.get("from") or []:
+                        raw_selectors[("NetworkPolicy.from", name)] = peer.get(
+                            "podSelector", {}
+                        ).get("matchLabels")
 
-    assert not missing, (
-        "kustomize will inject commonLabels into selectors, making the effective "
-        "selector wider than the file every test reads: " + "; ".join(missing)
+    assert raw_selectors, "no selectors found in deploy/; the comparison is inert"
+
+    rendered: dict[tuple[str, str], Any] = {}
+    for document in rendered_overlay:
+        kind, name = document.get("kind"), document.get("metadata", {}).get("name")
+        if kind == "Service":
+            rendered[("Service", name)] = document["spec"].get("selector")
+        elif kind == "NetworkPolicy":
+            spec = document["spec"]
+            rendered[("NetworkPolicy.podSelector", name)] = spec.get(
+                "podSelector", {}
+            ).get("matchLabels")
+            for rule in spec.get("ingress") or []:
+                for peer in rule.get("from") or []:
+                    rendered[("NetworkPolicy.from", name)] = peer.get(
+                        "podSelector", {}
+                    ).get("matchLabels")
+
+    differing = {
+        f"{kind}/{name}: file={raw_selectors[(kind, name)]} rendered={rendered[(kind, name)]}"
+        for (kind, name) in raw_selectors
+        if (kind, name) in rendered
+        and rendered[(kind, name)] != raw_selectors[(kind, name)]
+    }
+    assert not differing, (
+        "a transform changed these selectors between the file and the render, so "
+        "the cluster is not running what the file says: " + "; ".join(differing)
     )
 
 
