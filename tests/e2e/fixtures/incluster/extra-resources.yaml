@@ -353,10 +353,27 @@ spec:
   revisionHistoryLimit: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: srek3s-route-probe
+      # `srek3s.io/probe`, NOT `app.kubernetes.io/name: srek3s-sentinel`.
+      #
+      # A Deployment's selector must be a subset of its own template labels, and
+      # the template label below is deliberately the IMPERSONATED one — the probe
+      # carries the Sentinel's name so deploy/agent.yaml's ingress policy admits
+      # it. Selecting on that would be rejected at apply time with
+      # "`selector` does not match template `labels`", which is how this object
+      # failed: the label and the selector were the same requirement written twice,
+      # in two places, and only one of them was satisfiable.
+      #
+      # `srek3s.io/probe` is the probe's own identity and is what the capture
+      # Deployment above already selects on (`srek3s.io/capture`), so the two
+      # fixtures now use the same shape: a fixture-private label selects, and the
+      # impersonated label rides along on the template for admission only.
+      srek3s.io/probe: "true"
   template:
     metadata:
       labels:
+        # See the identity note above. This label is what admits the pod to the
+        # agent's ingress policy, and it is deliberately NOT what the Deployment
+        # selects on.
         app.kubernetes.io/name: srek3s-sentinel
         srek3s.io/probe: "true"
     spec:

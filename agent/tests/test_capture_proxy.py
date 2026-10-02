@@ -484,7 +484,19 @@ class _Fake:
 
 
 def _start(handler: Any) -> _Fake:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    # Same backlog as the proxy under test, and for the same reason.
+    #
+    # The stdlib default is 5. This test opens 24 concurrent connections, so the
+    # accept queue overflows and the kernel resets one before a response is
+    # written. That surfaces as `assert len(lines) == 24` failing with 23 — an
+    # assertion about *torn writes* reporting a *dropped connection*, which is the
+    # wrong diagnosis sent to whoever reads the failure. It passed locally and
+    # failed on a loaded CI runner, which is the signature of a backlog problem
+    # rather than of a locking problem.
+    class _Server(ThreadingHTTPServer):
+        request_queue_size = 128
+
+    server = _Server(("127.0.0.1", 0), handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

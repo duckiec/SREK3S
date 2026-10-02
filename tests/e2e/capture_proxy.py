@@ -282,6 +282,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(status, body, "application/json")
 
 
+class _BackloggedHTTPServer(ThreadingHTTPServer):
+    """A ThreadingHTTPServer whose listen backlog is not the stdlib default of 5.
+
+    ``socketserver.TCPServer.request_queue_size`` is 5, and that value is passed
+    straight to ``listen()``. Anything arriving beyond the accept queue is not
+    queued for later — the kernel completes or resets the connection instead. A
+    proxy sitting in the middle of a burst of incidents is exactly the case where
+    a burst is expected, so the default is too small for the job.
+
+    The failure this prevents is quiet and wrong-shaped: the client sees a reset
+    rather than a response, concludes the proxy is down, and the incident goes
+    unreported. A capture instrument that drops traffic under load is worse than
+    one that is absent, because it looks like it worked.
+    """
+
+    request_queue_size = 128
+
+
 def serve(
     *,
     output: pathlib.Path,
@@ -309,7 +327,7 @@ def serve(
             "counter": 0,
         },
     )
-    server = ThreadingHTTPServer((listen_host, listen_port), handler)
+    server = _BackloggedHTTPServer((listen_host, listen_port), handler)
     server.daemon_threads = True
     return server
 
