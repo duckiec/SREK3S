@@ -50,7 +50,24 @@
 # A fixture that granted *more* would be worse than useless: it would make the
 # run's read-only evidence describe the fixture rather than the thing shipped, and
 # a reader would have no way to tell.
-apiVersion: rbac.authorization.k8s.io
+# apiVersion carries the VERSION, not just the group. A bare
+# `rbac.authorization.k8s.io` maps to nothing:
+#
+#   resource mapping not found for name: "srek3s-sentinel" namespace:
+#   "sentinel-chaos": no matches for kind "Role" in version
+#   "rbac.authorization.k8s.io"
+#
+# The trailing hint kubectl prints with that — "ensure CRDs are installed
+# first" — is wrong and actively misleading here. Role is a built-in, served by
+# every cluster since 1.8; there is no CRD to install and no cluster
+# configuration that would fix it. Anyone who reads the hint will go install a
+# CRD and change nothing.
+#
+# This was wrong here once already. It was the only defect in this file, and it
+# survived a full offline suite, a kustomize render, and a review that read it
+# as "moved verbatim". test_every_fixture_object_names_a_servable_api_version
+# now fails a group-only apiVersion without a cluster.
+apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: srek3s-sentinel
@@ -70,7 +87,7 @@ rules:
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
 ---
-apiVersion: rbac.authorization.k8s.io
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: srek3s-sentinel

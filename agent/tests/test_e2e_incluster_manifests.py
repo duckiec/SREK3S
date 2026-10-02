@@ -155,6 +155,68 @@ def agent_deployment() -> dict[str, Any]:
     return one(load(DEPLOY / "agent.yaml"), "Deployment")
 
 
+def _applied_manifests() -> list[tuple[pathlib.Path, dict[str, Any]]]:
+    """Every object this repository hands to `kubectl apply`.
+
+    Both the shipped deploy set and the e2e fixture overlay, because both are
+    applied to a real cluster and neither is generated.
+    """
+    found: list[tuple[pathlib.Path, dict[str, Any]]] = []
+    for root in (DEPLOY, OVERLAY):
+        for path in sorted(root.rglob("*.y*ml")):
+            if path.name == "kustomization.yaml":
+                continue  # not applied directly; its `resources:` are checked elsewhere
+            for document in load(path):
+                found.append((path, document))
+    return found
+
+
+def test_every_applied_object_names_a_servable_api_version() -> None:
+    """apiVersion must carry group AND version, and every kind must have one.
+
+    `rbac.authorization.k8s.io` is a group with no version and maps to nothing:
+
+        resource mapping not found for name: "srek3s-sentinel" namespace:
+        "sentinel-chaos": no matches for kind "Role" in version
+        "rbac.authorization.k8s.io"
+
+    That defect was in this repository, in a file written minutes earlier, and it
+    survived a 908-test offline suite, a clean `kubectl kustomize` render, and a
+    review that described the file as "moved verbatim". Nothing offline can catch
+    it, because the file is well-formed YAML and every structural test here reads
+    `kind` rather than `apiVersion`.
+
+    Which is the point of asserting it. The rule Kubernetes actually applies is
+    narrow and checkable without a cluster: an apiVersion is either the bare
+    string `v1` (the core group) or exactly one `/` separating group from
+    version. A group-only value has no version to resolve and can never be
+    served, by any cluster, under any configuration.
+
+    The `kubectl` hint printed alongside the real failure — "ensure CRDs are
+    installed first" — sends the reader after a CRD that does not and cannot
+    exist for a built-in kind. Catching the shape here is what stops that hunt.
+    """
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}: {document.get('apiVersion')!r} "
+        f"({document.get('kind')})"
+        for path, document in _applied_manifests()
+        if not _is_servable_api_version(document.get("apiVersion"))
+    ]
+    assert not offenders, (
+        "an apiVersion that is neither 'v1' nor 'group/version' can never be "
+        f"served; kubectl reports these as 'resource mapping not found' and "
+        f"misleadingly suggests installing CRDs: {offenders}"
+    )
+
+
+def _is_servable_api_version(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if value == "v1":  # the core group is spelled without a slash
+        return True
+    return value.count("/") == 1 and all(part for part in value.split("/"))
+
+
 # ---------------------------------------------------------------------------
 # The base is the real deploy set
 # ---------------------------------------------------------------------------
