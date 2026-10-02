@@ -223,20 +223,77 @@ jobs:
           cache: pip
           cache-dependency-path: agent/requirements.txt
 
-      - name: Set up kustomize (renders the manifests the tests assert on)
-        uses: azure/setup-kustomize@v4
-        with:
-          # Pinned, like every other action in this file. The tests render
-          # deploy/ and assert against the OUTPUT rather than the raw files,
-          # because kustomize transforms what a cluster is given and reading the
-          # input cannot see it. `commonLabels` hid two defects in NetworkPolicy
-          # selectors that way — one of which made the e2e route probe unable to
-          # reach the agent it exists to prove it can reach.
-          #
-          # If this step is removed, the render-based tests FAIL rather than skip.
-          # A silently skipped render would be the false green this was added to
-          # eliminate.
-          kustomize-version: v5.4.3
+      - name: Install kustomize (the tests assert on RENDERED manifests)
+        # 3 minutes for a ~5MB download and an extraction. Bounded because the
+        # repository's own workflow auditor requires every blocking step to carry
+        # its own timeout-minutes, and the job budget is a backstop rather than a
+        # control: a hung curl should not be able to eat the job's whole 12.
+        timeout-minutes: 3
+        # Not an action. `azure/setup-kustomize` was here and was removed: it
+        # could not be resolved, and the failure mode was a job that died at
+        # "Set up job" with no test output at all — the worst possible place for
+        # a broken dependency, because it reads like the tests failed.
+        #
+        # A third-party action is also the wrong instrument for one static
+        # binary. This pulls the release artifact from kubernetes-sigs — the
+        # upstream project that builds it — over plain HTTPS, and VERIFIES IT.
+        #
+        # Both the version and the SHA-256 are pinned. The version alone is not
+        # pinning: an asset at a fixed URL can be replaced, and a compromised
+        # release would be executed by every future run of this workflow. The
+        # digest below is what makes the download safe, and it is why both
+        # architectures are listed explicitly rather than computed — the values
+        # are transcribed from the release's own checksums.txt, which is
+        # verifiable by anyone:
+        #
+        #   https://github.com/kubernetes-sigs/kustomize/releases/download/
+        #     kustomize%2Fv5.4.3/checksums.txt
+        #
+        #   3669470b...7a7  kustomize_v5.4.3_linux_amd64.tar.gz
+        #   1b515578...381c kustomize_v5.4.3_linux_arm64.tar.gz
+        #
+        # Bumping KUSTOMIZE_VERSION means bumping BOTH digests, or this step
+        # fails. That is the intended friction.
+        #
+        # If this step is removed or breaks, the render-based tests in
+        # agent/tests/test_e2e_incluster_manifests.py FAIL rather than skip. A
+        # silently unrendered assertion is the false green this replaced.
+        env:
+          KUSTOMIZE_VERSION: v5.4.3
+          KUSTOMIZE_SHA256_AMD64: 3669470b454d865c8184d6bce78df05e977c9aea31c30df3c669317d43bcc7a7
+          KUSTOMIZE_SHA256_ARM64: 1b515578b0af12c15d9856720066ce2fe66756d63785b2cbccaf2885beb2381c
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64|amd64) arch=amd64; digest="$KUSTOMIZE_SHA256_AMD64" ;;
+            aarch64|arm64) arch=arm64; digest="$KUSTOMIZE_SHA256_ARM64" ;;
+            *)
+              echo "::error::unsupported runner architecture $(uname -m);" \
+                "add it here with its digest rather than guessing one"
+              exit 1
+              ;;
+          esac
+
+          # The tag contains a slash (kustomize/v5.4.3); %2F is how a path
+          # segment encodes one. Verified against the release, not assumed.
+          asset="kustomize_${KUSTOMIZE_VERSION}_linux_${arch}.tar.gz"
+          url="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${asset}"
+
+          echo "fetching ${url}"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+               --retry 3 --retry-delay 2 --max-time 120 \
+               --output "/tmp/${asset}" "$url"
+
+          # Verify before extracting, never after: a tarball that fails its digest
+          # must not have the chance to place anything on PATH first.
+          echo "${digest}  /tmp/${asset}" | sha256sum --check --strict -
+          tar --extract --gzip --file "/tmp/${asset}" --directory /usr/local/bin kustomize
+
+          # Prove the binary is the one that was verified. `version` failing here
+          # would mean the tarball contained something else entirely.
+          kustomize version
+          kustomize build --help >/dev/null
 
       - name: Install agent dependencies
         run: |

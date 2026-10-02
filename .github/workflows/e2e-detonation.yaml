@@ -1812,7 +1812,23 @@ jobs:
           # is only authorised because extra-resources.yaml grants the Sentinel's
           # ServiceAccount a read-only Role there - deploy/rbac.yaml grants one in
           # srek3s-system only, which is the gap the runbook now documents.
-          kubectl -n sentinel-chaos patch deployment srek3s-sentinel --type=strategic -p '{
+          #
+          # The patch namespace is `srek3s-system`, NOT `sentinel-chaos`. The
+          # Sentinel's Deployment is created by the overlay in `srek3s-system`,
+          # and it is scoped to the chaos namespace at RUNTIME via its
+          # `-namespace` flag. Those are two different things, and conflating them
+          # was this step's bug:
+          #
+          #     Error from server (NotFound): deployments.apps "srek3s-sentinel"
+          #       not found
+          #
+          # because it looked for the Deployment where it does not live, while the
+          # rollout assertion two lines below correctly used `srek3s-system`.
+          # The step contradicted itself and the patch failed first.
+          #
+          # It went unnoticed because the leg had never reached this step: it died
+          # earlier, every run, for six commits.
+          kubectl -n srek3s-system patch deployment srek3s-sentinel --type=strategic -p '{
             "spec": {"template": {"spec": {"containers": [
               {"name": "sentinel", "env": [
                 {"name": "SREK3S_AGENT_URL", "value": "http://srek3s-capture:8000"}
