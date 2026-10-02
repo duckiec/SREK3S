@@ -35,10 +35,35 @@ name: e2e-detonation
 # against a real k3s node rather than by this job.
 
 on:
+  # Push to main is UNCONDITIONAL, and deliberately has no `paths:` filter. This
+  # is the only trigger that matters for the thing the workflow exists to catch:
+  # a change that reaches a real cluster. Filtering it would mean a commit that
+  # alters the deployed behaviour could merge without the live leg ever running.
   push:
     branches: [main]
   pull_request:
     branches: [main]
+    # SCOPE, added 2026-10-02.
+    #
+    # A dependency bump cannot change what this workflow proves. It detonates a
+    # real OOM on a real cluster and checks that a real incident, a real scrub,
+    # a real triage and a real `git apply` all still line up — and none of that
+    # moves when `golang.org/x/net` is bumped. Yet every Dependabot PR targets
+    # main, so the workflow fired on each one and spent a full k3s install,
+    # image build and cluster teardown to learn nothing.
+    #
+    # This is also what keeps a bot out: a Dependabot PR that touches only
+    # go.mod/go.sum matches none of these paths, so it is never queued at all.
+    # The job-level `if:` on `detonation` covers the case a paths filter cannot:
+    # a bot PR that DOES touch agent/requirements.txt, which `paths` alone would
+    # let through.
+    paths:
+      - 'agent/**'
+      - 'deploy/**'
+      - 'internal/**'
+      - 'cmd/**'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e-detonation.yaml'
   workflow_dispatch:
     inputs:
       observation_window:
@@ -74,6 +99,18 @@ env:
 jobs:
   detonation:
     name: E2E detonation (k3s, real OOM, real patch)
+
+    # Bot PRs never run the live leg, even the ones a `paths:` filter lets
+    # through. `push` and `workflow_dispatch` are unaffected because they are not
+    # pull requests — so a merged bump, or an operator re-running this by hand,
+    # still gets the full leg.
+    #
+    # `github.actor` is the account that *opened* the PR, which for Dependabot is
+    # `dependabot[bot]` even when a human later pushes commits onto the branch.
+    # Filtering on the head branch's owner would miss that; filtering on the
+    # actor would not, so the actor is what is checked.
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+
     runs-on: ubuntu-latest
     # Generous, because the observation window alone is 90s and cluster startup on
     # a shared runner is not fast. A timeout here is indistinguishable from a
@@ -1396,28 +1433,74 @@ jobs:
           AGENT_IMAGE="registry.internal/srek3s-agent:0.1.0"
 
           # The build context is the repository root, not agent/. Same reason
-          # AGENTS.md gives: the Dockerfile needs agent/ and its config.
+          # the house rules give: the Dockerfile needs agent/ and its config.
           docker build -t "$AGENT_IMAGE" -f agent/Dockerfile .
 
           docker save "$AGENT_IMAGE" -o /tmp/srek3s-agent.tar
 
-          # --namespace k8s.io, not --all-namespaces. This cluster is already
-          # running with images pulled into k8s.io, so the explicit namespace is
-          # the idempotent form: the import lands where kubelet actually looks
-          # and is visible in `images list` afterwards. docs/offline-install.md
-          # records both forms and says which is which; this is Mechanism B's
-          # repeated-import case, and it remains the unverified one.
-          sudo k3s ctr --timeout 120s --namespace k8s.io images import \
-            /tmp/srek3s-agent.tar --namespace k8s.io
+          # DISK, checked before the import rather than discovered by it.
+          #
+          # `ctr images import` writes every blob into containerd's content store
+          # and THEN writes the image record that gives the image its name. When
+          # the volume fills during unpacking, that first phase still reports
+          # "unpacking ... done" and the name is never registered — which is
+          # exactly the observed symptom: exit 0, nothing in `images list`.
+          #
+          # This is a *candidate* cause, not an established one. What is
+          # established is the shape of the failure, and the space check below
+          # turns it into a message that says "the disk was full" instead of
+          # leaving the next person to infer it.
+          AVAIL_MB=$(df -Pm /var/lib/rancher 2>/dev/null | awk 'NR==2 {print $4}')
+          if [ -n "${AVAIL_MB:-}" ] && [ "$AVAIL_MB" -lt 4096 ]; then
+            echo "::warning::only ${AVAIL_MB}MB free under /var/lib/rancher; the"
+            echo "::warning::image import writes blobs before it writes the name"
+            echo "::warning::record, and a full volume loses the name silently."
+          fi
 
-          # The effect, not the exit status. `ctr images import` exiting 0 has
-          # been observed to land the image somewhere kubelet never reads, which
-          # presents as ImagePullBackOff with no other symptom. So the tag is
-          # confirmed present and qualified in the namespace that matters.
-          if ! sudo k3s ctr --timeout 30s --namespace k8s.io images list \
-               | grep -qF "$AGENT_IMAGE"; then
+          # `--namespace k8s.io` ONCE, as ctr's own global flag.
+          #
+          # It was previously passed twice — once before the subcommand and once
+          # after the tarball. That second copy was NOT a bug: `--namespace` is a
+          # persistent root flag that subcommands inherit, so a repeat parses and
+          # is a no-op. Verified against the node's ctr
+          # (github.com/k3s-io/containerd/v2 v2.3.4-k3s1.36): both spellings
+          # reach the same error. Removing it is tidiness, not a fix, and the log
+          # says so rather than letting a future reader assume the duplicate flag
+          # caused an outage it did not.
+          sudo k3s ctr --namespace k8s.io --timeout 120s images import /tmp/srek3s-agent.tar
+
+          # THE EFFECT, NOT THE EXIT STATUS — and an assertion that can FAIL.
+          #
+          # `ctr images import` exiting 0 has been observed to land the image
+          # somewhere kubelet never reads, which presents as ImagePullBackOff with
+          # no other symptom.
+          #
+          # NOT `ctr images check "name==..."`, which is the obvious tool for this
+          # and is WRONG. Verified against this node's ctr
+          # (github.com/k3s-io/containerd/v2 v2.3.4-k3s1.36): `images check`
+          # prints nothing and exits 0 for an image that does not exist. It is not
+          # an assertion. Adopting it would have replaced a check that had already
+          # caught this exact failure five times with one that could never fail —
+          # and it would have reported "registered" for an image that was absent,
+          # which is the failure this step exists to prevent.
+          #
+          # `images list -q` emits one ref per line with no table formatting, so
+          # `grep -qxF` is an exact whole-line match that column padding or a
+          # truncated terminal cannot defeat. Both directions were verified on a
+          # real node before this was committed: a present image passes, an absent
+          # one takes the failure branch.
+          #
+          # The `default` namespace is dumped on failure because "the image landed
+          # in the wrong namespace" is the cheapest hypothesis and was previously
+          # indistinguishable from "the image did not land at all". That ambiguity
+          # is why this failed repeatedly before anyone could diagnose it.
+          if ! sudo k3s ctr --namespace k8s.io --timeout 30s images list -q \
+               | grep -qxF "$AGENT_IMAGE"; then
             echo "::error::$AGENT_IMAGE is not present in the k8s.io namespace"
-            sudo k3s ctr --timeout 30s --namespace k8s.io images list || true
+            echo "--- k8s.io (where kubelet looks) ---"
+            sudo k3s ctr --namespace k8s.io --timeout 30s images list || true
+            echo "--- default (did it land in the wrong namespace?) ---"
+            sudo k3s ctr --namespace default --timeout 30s images list || true
             exit 1
           fi
           echo "agent image registered in k8s.io as $AGENT_IMAGE"
