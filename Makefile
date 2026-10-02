@@ -245,6 +245,39 @@ check: test build ## Gates then images
 # `--load` is incompatible with a multi-platform build, so building several
 # platforms at once requires `--output type=oci` and a load step elsewhere. That is
 # why PLATFORM is a single value here and `make push-multiarch` is separate.
+#
+# CROSS-ARCHITECTURE BUILDS ARE ASYMMETRIC, AND NOT BY ACCIDENT
+# -----------------------------------------------------------
+# Setting PLATFORM to an architecture other than the host's behaves differently for
+# the two images, which surprises people who assume buildx treats them alike.
+#
+#   make build-sentinel PLATFORM=linux/amd64
+#     Works on an arm64 host with NO emulator. cmd/sentinel/Dockerfile pins its Go
+#     stage to `FROM --platform=$BUILDPLATFORM` and cross-compiles with
+#     GOARCH=$TARGETARCH, so the Go toolchain runs natively and emits a foreign-
+#     architecture binary. Verified on an aarch64 host with zero binfmt handlers:
+#     the image reports Architecture=amd64 and /bin/sentinel is
+#     `ELF 64-bit LSB executable, x86-64, statically linked`.
+#
+#   make build-agent PLATFORM=linux/amd64
+#     Needs an emulator. agent/Dockerfile's `FROM python:3.11-slim` must run the
+#     TARGET's interpreter to install the TARGET's wheels. Forcing
+#     --platform=$BUILDPLATFORM there would install arm64 wheels into an image
+#     labelled linux/amd64 — the install SUCCEEDS, the label is a lie, and the
+#     failure appears at pod start as an `Illegal instruction`, long after the
+#     build reported success. That trade is not worth taking to avoid an emulator.
+#
+# Without binfmt_misc handlers the agent build fails with
+#
+#     exec /bin/sh: exec format error
+#
+# which reads as a broken Dockerfile rather than a missing host capability.
+# `make doctor` reports it as a WARNING with the remedy, because it is only
+# required by cross-architecture builds — `make build`, `make test` and
+# `make deploy` all use the host architecture and are unaffected.
+#
+#   docker run --privileged --rm tonistiigi/binfmt --install all
+#
 .PHONY: build
 build: build-sentinel build-agent ## Build both images with buildx (host arch by default)
 

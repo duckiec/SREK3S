@@ -177,6 +177,51 @@ else
     remedy "On Linux this ships with Docker; on Docker Desktop it is built in."
     remedy "Otherwise install the buildx plugin."
   fi
+
+  # ---------------------------------------------------------------------------
+  # EMULATION, and why it is a warning and not a requirement.
+  # ---------------------------------------------------------------------------
+  # Only ONE of the two images needs it, and only when cross-building:
+  #
+  #   cmd/sentinel/Dockerfile  the Go stage is `FROM --platform=$BUILDPLATFORM`
+  #                            and cross-compiles with GOARCH=$TARGETARCH. A
+  #                            linux/amd64 Sentinel builds on an arm64 host with
+  #                            no emulator at all. Verified: the image reports
+  #                            Architecture=amd64 and the binary is
+  #                            `ELF 64-bit LSB executable, x86-64`.
+  #
+  #   agent/Dockerfile         `FROM python:3.11-slim` must run the TARGET's
+  #                            interpreter to install the TARGET's wheels.
+  #                            Forcing --platform=$BUILDPLATFORM would install
+  #                            arm64 wheels into an image labelled linux/amd64:
+  #                            the install SUCCEEDS, the label is a lie, and the
+  #                            failure appears at pod start as an
+  #                            `Illegal instruction`. So the agent genuinely
+  #                            needs binfmt_misc handlers when the target
+  #                            architecture differs from the host's.
+  #
+  # Without a handler that build fails with a message that explains nothing:
+  #
+  #     exec /bin/sh: exec format error
+  #
+  # which reads as a broken Dockerfile rather than a missing host capability.
+  # So it is reported here, where there is room to explain it.
+  #
+  # A WARNING, never a failure. Every native build — which is what `make build`
+  # does by default, and what all of `make test` and `make deploy` depend on —
+  # is completely unaffected. Failing a pre-flight over a capability that only
+  # one optional target needs would train people to ignore this script.
+  if [ -d /proc/sys/fs/binfmt_misc ] && ls /proc/sys/fs/binfmt_misc/qemu-* >/dev/null 2>&1; then
+    pass "binfmt     qemu handlers registered"
+  else
+    warn "no binfmt_misc/qemu handlers: cross-architecture AGENT builds will fail"
+    remedy "Native builds are unaffected — 'make build', 'make test', 'make deploy'."
+    remedy "The Sentinel cross-compiles with no emulator; only the agent needs one,"
+    remedy "because it must install wheels for the TARGET architecture."
+    remedy "To enable emulation (Linux only, needs privileged):"
+    remedy "  docker run --privileged --rm tonistiigi/binfmt --install all"
+    remedy "Docker Desktop has this on by default."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
