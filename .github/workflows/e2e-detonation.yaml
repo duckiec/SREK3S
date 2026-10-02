@@ -1510,6 +1510,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          # THE NAMESPACE FIRST. This step was the deterministic failure on `main`
+          # for five consecutive commits, and the error named nothing useful:
+          #
+          #     Error from server (NotFound): error when creating "STDIN":
+          #       namespaces "srek3s-system" not found
+          #
+          # Cause: this step names `srek3s-system`, but nothing created it until the
+          # NEXT step, which is where `kubectl apply -k fixtures/incluster` pulls
+          # `deploy/namespace.yaml` in through the overlay base. The fixture
+          # overlay's own header says "namespace.yaml from the base is applied
+          # before anything names the namespace" — which is the intended ordering,
+          # and which the step order did not implement. The assertion that caught
+          # it was the ConfigMap existence check, correctly, three lines too late.
+          #
+          # Applied from the real `deploy/namespace.yaml`, never a vendored copy: a
+          # copy could drift from the manifest carrying the PSA labels this leg is
+          # meant to exercise, and a test of a copy proves nothing. `kubectl apply`
+          # is idempotent, so the overlay in the next step reconciles it.
+          kubectl apply -f deploy/namespace.yaml
+
           # --from-file, not a committed ConfigMap body. The script that runs
           # in-cluster is then byte-identical to the one the offline tests
           # import and the host-process leg runs. A transcribed copy would be a
