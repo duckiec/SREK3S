@@ -127,7 +127,22 @@ spec:
               value: deploy/chaos/oom-leak.yaml
       volumes:
         # `manifests` is the shipped emptyDir and is deliberately not repeated.
+        #
+        # The ConfigMap name must match what the workflow actually creates:
+        # srek3s-agent-gitops. It was `srek3s-agent-manifests` here, which read
+        # better and was wrong, and the result was a pod that hung in `Init:0/1`
+        # for the full eight-minute step timeout with no IP, no restarts and no
+        # message: kubelet cannot mount a ConfigMap that does not exist, so the
+        # init container never starts and never fails. Nothing reports it as
+        # missing; the pod simply never becomes ready.
+        #
+        # The workflow's own existence assertion passed throughout, because it
+        # checked the two names it creates — and neither was the one anything
+        # mounted. A green assertion about a name nothing uses.
+        #
+        # test_every_configmap_the_overlay_mounts_is_one_the_workflow_creates
+        # now ties the two files together, so the names cannot drift apart again.
         - name: manifest-source
           configMap:
-            name: srek3s-agent-manifests
+            name: srek3s-agent-gitops
             defaultMode: 0444

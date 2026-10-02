@@ -26,6 +26,7 @@ objects at once.
 from __future__ import annotations
 
 import pathlib
+import re
 from typing import Any
 
 import pytest
@@ -215,6 +216,83 @@ def _is_servable_api_version(value: object) -> bool:
     if value == "v1":  # the core group is spelled without a slash
         return True
     return value.count("/") == 1 and all(part for part in value.split("/"))
+
+
+def _configmaps_mounted_by_the_overlay() -> dict[str, list[str]]:
+    """``{configmap name: [objects that mount it]}`` across the whole overlay."""
+    mounted: dict[str, list[str]] = {}
+    for path in sorted(OVERLAY.glob("*.yaml")):
+        if path.name == "kustomization.yaml":
+            continue
+        for document in load(path):
+            where = f"{document.get('kind')}/{document.get('metadata', {}).get('name')}"
+            for volume in _walk(
+                document.get("spec", {})
+                .get("template", {})
+                .get("spec", {})
+                .get("volumes", [])
+            ):
+                name = (volume.get("configMap") or {}).get("name")
+                if name:
+                    mounted.setdefault(name, []).append(where)
+    return mounted
+
+
+def _configmaps_the_workflow_creates() -> set[str]:
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "e2e-detonation.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    bodies = "\n".join(
+        step.get("run", "")
+        for job in (workflow.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+    )
+    return set(re.findall(r"create\s+configmap\s+(\S+)", bodies))
+
+
+def _walk(node: object) -> list[dict[str, Any]]:
+    """Every dict in a nested structure, so volumes are found at any depth."""
+    if isinstance(node, dict):
+        return [node] + [d for child in node.values() for d in _walk(child)]
+    if isinstance(node, list):
+        return [d for child in node for d in _walk(child)]
+    return []
+
+
+def test_every_configmap_the_overlay_mounts_is_one_the_workflow_creates() -> None:
+    """The overlay and the workflow must agree on every ConfigMap name.
+
+    This is the defect class the module docstring says it cannot see, seen
+    anyway. Nearly every check here asserts a property of a single document, so
+    a name that has to match across two files is exactly what nothing covered.
+
+    It shipped as: the workflow created `srek3s-agent-gitops`, the patch mounted
+    `srek3s-agent-manifests`, and the two had never been in the same file. The
+    agent pod then sat in `Init:0/1` for the full eight-minute step timeout with
+    no IP, no restarts and no message, because kubelet cannot mount a ConfigMap
+    that does not exist — the init container never starts and so never fails.
+
+    What makes it worth a test rather than a fix is that the workflow's own
+    existence assertion passed the whole time. It checked the two names it
+    creates, and neither was the one anything mounted: green, correct, and
+    irrelevant. An assertion that verifies a name nothing depends on is worse
+    than no assertion, because it is read as coverage.
+
+    Every ConfigMap the overlay mounts must therefore be created by the e2e job.
+    """
+    created = _configmaps_the_workflow_creates()
+    mounted = _configmaps_mounted_by_the_overlay()
+
+    assert mounted, "the overlay mounts no ConfigMap at all; the scan is broken"
+    orphans = {name: users for name, users in mounted.items() if name not in created}
+    assert not orphans, (
+        "the overlay mounts ConfigMaps the e2e job never creates; kubelet cannot "
+        "mount a missing ConfigMap, so the pod stays in Init:0/1 until the step "
+        f"times out with no diagnostic. Not created by the workflow: {orphans}. "
+        f"The workflow creates: {sorted(created)}"
+    )
 
 
 # ---------------------------------------------------------------------------
