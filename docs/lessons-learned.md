@@ -1490,3 +1490,136 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   the moment the uncommon-but-legal one appears, and it fails in a way that
   misattributes the cause. `valueFrom` is not exotic; it is how every credential
   enters a pod.
+
+## 28. A Runbook Describing A Defect That Was Fixed Four Milestones Ago (v1.0.2)
+
+- **What happened:** `docs/runbook.md` §1 was rewritten to be scannable. Before
+  restructuring it, five places still asserted that `deploy/sentinel.yaml` ships
+  `WATCH_NAMESPACE: ""` and that the deployment "cannot watch anything" as
+  committed. That was true when written. It stopped being true when the base
+  manifest was changed to `srek3s-system` to match the namespaced `Role` — which is
+  the fix recorded as `ENV-2.1`. The runbook was never revisited, so for four
+  milestones it instructed a reader to go fix a defect that no longer existed, using
+  a procedure for a condition that could no longer be observed.
+
+- **Why it is a problem:** The cost is not the wasted reading time. It is that the
+  runbook's whole argument for §1 — "if you see silence, suspect the scope/grant
+  mismatch" — rested on the base state being broken. With the base fixed, the
+  correct advice is the *pairing* ("compare these two fields"), and a reader who
+  followed the stale text would have widened the watch scope to reproduce a defect
+  they believed was still open, thereby **causing** the exact silence the section
+  warns about. Documentation that is stale in the direction of a false alarm is
+  worse than documentation that is absent, because it gets acted on.
+
+- **How we fixed it:** All five sites rewritten to describe the invariant instead of
+  the incident: the two fields agree as committed, breaking the pairing is silent,
+  here is the field to compare, here is the assertion that now enforces it. The
+  historical defect is described rather than deleted — `ENV-2.1` in `ROADMAP.md` and
+  §26 of this file are the record, and neither is amended. The troubleshooting row
+  in §6 was changed from a `kubectl auth can-i` invocation to a two-field
+  comparison, because the command answered a question about the old state.
+
+- **The generalisable form:** Fixing a defect and documenting the fix are separate
+  acts, and only the first one has a test. A guard proves a *manifest* is correct;
+  nothing proves a *document* still describes that manifest, because prose has no
+  assertion to fail. When a fix changes shipped state, searching for the places
+  that describe that state is part of the fix, not a follow-up — and
+  `grep -rn '<the-old-value>' --include='*.md'` finds them in seconds, which a
+  careful re-read of 1,492 lines of prose does not.
+
+- **Also recorded, because it is the same defect in a different medium:** while
+  fixing the runbook, the corrected text cited
+  `test_the_watch_scope_is_inside_the_granted_namespace` as the assertion enforcing
+  the pairing. **That test did not exist.** It had been intended in a previous cycle
+  and never written, and the sentence asserting it was a fabrication with a
+  plausible-looking name in it — the exact shape `AGENTS.md` §5.7 warns about. It
+  was caught only because the name was grepped before being trusted. The test was
+  then written, given a negative control, and plant-tested against the real manifest
+  (§29). **A documentation claim about a test is a claim that can be checked in one
+  command, and the fact that it reads like its neighbours is not a reason to skip
+  the check.**
+
+## 29. A Negative Control That Duplicated The Assertion Instead Of Exercising It (v1.0.2)
+
+- **What happened:** The first version of the control for the watch-scope guard
+  (`test_control_watch_scope_check_fails_on_an_ungranted_scope`) built its own
+  offender list inline:
+
+      offenders = [ns for ns in ("", *sorted(granted)) if not ns.strip()]
+      assert offenders == [""]
+
+  and then separately asserted that `"sentinel-chaos"` was not granted. It passed.
+  It was also worthless: the inline list comprehension shares no code with the real
+  comparison, so the control proved that *the control's own copy* of the logic
+  detects an empty scope. It would have passed unchanged if the real
+  `ungranted_scopes()` were deleted outright.
+
+- **Why it is a problem:** This is the vacuous-control trap in its purest form, and
+  it is attractive precisely because it looks thorough — it has a fixture, an
+  injected value, and an assertion. What it lacks is the one property that makes a
+  control worth having: that it fails when the thing it guards fails. A control
+  carrying its own logic is a second opinion nobody asked for, and it raises the
+  count of green tests without raising the count of verified behaviour.
+
+- **How we fixed it:** Extracted the comparison into
+  `ungranted_scopes(scope, granted) -> list[str]`, called by both the real test and
+  the control, so the control exercises the shipped function with the value that
+  actually shipped (`""`) rather than an invented stand-in. It now also asserts the
+  **positive** case — that a granted namespace is *not* flagged — because a
+  comparison that flags everything passes a negative control perfectly while flagging
+  a correct deployment as broken on every run.
+
+  The in-file control was still not sufficient evidence, so the guard was
+  additionally **plant-tested**: `deploy/sentinel.yaml` was edited in place to carry
+  the historical `value: ""`, the real test was run, and it failed; the file was
+  then restored with `git checkout --` rather than an in-memory copy, so an
+  interrupted run leaves a dirty tree instead of a clean-looking wrong one. Observed
+  result: `1 failed, 25 deselected` while planted, `2 passed, 24 deselected` after
+  restore, and the restored file compared byte-identical to the committed one.
+
+- **The generalisable form:** A negative control must exercise the unit under test,
+  not paraphrase it — if deleting the real function leaves the control passing, the
+  control is measuring itself. And a control that proves only *failure is
+  detectable* is half a control: a guard that fails closed on everything satisfies it
+  perfectly while being useless, so the control needs a case the guard must
+  **pass**.
+
+## 30. `git checkout --` In A Plant Script Ate Four Milestones Of Uncommitted Work (v1.0.2)
+
+- **What happened:** To prove the new documentation-link guard was not vacuous, a
+  script planted a broken anchor in `docs/runbook.md`, ran the test, and then
+  restored the file with `git checkout -- docs/runbook.md`. That runbook was
+  **715 lines of unstaged edits** — a navigation table, a condensed RBAC section,
+  three corrected stale passages. Every one of them was discarded. The restore came
+  from the *index*, which still held the committed revision, so the file went back
+  four milestones into the past and `git status` showed a clean, confident, wrong
+  file.
+
+- **Why it is a problem:** `git checkout --` reads as "undo my temporary edit" and
+  is actually "restore this path to the index". Those coincide only when the file
+  has no uncommitted changes, which is exactly the case a plant test does **not**
+  guarantee — a plant test is run specifically when the file is being worked on.
+  The failure is silent, the script exits 0, and the printout says "restored":
+  identical to committed = False, but only because the comparison happened to be
+  there. Without that line, four milestones of work would have been reported as
+  restored and discovered later, or not at all. The earlier plant on
+  `deploy/sentinel.yaml` succeeded with the same code **because that file had no
+  unstaged edits** — the technique was validated by luck and then reused.
+
+- **How we fixed it:** The runbook edits were redone and verified with marker
+  greps rather than a line count. The restore strategy is now the rule: **a plant
+  script must restore the exact bytes it read, from memory, and then assert the
+  file is byte-identical to what it started as.** `git checkout` is acceptable only
+  when the script has first confirmed `git diff --quiet -- <path>`, i.e. that the
+  file is clean and there is therefore nothing to lose. The assert-the-restore step
+  is not optional bookkeeping — it is the only thing standing between a verification
+  technique and silent data loss.
+
+- **The generalisable form:** Any technique that mutates state to prove a check can
+  fire is a **destructive** technique, and its safety depends on a precondition that
+  is invisible in the code that performs it. "This worked last time" is the weakest
+  possible evidence, because the precondition was different last time. The general
+  fix is to make the script *prove* it restored what it found, rather than trusting
+  that it did — the same rule this file keeps arriving at for negative controls. A
+  verification step that can destroy the thing it is verifying needs a stronger
+  completion check than one that only reads.

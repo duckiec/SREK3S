@@ -145,6 +145,129 @@ def test_no_cluster_scoped_binding_grants_the_sentinel_more() -> None:
     assert subject["namespace"] == "srek3s-system"
 
 
+def granted_namespaces(documents: list[dict[str, Any]]) -> set[str]:
+    """Namespaces in which the Sentinel's ServiceAccount actually holds a grant.
+
+    Read from the RoleBinding's subject, not the Role's ``metadata.namespace``: the
+    subject is what the apiserver evaluates, and a Role whose namespace and a
+    binding whose subject disagree would make the wrong one authoritative here.
+    """
+    binding = one(documents, "RoleBinding")
+    return {
+        str(subject["namespace"])
+        for subject in binding["subjects"]
+        if subject.get("kind") == "ServiceAccount"
+    }
+
+
+def watch_scope(documents: list[dict[str, Any]]) -> str:
+    """The literal ``WATCH_NAMESPACE`` the Sentinel Deployment is configured with.
+
+    Note the deliberate difference from ``env_map()`` in
+    ``test_e2e_incluster_manifests.py``, which maps a ``valueFrom`` entry to its
+    source and carries on. That tolerance is right there, where the question is
+    "is the variable bound to the thing I expect", and wrong here: this check exists
+    to compare a *scope* against a *grant*, and a reference it cannot resolve is not
+    a scope it has verified. So it raises instead. Do not unify these - unifying
+    them in this direction would make this guard silently assert nothing, which is
+    the exact failure this test was added to stop.
+    """
+    deployment = one(documents, "Deployment")
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    declared = [
+        entry
+        for entry in container.get("env") or []
+        if entry.get("name") == "WATCH_NAMESPACE"
+    ]
+    assert declared, (
+        "the Sentinel Deployment never sets WATCH_NAMESPACE; if the flag default is "
+        "wider than the Role, the informer will be refused forever in silence"
+    )
+    assert "value" in declared[0], (
+        "WATCH_NAMESPACE resolves through valueFrom, which this check cannot "
+        "follow. Either give it a literal, or teach this check to resolve the "
+        "reference - do not leave it asserting nothing"
+    )
+    return str(declared[0]["value"])
+
+
+def ungranted_scopes(scope: str, granted: set[str]) -> list[str]:
+    """Scopes the Sentinel would *ask for* and cannot obtain.
+
+    Separate from the test that calls it so the negative control can exercise this
+    exact function. A control that reimplements the comparison proves that the
+    control reimplements it correctly, which is not the property at issue.
+    """
+    if not scope.strip():
+        # Empty means every namespace, which a namespaced Role never confers.
+        return ["<all namespaces>"]
+    return [] if scope in granted else [scope]
+
+
+def test_the_watch_scope_is_inside_the_granted_namespace() -> None:
+    """The invariant that ``ENV-2.1`` violated and no other check covered.
+
+    Every other RBAC assertion in this file is scoped to the namespace the Role
+    lives in. None of them compares that namespace to the scope the Sentinel is
+    *configured* to watch, so all of them passed while the deployment was broken.
+
+    The failure mode is why this needs asserting rather than documenting: a
+    cluster-wide watch against a namespaced Role produces a ``LIST`` the apiserver
+    refuses, and the informer retries it indefinitely. No incident, no log line, no
+    non-zero exit. It is indistinguishable from a healthy watcher on a quiet
+    cluster, and it is the failure mode of the one tool whose entire output is
+    those incidents.
+    """
+    scope = watch_scope(load("sentinel.yaml"))
+    granted = granted_namespaces(load("rbac.yaml"))
+
+    offenders = ungranted_scopes(scope, granted)
+    assert not offenders, (
+        f"WATCH_NAMESPACE is {scope!r} but the Sentinel's ServiceAccount is granted "
+        f"only in {sorted(granted)}; ungranted scope(s): {offenders}. The informer "
+        "will be refused, silently and forever"
+    )
+
+
+def test_control_watch_scope_check_fails_on_an_ungranted_scope() -> None:
+    """Proves the scope check can fail, using the value that actually shipped.
+
+    This is the negative control for
+    :func:`test_the_watch_scope_is_inside_the_granted_namespace`, and it is the
+    whole reason that test is trustworthy. The defect it guards was found by
+    reading two manifests and reasoning about the apiserver; if the comparison is
+    wrong, the real test is wrong in the same way and will report a broken
+    deployment as healthy.
+
+    ``""`` is not invented for the control. It is the value ``deploy/sentinel.yaml``
+    carried when the mismatch was found, so a control that catches it catches the
+    real thing rather than a convenient stand-in.
+    """
+    granted = granted_namespaces(load("rbac.yaml"))
+
+    assert ungranted_scopes("", granted), (
+        "an empty WATCH_NAMESPACE must be reported as ungranted, or "
+        "test_the_watch_scope_is_inside_the_granted_namespace would pass a "
+        "cluster-wide watch against a namespaced Role"
+    )
+
+    unwatched = next(
+        ns for ns in ("sentinel-chaos", "default", "kube-system") if ns not in granted
+    )
+    assert ungranted_scopes(unwatched, granted) == [unwatched], (
+        f"{unwatched!r} is not granted and must be reported; if rbac.yaml starts "
+        "granting every namespace this control stops being informative and the "
+        "first assertion is carrying it alone"
+    )
+
+    # And the positive case, so the control is not merely asserting that everything
+    # is broken.
+    for granted_ns in sorted(granted):
+        assert (
+            ungranted_scopes(granted_ns, granted) == []
+        ), f"{granted_ns!r} IS granted, so the check must not flag it"
+
+
 def test_the_agent_gets_no_cluster_credential() -> None:
     """3.6.5: ``agent/`` has no ServiceAccount token automount.
 

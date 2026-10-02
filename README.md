@@ -1,391 +1,195 @@
-# SREK3S — Autonomous Reliability Firewall
+# SREK3S
 
-SREK3S watches a Kubernetes cluster for container failures, produces a root-cause
-analysis, and — when the cause is unambiguous and the fix is a one-line resource
-change — emits a verified unified `git diff` for a human to merge. It never
-writes to the cluster. That is enforced by the cluster, not by convention.
+**A fail-closed, AI-powered Site Reliability Engineer for your Kubernetes cluster.**
 
-**Status:** MVP sealed — 811 Python tests + 179 Go test functions green and all CI gates
-passing **on GitHub Actions `ubuntu-latest`**. That platform, not any single developer
-machine, is where those numbers come from; see [Runtime baseline](#runtime-baseline) for
-what the local host can and cannot add. [`ROADMAP.md`](ROADMAP.md) records per-milestone
-evidence; [`docs/lessons-learned.md`](docs/lessons-learned.md) records the defects found
-along the way, including the ones a passing gate failed to catch.
+[![CI](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Release](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg)](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml)
+[![Multi-arch](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-4655db)](https://github.com/duckiec/SREK3S)
+[![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8?logo=go)](https://go.dev)
+[![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-819%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
-> **Contributing, or want to understand the engine?** Read
-> **[`ENGINEERING.md`](ENGINEERING.md)** first. It is a technical breakdown of *why* the
-> system is built this way — the fail-closed tier routing, the model boundary, the
-> zero-leakage scrubber, and the testing methodology — written for the maintainer who
-> arrives later and cannot tell whether a tempting simplification is safe.
+It reads your crashing containers, works out *why*, and hands you a reviewed
+`git diff`. **It can never change your cluster** — enforced by RBAC, not by
+convention.
 
 ---
 
 ## Quick Start
 
-Four commands. Everything below is optional detail.
-
 ```bash
-git clone https://github.com/OWNER/SREK3S.git && cd SREK3S
-
-make doctor      # check the host BEFORE anything else; readable failures, no stack traces
-make bootstrap   # create .venv311, install Python deps, download Go modules
-make test        # the full gate sweep: go vet, gofmt, race detector, black, flake8, mypy --strict, pytest
-make deploy      # apply the base manifests and wait for both rollouts
+git clone https://github.com/duckiec/SREK3S.git && cd SREK3S
+make doctor      # verify the host: OS, arch, docker+buildx, go, python 3.11+
+make bootstrap   # create .venv311, install deps, download Go modules
+make test        # full gate sweep: go vet, gofmt, -race, black, flake8, mypy, pytest
+make deploy      # apply the manifests and wait for both rollouts
 ```
 
-`make doctor` is the one worth running first. It detects the OS and architecture,
-verifies `docker`/`buildx`, Go, and a **3.11+** Python, and distinguishes a stopped
-Docker daemon from one your user simply cannot reach — which are different problems
-with different fixes, and the raw error for both is the same socket message.
+Done. Watch it work with a real crash:
 
 ```bash
-Platform       [ ok ] OS         Linux Fedora Linux 44
-               [ ok ] arch       aarch64 (aarch64)
-docker 29.8.2 · buildx v0.37.1 · [ ok ] go 1.26.8 · [ ok ] python 3.11.16 (.venv311)
-✓ all required dependencies present
+make deploy-overlay            # scope the sentinel to the chaos namespace
+make chaos                     # deploy a real crashing app with a planted secret
+kubectl -n sentinel-chaos logs deploy/real-crash   # the raw log, credential and all
+kubectl -n srek3s-system logs deploy/srek3s-sentinel -f | grep stats
 ```
 
-<details>
-<summary>All targets — run <code>make help</code></summary>
+> `make clean` tears down the chaos namespace. It deliberately **will not** delete
+> `srek3s-system` — that is someone's deployment, and "clean" is the word someone
+> types while annoyed.
 
-| Target | Does |
+---
+
+## Core Features
+
+| | |
 |---|---|
-| `make doctor` | Host pre-flight check (`scripts/bootstrap.sh`) |
-| `make bootstrap` | Create `.venv311`, install deps, `go mod download` |
-| `make test` | Every gate: Go (vet, gofmt, `-race`) then Python (black, flake8, `mypy --strict`, pytest) |
-| `make build` | Both images via `buildx`, host architecture by default |
-| `make verify-images` | Build, then **execute** each image's entrypoint |
-| `make push-multiarch` | `linux/amd64` + `linux/arm64` manifest list (needs a registry) |
-| `make deploy` / `make undeploy` | Apply / remove `deploy/base` |
-| `make deploy-overlay` | Apply the local-live overlay (scopes the Sentinel to `sentinel-chaos`) |
-| `make chaos` | Deploy the real-crash chaos workload |
-| `make clean` | Delete the chaos namespace and `.venv311` — **never** the system namespace |
+| **🔒 Zero-leakage secret scrubbing** | Telemetry is masked **in memory, on the Go node, before any network egress** — 11 enumerated rules, never on disk, never in a queue. Redaction is *selective within the match*, so `postgres://checkout:[REDACTED]@db.internal:5432/prod` loses the password and keeps the diagnosis. |
+| **🧯 Fail-closed by construction** | An unverifiable patch is **discarded**, never emitted with a caveat. Unknown classification, unreadable manifest, or a diff that fails `git apply --check` — each escalates to a human war-room with `git_patch: ""`. Tier-2 is the designed resting state, not a failure. |
+| **🧫 Prompt-injection defense** | The model's response schema has **no field for a tier or a patch**, so it physically cannot return authority. Rules ride in a native `system_instruction` field, never concatenated with the evidence — anyone who can write to a crashing container's stdout can print text that looks like an instruction. |
+| **📦 GitOps auto-patching** | Tier-1 emits a unified diff that survived both a structural YAML AST check *and* a real `git apply --check` against the target manifest's own bytes. For a human to merge. Never applied. |
+| **🚫 Zero cluster write authority** | The Sentinel's Role enumerates `["get","list","watch"]`. The Agent has no ServiceAccount token at all. A CI job `ast`-walks the schema and fails the build if any field is shaped like a write verb. |
+| **🐳 Multi-arch, one command** | `linux/amd64` and `linux/arm64` via BuildKit cross-compilation. CI proves both compile on **every pull request**; a `v*` tag publishes a real manifest list to GHCR. |
+| **🧪 Tested against a live cluster** | Planted credentials and adversarial stack traces in a real crashing workload, detected naturally through the Kubernetes API. Not a mocked payload. |
 
-Cross-build for another architecture:
+---
 
-```bash
-make build PLATFORM=linux/amd64
+## How It Works
+
+```
+   pod crashes
+       │
+       ▼
+┌──────────────────────┐
+│  SREK3S Sentinel     │  watches pods + events via read-only informers
+│  (Go, read-only)     │  scrubs every log line IN MEMORY before egress
+└──────────┬───────────┘
+           │  Contract A — scrubbed incident payload
+           ▼
+┌──────────────────────┐
+│  SREK3S Agent        │  deterministic classifier → tier routing
+│  (Python, stateless) │  Tier-1 only if the diff VERIFIES twice
+└──────────┬───────────┘
+           │
+     ┌─────┴──────────────────────────────┐
+     │                                     │
+     ▼                                     ▼
+┌────────────────┐              ┌────────────────────┐
+│  TIER 1 TOIL   │              │  TIER 2 ARCHITECT. │
+│                │              │                    │
+│  verified diff │              │  git_patch: ""     │
+│  for a human   │              │  war-room dispatch │
+│  to merge      │              │  + verification    │
+└────────────────┘              │    policy          │
+                                └─────────┬──────────┘
+                                          │ optional: a model writes the
+                                          │ *prose* of the explanation. It
+                                          │ cannot set the tier, the patch,
+                                          │ or any validation flag.
+                                          ▼
 ```
 
-</details>
+**Tier-1 requires two independent verifications:** a structural YAML AST check, and
+a real `git apply --check` against the target manifest's own bytes. If either fails,
+the patch is thrown away and the incident escalates.
 
-### The Gemini API key (optional, and genuinely optional)
+---
 
-SREK3S runs **without** a model. Tier, patch, and every validation flag are computed
-deterministically; the model, when present, only writes the prose in a Tier-2 root-cause
-explanation that a human already has to read. If you skip this section, nothing is
-degraded except the fluency of one paragraph.
+## Optional: the Gemini API key
+
+**The system runs fine without it.** Tier, patch, and every validation flag are
+computed deterministically; a model — when present — writes only the prose in a
+Tier-2 explanation a human already has to read.
 
 ```bash
-# Local work: a .env or .env.local in the repository root, both gitignored.
+# locally: .env or .env.local, both gitignored
 echo 'GEMINI_API_KEY=your-key' > .env.local
 
-# In-cluster: a Secret the Agent reads via valueFrom.
+# in-cluster: a Secret the agent reads via valueFrom
 kubectl -n srek3s-system create secret generic srek3s-secrets \
   --from-literal=GEMINI_API_KEY="$(sed -n 's/^GEMINI_API_KEY=//p' .env.local)"
 kubectl -n srek3s-system rollout restart deployment/srek3s-agent
 ```
 
-The manifest reference is `optional: true` on purpose. Without it, a cluster with no
-Secret produces pods stuck in `CreateContainerConfigError`, because a missing `keyRef`
-is an **admission failure, not a missing environment variable** — meaning an operator
-who wants no model at all could not run the agent. With it, an absent Secret leaves the
-variable unset and the agent behaves exactly as it did before.
+`optional: true` on that reference is load-bearing — without it a cluster with no
+Secret produces pods stuck in `CreateContainerConfigError`, and an operator who
+wants no model at all could not run the agent.
 
-To send the model raw log text — which is what makes an RCA worth reading — set
-`SREK3S_LOG_TEXT_EVIDENCE=true`. It defaults to **off**, because sending
-container-controlled text to a third party should be a deliberate act.
+To send raw log text to the model (which is what makes an RCA worth reading), set
+`SREK3S_LOG_TEXT_EVIDENCE=true`. It defaults to **off** — sending
+container-controlled text to a third party should be deliberate.
 
-> **The agent also needs egress on TCP 443.** `deploy/agent.yaml` grants it, and that
-> rule is the only non-DNS egress this pod has. It is `0.0.0.0/0` because a
-> NetworkPolicy selects namespaces, pods, or CIDRs — and an external provider has no
-> stable CIDR. See the comment in the manifest for the reasoning and the cost.
+> The agent needs egress on **TCP 443**. `deploy/agent.yaml` grants it, and that is
+> the only non-DNS egress the pod has.
 
 ---
 
-## What makes this different from a logging tool
+## Documentation & Philosophy
 
-A log aggregator tells you what a container printed. SREK3S tells you **what to do about
-it**, and is built so that being wrong is expensive:
-
-**It cannot change your cluster.** Not by policy — structurally. The Sentinel's
-ServiceAccount is bound to a Role enumerating `["get","list","watch"]`, and the Agent
-has no ServiceAccount token at all. A CI check reads the schema with `ast` and fails the
-build if any field is shaped like a write verb. There is no code path that reaches
-`kubectl apply`, because there is nothing to call it with.
-
-**It proposes a diff, never applies one.** When the cause is unambiguous and the fix is
-a single resource value, it emits a unified `git diff` that survives both a structural
-YAML AST check *and* an in-sandbox `git apply --check` against the real target manifest.
-Unverifiable is not "emit it anyway" — it is **discard it and escalate**. An agent that
-proposes something it cannot prove is worse than one that stays quiet.
-
-**Everything is masked before it leaves the process.** Telemetry is scrubbed in memory
-on the Go node — never on disk, never in a queue. Credentials, tokens, and PII are
-replaced with `[REDACTED]` while the endpoint topology around them is preserved, because
-a diagnosis that cannot name the host it was talking to is not a diagnosis.
-
-**When it is not sure, it stops.** `UNKNOWN` classification, an unreadable target, a
-patch that will not verify — each one escalates to a human war-room dispatch with
-`git_patch: ""`. The blast radius of a mistake is a paragraph somebody reads, not a
-change somebody discovers in production.
-
-**The model cannot change any of that.** A model is consulted only after the tier is
-decided. The response schema it receives has no field for a tier or a patch, so a
-model physically cannot return one. If you feed it a prompt injection hidden in a
-crash log, the worst outcome is a badly-worded paragraph inside an escalation a human
-already owns.
-
----
-
-## Getting started
-
-### Prerequisites
+The reasoning behind all of the above lives in documents written for people who
+will *change* this system:
 
 | | |
 |---|---|
-| Go | 1.23+ (`go.mod` pins 1.23). Local: `go version go1.26.8-X:nodwarf5 linux/arm64` (resolves to `/usr/sbin/go`; see [Runtime baseline](#runtime-baseline)). |
-| Python | **3.11, strictly.** 3.12+ syntax is not permitted; formatting is pinned to `target-version = ["py311"]` and `setup.cfg` sets `python_version = 3.11`. Use the pinned virtualenv `~/SREK3S/.venv311`, not the system `python3`. |
-| Cluster | Any conformant cluster. CI uses k3s; locally, k3s v1.36.4+k3s1. |
-| `git` | Required in the agent image — patch validation runs `git apply --check`. |
-| Docker | Required to build the images. `sudo docker` on this host — see [Runtime baseline](#runtime-baseline). |
-| `gcc` | Needed for `go test -race`. Present here; absent on the previous host. |
-| Platform | Images target `linux/arm64` locally, `linux/amd64` in CI. |
+| **[`ENGINEERING.md`](ENGINEERING.md)** | **Start here if you intend to contribute.** Why the system is built this way — the fail-closed argument, the model boundary, the scrubber, and the testing methodology. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Single source of truth for schemas, layout, and the trust boundary. |
+| [`docs/runbook.md`](docs/runbook.md) | Operational: deploy, watch, interpret, review. |
+| [`docs/lessons-learned.md`](docs/lessons-learned.md) | Every defect found — **including the negative controls that failed for the wrong reason.** The most useful file in the repo. |
+| [`REALWORLD_TESTING.md`](REALWORLD_TESTING.md) · [`TESTING_BASE_RULES.md`](TESTING_BASE_RULES.md) | The live-cluster test protocol, and what may and may not be asserted. |
+| [`PRD.md`](PRD.md) · [`ROADMAP.md`](ROADMAP.md) | Requirements and delivery history. |
 
-### Build
+<details>
+<summary><b>Why fail-closed (the long version)</b></summary>
 
-```bash
-go build -o bin/sentinel ./cmd/sentinel
-sudo docker build --platform linux/arm64 \
-  -t registry.internal/srek3s-agent:0.1.0    -f agent/Dockerfile .
-sudo docker build --platform linux/arm64 \
-  -t registry.internal/srek3s-sentinel:0.1.0 -f cmd/sentinel/Dockerfile .
-```
+## What makes this different from a logging tool
 
-Both images take the **repository root** as their build context — a context of
-`agent/` or `cmd/sentinel/` fails at the `COPY`, because the module and the
-packages being compiled live outside those directories. The Sentinel's image is
-`gcr.io/distroless/static` rather than `scratch`: no shell, no libc, no package
-manager, but it does carry CA certificates, which `scratch` does not — without
-them an `https://` agent endpoint fails certificate verification and presents as
-a network fault.
+A log aggregator tells you what a container printed. SREK3S tells you **what to do
+about it**, and is built so that being wrong is expensive.
 
-Build locally, or on `amd64` CI, or not at all: a wrong-platform image and a
-missing image produce the **same** `ImagePullBackOff`. Check which you have with
-`sudo k3s ctr images ls --namespace k8s.io`.
+**It cannot change your cluster.** Not by policy — structurally. The Sentinel's
+ServiceAccount is bound to a Role enumerating `["get","list","watch"]`, and the
+Agent has no ServiceAccount token at all. A CI check reads the schema with `ast` and
+fails the build if any field is shaped like a write verb.
 
-Running the binary directly is enough for development:
+**It proposes a diff, never applies one.** When the cause is unambiguous and the fix
+is a single resource value, it emits a unified `git diff` that survives both a
+structural YAML AST check *and* an in-sandbox `git apply --check`. Unverifiable is
+not "emit it anyway" — it is **discard it and escalate**. An agent that proposes
+something it cannot prove is worse than one that stays quiet.
 
-```bash
-./bin/sentinel -agent-url http://127.0.0.1:8001 -namespace default
-```
+**Everything is masked before it leaves the process.** Credentials, tokens, and PII
+are replaced with `[REDACTED]` while the endpoint topology around them is preserved,
+because a diagnosis that cannot name the host it was talking to is not a diagnosis.
 
-### Deploy
+**When it is not sure, it stops.** The blast radius of a mistake is a paragraph
+somebody reads, not a change somebody discovers in production.
 
-```bash
-sudo kubectl apply -k deploy/
-```
+**The model cannot change any of that.** It is consulted only after the tier is
+decided, and the schema it receives has no field for a tier or a patch.
 
-`deploy/service.yaml` publishes the agent on `srek3s-agent:8000`, which is the
-Sentinel's built-in `-agent-url` default. The two are asserted equal — along
-with the Service's selector against the agent's pod labels, and its
-`targetPort` against the port the agent actually binds — by
-`test_the_agent_service_routes_the_sentinels_default_endpoint`. That check
-exists because v1.0.0 shipped a deploy set whose Sentinel pointed at a Service no
-manifest created, on a port nothing listened to. It applied cleanly, every
-manifest test passed, and the two pods could not talk. The E2E never caught it
-either: it port-forwards around name resolution entirely.
+</details>
 
-> ### Two things to know before you read "silence" as "healthy"
->
-> **1. `WATCH_NAMESPACE: ""` is committed, and the `Role` is namespaced.** `deploy/sentinel.yaml`
-> configures the Sentinel to watch *all* namespaces while `deploy/rbac.yaml` grants it a
-> `Role` in `srek3s-system` only — no `ClusterRole`, no `ClusterRoleBinding`. A cluster-wide
-> `LIST` is therefore **unauthorised**, and the symptom is not an error: the informer retries
-> and reports nothing at all. **Set `WATCH_NAMESPACE` to a namespace, and put a matching
-> `Role` + `RoleBinding` in that namespace.** The commands are in
-> [`docs/runbook.md`](docs/runbook.md) §1 — "RBAC is namespace-scoped, and that is
-> deliberate" — and they are not duplicated here, because the reasoning behind them matters
-> more than the commands. **Found by static analysis on 2026-10-01; not yet reproduced at
-> runtime.**
->
-> **2. The agent's manifest root ships empty, so Tier-1 is unreachable.** `deploy/agent.yaml`
-> mounts `/manifests` and points `SREK3S_MANIFEST_ROOT` at it, but the volume is an
-> `emptyDir`, and the default target `deploy/payments/checkout-api.yaml` **does not exist in
-> this repository**. The agent cannot read a manifest, so every incident escalates to
-> Tier-2 with `git_patch == ""` and `patch_validated == false`. That is fail-closed design
-> working (invariant **I-B2**) — but it looks exactly like a working setup, which is why the
-> manifest and the runbook both say so in those words. Populate it with your real GitOps
-> checkout and point `SREK3S_TARGET_MANIFEST` inside it to enable Tier-1.
->
-> **An in-cluster run therefore demonstrates the Tier-2 war-room path and the no-mutation
-> guarantee. It cannot demonstrate a Tier-1 patch until that checkout is wired.** Offline,
-> against `tests/fixtures/`, Tier-1 is fully exercised — real `git apply --check` and golden
-> diffs — so this is a deployment-wiring gap, not an implementation gap.
-
-**RBAC is namespace-scoped by design.** `deploy/rbac.yaml` grants the Sentinel a
-`Role` in `srek3s-system` and nowhere else — no `ClusterRole`, no
-`ClusterRoleBinding`. Monitoring any other namespace means applying the same
-read-only `Role` plus a `RoleBinding` **into that namespace**, pointing at the
-ServiceAccount in `srek3s-system`. The runbook has the commands and the
-verification.
-
-**The images are placeholders.** The manifests reference
-`registry.internal/srek3s-{agent,sentinel}:0.1.0`. Those tags are placeholders the
-release pipeline rewrites in the committed file, so applying the set against a
-cluster that cannot pull them yields `ImagePullBackOff`. For the verified `pull` +
-`tag` path into a local containerd, and for the **unverified** air-gapped path this
-host is now *able* to test, see [`docs/offline-install.md`](docs/offline-install.md).
-
-### Publishing
-
-`git tag v1.0.0 && git push --tags` publishes both images to GitHub Container
-Registry as `linux/amd64` + `linux/arm64` manifest lists, using the default
-`GITHUB_TOKEN` — no registry credential is stored in this repository.
-
-```bash
-ghcr.io/OWNER/srek3s-sentinel:1.0.0    # pin this
-ghcr.io/OWNER/srek3s-sentinel:latest
-ghcr.io/OWNER/srek3s-agent:1.0.0
-ghcr.io/OWNER/srek3s-agent:latest
-```
-
-Two things to know before using them. **`:latest` moves** — pin the version tag for
-anything you care about. And **the published registry differs from the one in
-`deploy/`**: the manifests reference `registry.internal/`, so deploying a released
-image means rewriting the image reference, or kustomizing an overlay with an
-`images:` block. That asymmetry is deliberate — a committed image tag that a push
-could silently change would be worse — but it does mean "released" and "what
-`make deploy` applies" are not the same thing today.
-
-### Run the tests
-
-None of this needs a cluster — but on this host, none of it runs as written unless the
-interpreter is pinned.
-
-```bash
-make test          # all of it, in order: Go (vet, gofmt, -race) then Python
-```
-
-Or individually, if you want to know which one broke:
-
-```bash
-PY=~/SREK3S/.venv311/bin/python
-
-go test -race ./...                 # -race is runnable here: gcc present on linux/aarch64
-$PY -m pytest agent/tests/ -q       # 811 passed, 3 skipped
-$PY -m black --check agent/ tests/
-$PY -m flake8 agent/ tests/
-$PY -m mypy --strict agent/ tests/
-$PY scripts/audit_workflow.py       # audits the CI definition itself
-```
-
-The 3 skips are a **blocked dependency, not a pass**: a live-cluster round-trip that
-needs a reachable apiserver, and this host's kubeconfig is root-owned.
-
-Use the virtualenv. The system `python3` on this host is **3.14.3**, and this
-project's Python configuration is pinned the other way: `black` to
-`target-version = ["py311"]`, `setup.cfg` to `python_version = 3.11`. `black` infers
-target versions from the syntax it finds and that inference is sensitive to the host
-interpreter — `agent/pyproject.toml` records the same black version reformatting one
-file differently under 3.11 than under 3.14. A `black --check` failure here is a host
-artefact until proven otherwise.
-
-`go test -race` was unavailable on the previous `windows/arm64` host — no
-ThreadSanitizer — which is why so much of `ROADMAP.md` says "CI-only". That constraint no
-longer applies to local runs. It never applied to CI, and `ubuntu-latest` is still where
-the published numbers come from.
-
-`mypy --strict` must be run against `agent/` **and** `tests/` together — against
-`agent/` alone it reports spurious `import-not-found` errors for the test
-fixtures.
-
-The 2 skips are live-cluster tests that print `BLOCKED DEPENDENCY, not a pass`.
-They need `kubectl` and a reachable cluster; the offline half of that file is
-what ran.
-
-### What is *not* wired, so you do not assume it is
-
-- **No model.** `agent/llm.py` is a validation boundary, not a model client:
-  `CompletionClient` is a `typing.Protocol` with no implementation, the module imports no
-  network library, and `fastembed`/`onnxruntime` exist only in a comment in
-  `requirements.txt`. Every RCA and diff is deterministic. (`ARCHITECTURE.md` §5.5.2.)
-- **No post-remediation loop in the service.** `agent/verify.py` is implemented and heavily
-  tested but **imported by no production module**; `triage.py` emits `verification_policy`
-  and nothing consumes it. The loop is not reachable from the running HTTP service.
-  (`ARCHITECTURE.md` §5.5.1.)
-
-### Where to go next
-
-- **Operating it** — [`docs/runbook.md`](docs/runbook.md): deploying, reading
-  logs, interpreting a Tier-2 dispatch, reviewing a Tier-1 PR, and the
-  No-Autofix guarantee.
-- **Understanding it** — [`ARCHITECTURE.md`](ARCHITECTURE.md) is the single
-  source of truth for schemas, invariants, and layout. Code and spec
-  disagreeing is treated as a stop-the-line discrepancy, not a documentation
-  bug.
-- **Deploy manifests** — [`deploy/`](deploy/): `namespace.yaml`, `rbac.yaml`,
-  `sentinel.yaml`, `agent.yaml`, `kustomization.yaml`, plus `chaos/` for the
-  deliberate-failure fixtures.
-- **Requirements** — [`PRD.md`](PRD.md).
-- **Why any of this exists** — [below](#the-problem-the-llm-blast-radius-gap).
-
----
-
-## Table of contents
-
-- [Quick Start](#quick-start)
-- [What makes this different from a logging tool](#what-makes-this-different-from-a-logging-tool)
-- [Runtime baseline](#runtime-baseline)
-- [Getting started](#getting-started)
-- [The problem: the LLM blast-radius gap](#the-problem-the-llm-blast-radius-gap)
-- [What SREK3S actually does](#what-srek3s-actually-does)
-- [Data flow](#data-flow)
-- [Engineering deep dive](#engineering-deep-dive)
-  - [1. Zero cluster mutation is structural](#1-zero-cluster-mutation-is-structural)
-  - [2. The in-memory scrubber](#2-the-in-memory-scrubber)
-  - [3. The ephemeral, resource-capped sandbox](#3-the-ephemeral-resource-capped-sandbox)
-  - [4. Fail-closed Tier 1 / Tier 2 routing](#4-fail-closed-tier-1--tier-2-routing)
-  - [5. The post-remediation verification loop](#5-the-post-remediation-verification-loop)
-  - [6. Invariants](#6-invariants)
-  - [7. Verification without a cluster](#7-verification-without-a-cluster)
-- [Testing and gates](#testing-and-gates)
-- [Repository map](#repository-map)
-
----
+<details>
+<summary><b>The problem this solves</b></summary>
 
 ## The problem: the LLM blast-radius gap
 
-Asking a model to fix a production incident couples two things that should be
-decoupled: *diagnosing* the fault and *acting* on it. Diagnosis is where a
-language model is genuinely useful — correlating a `CrashLoopBackOff` with a
-memory limit, a liveness probe, and a previous OOMKilled termination is exactly
-the kind of multi-signal reasoning that is tedious and error-prone by hand.
+Every automated SRE tool faces the same asymmetry. When it is right, someone saves an
+hour. When it is wrong, it changes production, and the person who has to notice is
+asleep. Conventional tooling resolves this by being conservative in *what it does* —
+it alerts more, automates less — which drifts toward a dashboard with natural
+language on it.
 
-Action is where it is dangerous, because the blast radius of a wrong patch is not
-proportional to the confidence that produced it. A plausible `resources.limits`
-edit that raises a memory ceiling by 4× on a node that is already under
-memory pressure turns a single-container restart loop into a node-level eviction
-cascade. The model was *probably* right. The cluster does not grade on a curve.
+SREK3S takes the opposite position: **the safe outcome is not "do less", it is
+"arrive at a human having proved something."**
 
-The compliance problem is adjacent and, for many operators, disqualifying.
-Incident telemetry is a rich source of credentials: env-var dumps in crash
-reports, connection strings with inline passwords, mounted service-account
-tokens. Any system that ships that telemetry to a third-party inference endpoint
-is a credential-exfiltration path with a helpful README. Auditors do not
-distinguish between "the model was instructed not to log secrets" and "the
-secrets are not present in what left the process."
+</details>
 
-SREK3S treats both as structural problems:
+<details>
+<summary><b>What SREK3S actually does, and the data flow</b></summary>
 
-- **Blast radius is decided by policy, not by the model.** The model proposes a
-  patch. It does not choose whether to ship it. A verdict of `TIER_2` is
-  structurally incapable of carrying a patch at all.
-- **Credentials never leave the Go process.** Scrubbing happens in memory, on
-  the Sentinel, before the egress boundary. There is no code path in which
-  unmasked telemetry reaches the network.
-
-## What SREK3S actually does
+### What SREK3S actually does
 
 1. Watches pods and events through a read-only informer pair.
 2. Detects `OOMKilled` and `CrashLoopBackOff`, joining container terminations to
@@ -408,7 +212,8 @@ SREK3S treats both as structural problems:
 Steps 6 and 7 are the difference between a demo and a system. A patch that was
 never applied looks identical to a patch that fixed nothing, until you check.
 
-## Data flow
+
+### Data flow
 
 ```
   Kubernetes API                    Go Sentinel (UID 10001, read-only)
@@ -444,9 +249,12 @@ never applied looks identical to a patch that fixed nothing, until you check.
 
 ---
 
-# Engineering deep dive
+</details>
 
-## 1. Zero cluster mutation is structural
+<details>
+<summary><b>Engineering deep dive — the seven properties</b></summary>
+
+### 1. Zero cluster mutation is structural
 
 The Sentinel runs with a namespaced `Role` granting exactly `get`, `list`,
 `watch` on `pods`, `pods/log`, and `events`. There is no `ClusterRoleBinding`.
@@ -486,7 +294,8 @@ back at the ServiceAccount in `srek3s-system`
 ([`docs/runbook.md`](docs/runbook.md) §1). One narrow `Role` per namespace is the
 intended shape.
 
-## 2. The in-memory scrubber
+
+### 2. The in-memory scrubber
 
 Eleven rules, in a **normative order** fixed by `ARCHITECTURE.md` §6 and
 asserted by `TestManifestMatchesSpecification`:
@@ -540,7 +349,8 @@ are maskable, including a `negative_controls` group of 6 cases that must *not*
 be masked. A masker that redacts everything scores 100% on the 32 and is
 useless.
 
-## 3. The ephemeral, resource-capped sandbox
+
+### 3. The ephemeral, resource-capped sandbox
 
 LLM inference and regex analysis are untrusted compute. The agent runs them in a
 disposable process (`python -m sandbox_worker`) with `RLIMIT_AS` at 256 MiB and
@@ -567,7 +377,8 @@ The CPU limit is small on purpose. A large value would be more defensible if the
 workload were CPU-trivial; the ceiling exists to bound blast radius, not to
 accommodate a slow analysis.
 
-## 4. Fail-closed Tier 1 / Tier 2 routing
+
+### 4. Fail-closed Tier 1 / Tier 2 routing
 
 The routing decision is deterministic and lives in the agent, not in the model.
 The model is given a constrained decoding schema and can only populate fields
@@ -602,7 +413,8 @@ directory, and `git apply` exited `0` having verified the wrong file. The
 harness now asserts the *effect* — that the target file in the scratch tree
 changed — rather than the exit status.
 
-## 5. The post-remediation verification loop
+
+### 5. The post-remediation verification loop
 
 > **Not wired into the running service.** `agent/verify.py` (741 lines) implements
 > this loop and is covered by the sixty tests recorded in `ROADMAP.md` box `4.3.2`,
@@ -646,7 +458,8 @@ long time. When the budget is exhausted, the cause is recorded explicitly
 one action — a human is needed in every case — but the *reason* is what lets that
 human avoid repeating the investigation the agent just did.
 
-## 6. Invariants
+
+### 6. Invariants
 
 Eleven invariants, each with a test that fails the build when it is violated.
 
@@ -671,7 +484,8 @@ Eleven invariants, each with a test that fails the build when it is violated.
 | `I-B5` | Neither contract has any field capable of expressing a cluster write verb |
 | `I-B6` | Every response string passes the agent-side defensive re-scan |
 
-## 7. Verification without a cluster
+
+### 7. Verification without a cluster
 
 The most common way to get a systems project into trouble is to make the
 interesting paths testable only against real infrastructure. SREK3S is
@@ -704,7 +518,7 @@ with a read-only root and no mounted token. It does not detonate anything; that
 chain is the detonation leg's job, and duplicating it would re-prove a layer that
 is not in question to cover one that is.
 
-Three of the 811 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
+Three of the 819 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
 pass`. They need a reachable cluster. On the current `Fedora 44` / `linux/aarch64`
 host `go test -race` and the container build are **no longer** blocked — `gcc` is
 installed and Docker is running (behind `sudo`) — so they can be run locally and
@@ -713,6 +527,146 @@ neither was available, which is why so much of `ROADMAP.md` reads "CI-only";
 those records are left intact.
 
 ---
+
+</details>
+
+<details>
+<summary><b>Prerequisites, manual build, and manual deploy</b></summary>
+
+### Prerequisites
+
+| | |
+|---|---|
+| Go | 1.23+ (`go.mod` pins 1.23). |
+| Python | **3.11, strictly.** 3.12+ syntax is not permitted; formatting is pinned to `target-version = ["py311"]` and `setup.cfg` sets `python_version = 3.11`. Use the pinned virtualenv `.venv311`, not the system `python3`. |
+| Cluster | Any conformant cluster. CI uses k3s; locally, k3s v1.36.4+k3s1. |
+| `git` | Required in the agent image — patch validation runs `git apply --check`. |
+| Docker | Required to build the images. |
+| `gcc` | Needed for `go test -race`. |
+| Platform | Images target `linux/arm64` locally; CI builds **both** architectures. |
+
+### Build
+
+```bash
+go build -o bin/sentinel ./cmd/sentinel
+sudo docker build -t registry.internal/srek3s-agent:0.1.0    -f agent/Dockerfile .
+sudo docker build -t registry.internal/srek3s-sentinel:0.1.0 -f cmd/sentinel/Dockerfile .
+```
+
+Both images take the **repository root** as their build context — a context of
+`agent/` or `cmd/sentinel/` fails at the `COPY`, because the module and the packages
+being compiled live outside those directories.
+
+> **A wrong-platform image and a missing image produce the *same*
+> `ImagePullBackOff`.** Check which one you have with
+> `sudo k3s ctr images ls --namespace k8s.io`.
+
+The Sentinel's image is `gcr.io/distroless/static` rather than `scratch`: no shell,
+no libc, no package manager, but it does carry CA certificates, which `scratch`
+does not — without them an `https://` agent endpoint fails certificate verification
+and presents as a network fault.
+
+Running the binary directly is enough for development:
+
+```bash
+./bin/sentinel -agent-url http://127.0.0.1:8001 -namespace default
+```
+
+### Deploy
+
+```bash
+sudo kubectl apply -k deploy/base
+```
+
+`deploy/service.yaml` publishes the agent on `srek3s-agent:8000`, which is the
+Sentinel's built-in `-agent-url` default. The two are asserted equal — along with
+the Service's selector against the agent's pod labels, and its `targetPort` against
+the port the agent actually binds — by
+`test_the_agent_service_routes_the_sentinels_default_endpoint`.
+
+> ### Two things to know before you read "silence" as "healthy"
+>
+> **1. The watch scope and the RBAC grant must agree.** A cluster-wide watch with a
+> namespaced Role produces **no incidents and no error** — the informer retries a
+> forbidden request forever. `deploy/sentinel.yaml` defaults `WATCH_NAMESPACE` to
+> `srek3s-system`, which matches the Role as shipped; widening one without the other
+> is the classic silent failure.
+>
+> **2. A NetworkPolicy matching nothing also produces silence, with zero 403s**,
+> because no authorization is ever attempted. An RBAC-only check reports the
+> deployment healthy while the watcher sees nothing.
+>
+> **3. Pod Security Admission failures look like an empty cluster.** A manifest
+> rejected by PSA `restricted` fails closed, and a fixture rejected at admission is
+> worse than no fixture — it reads as "the cluster is quiet". Note that
+> `deploy/namespace.yaml` sets `enforce-version: latest`, so PSA is evaluated
+> against whatever control plane is running: the same manifests can be admitted on
+> k3s 1.36 and refused on 1.29 for a reason that has nothing to do with the code.
+> Diagnose the version skew before diagnosing the manifest.
+
+### Publishing
+
+`git tag v1.0.0 && git push --tags` publishes both images to GitHub Container
+Registry as `linux/amd64` + `linux/arm64` manifest lists, using the default
+`GITHUB_TOKEN` — no registry credential is stored in this repository.
+
+```bash
+ghcr.io/duckiec/srek3s-sentinel:1.0.0    # pin this
+ghcr.io/duckiec/srek3s-sentinel:latest
+ghcr.io/duckiec/srek3s-agent:1.0.0
+ghcr.io/duckiec/srek3s-agent:latest
+```
+
+Two things to know. **`:latest` moves** — pin the version tag for anything you care
+about. And **the published registry differs from the one in `deploy/`**: the
+manifests reference `registry.internal/`, so deploying a released image means
+rewriting the image reference, or kustomizing an overlay with an `images:` block.
+
+### Run the tests
+
+```bash
+make test          # all of it, in order
+```
+
+Or individually:
+
+```bash
+PY=~/SREK3S/.venv311/bin/python
+go test -race ./...                 # 819 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 819 passed, 3 skipped
+$PY -m black --check agent/ tests/
+$PY -m flake8 agent/ tests/
+$PY -m mypy --strict agent/ tests/
+$PY scripts/audit_workflow.py       # audits the CI definition itself
+```
+
+The 3 skips are a **blocked dependency, not a pass**: a live-cluster round-trip that
+needs a reachable apiserver, and the development host's kubeconfig is root-owned.
+
+</details>
+
+<details>
+<summary><b>What is not wired, so you do not assume it is</b></summary>
+
+### What is *not* wired
+
+**The post-remediation verification loop.** `agent/verify.py` implements the PRD F4
+loop and is covered by `agent/tests/test_verify.py` and
+`agent/tests/test_verification_e2e.py` — but **no production module imports it**:
+`main.py` and `triage.py` do not. `triage.py` emits `verification_policy` on the wire
+and nothing in the service consumes it, so PRD F4 and ARCH §5.2 are not reachable
+from the running HTTP service.
+
+**Tier-1 auto-patching as deployed.** `SREK3S_MANIFEST_ROOT` mounts an emptyDir, so
+as deployed the manifest provider cannot resolve its target file. Every incident
+therefore escalates to Tier-2 under I-B2, and no patch is ever proposed
+unverified. That is the intended safe state, not a misconfiguration — but it looks
+exactly like a working setup.
+
+</details>
+
+<details>
+<summary><b>Testing and gates</b></summary>
 
 ## Testing and gates
 
@@ -734,6 +688,7 @@ those records are left intact.
 | Chaos fixtures | `test_chaos_fixtures.py` | **Executes** each fixture's script; asserts the failure is the one under test |
 | Images | `test_sentinel_image.py` | Stage split, `CGO_ENABLED=0`, cross-compile ARGs |
 | Workflows | `test_workflows.py` | Triggers, `needs:` resolution, multi-arch coverage, least privilege |
+| Doc links | `test_docs_links.py` | Every `#anchor` in the user-facing docs resolves. Prose has no assertion to fail, so a document can claim a section is reachable when it is not. |
 | Multi-arch | CI `multi-arch-dry-run` job | `linux/amd64` + `linux/arm64`, `output: type=cacheonly` |
 
 Most of these assert a property of a single file. `Routing` asserts a property of
@@ -750,6 +705,11 @@ modules shipped undocumented. The suite was green throughout, because no test
 read the document. It now asserts in both directions: every path the tree names
 must exist, and every production source under the directories the tree enumerates
 must be named. A one-way check cannot see an omission.
+
+</details>
+
+<details>
+<summary><b>Repository map and runtime baseline</b></summary>
 
 ## Repository map
 
@@ -775,12 +735,6 @@ docs/                  runbook, lessons learned, offline install, CI triage
 `agent/tests/test_architecture_layout.py` fails the build if it drifts from disk
 in either direction.
 
----
-
-MIT licensed. See [`LICENSE`](LICENSE).
-
----
-
 ## Runtime baseline
 
 The development host is **WSL2 on an ARM64 Windows machine, distribution
@@ -789,15 +743,21 @@ The development host is **WSL2 on an ARM64 Windows machine, distribution
 
 | | |
 |---|---|
-| **Images must be `linux/arm64`.** | CI builds `amd64`. A local image and a CI image are not the same artifact. |
-| **`sudo docker …`** | `duckie` is in `wheel` but not in the `docker` group; `/var/run/docker.sock` is `root:docker`. Plain `docker` fails with `permission denied while trying to connect to the docker API`. |
+| **Images must be `linux/arm64`.** | CI builds **both** architectures now. A local image and a CI image are still not the same artifact. |
+| **`sudo docker …`** | `duckie` is in `wheel` but not in the `docker` group; `/var/run/docker.sock` is `root:docker`. Plain `docker` fails with `permission denied`. `make build` prints both remedies rather than a socket error. |
 | **`sudo kubectl …`** | The k3s kubeconfig is mode `0600` and root-owned. Every `kubectl` call needs it. |
-| **Python gates run in `.venv311`.** | The system `python3` here is 3.14.3 and is **not** a valid interpreter for this project. Use `~/SREK3S/.venv311/bin/python -m pytest`. |
+| **Python gates run in `.venv311`.** | The system `python3` here is 3.14.3 and is **not** a valid interpreter for this project. `make test` resolves `.venv311` itself. |
 
-`go test -race` is now runnable locally (`gcc` is present on `linux/aarch64`), which it was
+`go test -race` is runnable locally (`gcc` is present on `linux/aarch64`), which it was
 not on the earlier `windows/arm64` host. **CI on `ubuntu-latest` remains the platform
 authority** for every published figure; a local pass is extra evidence, never a
 substitution. The full environment of record is in
 [`ROADMAP.md`](ROADMAP.md) § *Local Environment Baseline*.
 
+</details>
+
 ---
+
+## License
+
+[MIT](LICENSE) © 2026 duckie

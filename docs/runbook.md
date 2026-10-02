@@ -4,6 +4,15 @@ For the human on call, or the agent reading this on your behalf. It covers the
 four things an operator actually does with this system: deploy it, watch it,
 interpret what it escalates, and review what it proposes.
 
+| § | | Do this when |
+|---|---|---|
+| [1](#1-deploying-the-sentinel) | Deploy the Sentinel | first deploy, or changing what is watched |
+| [2](#2-observing-the-logs) | Observe the logs | you want to know it is working |
+| [3](#3-interpreting-a-war-room-dispatch-tier-2) | Read a Tier-2 dispatch | an incident escalated to you |
+| [4](#4-reviewing-a-tier-1-gitops-pr) | Review a Tier-1 PR | a patch was proposed for merge |
+| [5](#5-the-no-autofix-guarantee) | The no-autofix guarantee | you do not yet believe it |
+| [6](#6-when-something-is-wrong) | Symptom → cause | something is broken and you are guessing |
+
 Two claims are made here that are worth checking rather than taking on trust,
 and both are checked in [§5](#5-the-no-autofix-guarantee): **the Sentinel cannot
 write to your cluster**, and **the agent cannot write to your cluster**. They are
@@ -13,6 +22,21 @@ enforced at three independent layers, and no configuration turns either off.
 > Docker + buildx, Go, and a **3.11+** Python, and it distinguishes a stopped Docker
 > daemon from one your user cannot reach — which are different problems that
 > otherwise produce the same socket error. Then `make bootstrap` and `make test`.
+
+> ### The three states that all look like "working"
+>
+> Read this once. It is the failure mode that costs the most time, because none of
+> them produces an error.
+>
+> | | Looks healthy because | Actually means |
+> |---|---|---|
+> | Watch scope ≠ granted namespace | no incidents, no log lines, exit 0 | the apiserver is refusing the `LIST` and the informer is retrying it forever — [§1](#rbac-is-namespace-scoped-and-that-is-deliberate) |
+> | `NetworkPolicy` matches nothing | zero 403s, because none were attempted | traffic is not being made, so nothing is actually under test — [§1](#networkpolicy-enforcement-expected-not-verified) |
+> | Pod Security Admission rejects a manifest | the namespace exists and is empty | the fixture never started, so there is no failure to detect — [§1](#two-committed-states-that-read-as-healthy) |
+>
+> A fourth case is the opposite: `git_patch` empty on every incident **is** the
+> design working, because `SREK3S_MANIFEST_ROOT` ships as an `emptyDir` —
+> [§1](#the-agents-manifest-root-ships-empty).
 
 ---
 
@@ -58,7 +82,7 @@ cluster.
 
 | | Committed state | What you see |
 |---|---|---|
-| **Watch scope vs grant** | `sentinel.yaml` sets `WATCH_NAMESPACE: ""` (all namespaces); `rbac.yaml` grants a `Role` in `srek3s-system` only | A cluster-wide `LIST` is unauthorised. The informer retries it. **No incidents and no error** — indistinguishable from a healthy cluster watching nothing. Fix in [the next section](#rbac-is-namespace-scoped-and-that-is-deliberate). Found by static analysis on 2026-10-01; **not yet reproduced at runtime.** |
+| **Watch scope vs grant** | `sentinel.yaml` ships `WATCH_NAMESPACE: srek3s-system`, which is the namespace `rbac.yaml` grants — **the two agree as committed.** They did not always: an earlier revision shipped `""` (all namespaces) against a namespaced Role, which produced a cluster-wide `LIST` the apiserver refused forever, with **no incidents and no error**. If you widen the scope, widen the grant in the same commit. | Nothing, if you leave them alone. **Silence if you break the pairing** — indistinguishable from a healthy cluster watching nothing. Asserted by `test_the_watch_scope_is_inside_the_granted_namespace`. |
 | **Agent manifest root** | `agent.yaml` mounts `/manifests` as an `emptyDir`, and the default target `deploy/payments/checkout-api.yaml` does not exist in this repository | Every incident escalates to `TIER_2_ARCHITECTURAL` with `git_patch == ""`. **That is the design working** (invariant I-B2), not a fault — see [The agent's manifest root ships empty](#the-agents-manifest-root-ships-empty). |
 
 The honest summary: **an in-cluster run of `deploy/` demonstrates the Tier-2
@@ -111,94 +135,70 @@ the node's containerd namespace is `docs/offline-install.md`'s subject.
 
 ### RBAC is namespace-scoped, and that is deliberate
 
-> **Read this before your first deploy, because `deploy/` ships in a state this
-> section contradicts.** `deploy/sentinel.yaml` sets `WATCH_NAMESPACE: ""`, which
-> asks the Sentinel to watch every namespace. The `Role` described here authorises
-> it to read exactly one. Those two do not compose: the cluster-wide `LIST` is
-> refused, and **the symptom is silence, not an error** — the process starts
-> cleanly and reports nothing. Both halves must be fixed together; see
-> "The consequence you must act on" below, which already contains the procedure.
+> ### The pairing is the invariant: `WATCH_NAMESPACE` must name a namespace you hold a grant in
 >
-> This mismatch was found by **static analysis on 2026-10-01 and has not been
-> reproduced at runtime** — nothing was deployed when it was found. It is recorded
-> as an open defect in `ARCHITECTURE.md` §2.1 and `ROADMAP.md` `ENV-2.1`, and
-> neither the manifest nor this runbook has been changed to hide it.
+> As shipped, both are `srek3s-system` and they agree.
+> `agent/tests/test_deploy_manifests.py::test_the_watch_scope_is_inside_the_granted_namespace`
+> fails the build if they stop agreeing.
 >
-> The reason no gate caught it is worth knowing, because you will write the next
-> one: `TestSentinelRoleGrantsNoMutatingVerb` and
+> **Break the pairing and nothing tells you.** An earlier revision shipped
+> `WATCH_NAMESPACE: ""` — which means *every* namespace — against a namespaced
+> `Role`. The cluster-wide `LIST` was refused, the informer retried it forever, and
+> **the symptom was silence, not an error**: clean startup, no log line, no
+> non-zero exit. Indistinguishable from a healthy watcher on a quiet cluster, in a
+> tool whose entire output is incidents.
+>
+> Found by static analysis on 2026-10-01 and **not reproduced at runtime** (nothing
+> was deployed when it was found). Recorded as `ENV-2.1` in `ROADMAP.md`; §26 of
+> `docs/lessons-learned.md` carries the mechanism. Why no gate caught it:
+> `TestSentinelRoleGrantsNoMutatingVerb` and
 > `TestSentinelRoleGrantsWhatTheWatcherReads` both pass, and both are scoped to the
-> namespace the `Role` lives in. Neither compares that namespace to the configured
-> watch scope. Correct assertions over correct manifests, wrong in composition.
+> namespace the `Role` lives in. **Neither compared that namespace to the configured
+> scope.** Correct assertions over correct manifests, wrong in composition.
 
-**`deploy/rbac.yaml` grants the Sentinel a `Role` in `srek3s-system` and
-nowhere else.** A `Role` is namespaced by definition, and a `RoleBinding` in
-`srek3s-system` can only reference a `Role` in `srek3s-system`. There is no
-`ClusterRole` and no `ClusterRoleBinding` in this set, and adding one would be
-the single highest-severity change available to this codebase.
+**`deploy/rbac.yaml` grants the Sentinel a `Role` in `srek3s-system` and nowhere
+else.** No `ClusterRole`, no `ClusterRoleBinding` — adding one would be the single
+highest-severity change available to this codebase. A watcher's entire authority is
+what it can read, so scoping the grant makes the blast radius of a compromised
+Sentinel one namespace rather than the cluster.
 
-The reason is blast radius. A watcher's entire authority is the set of things it
-can read, and a cluster-wide grant reads every namespace, including the ones that
-hold other people's secrets. Scoping the grant to one namespace makes the blast
-radius of a compromised Sentinel equal to that namespace rather than the cluster.
-
-**The consequence you must act on:** the Sentinel is authorised to read only
-`srek3s-system`. If you set `-namespace` to anything else — `default`,
-`payments`, your application's namespace — **it will be refused**, and the
-failure looks like a hang rather than an error: the informer retries an
-unauthorised `LIST`, and the symptom is no incidents rather than a permission
-message. **Leaving it empty has the same effect for the opposite reason**: an
-empty value means *every* namespace, and "every namespace" is unauthorised by a
-`Role` that only covers one. Both directions of misconfiguration produce silence.
-
-To monitor a namespace, apply the same `Role` and a `RoleBinding` into **that**
-namespace, referring to the ServiceAccount in `srek3s-system`:
+To watch a namespace other than `srek3s-system`, do **both** halves:
 
 ```bash
 NS=payments   # the namespace you actually want to watch
 
+# 1. the GRANT — Role + RoleBinding in $NS, referring back to srek3s-system
 sudo kubectl -n "$NS" create role srek3s-sentinel \
   --verb=get,list,watch --resource=pods,pods/log,events
 sudo kubectl -n "$NS" create role srek3s-sentinel \
   --verb=get,list,watch --api-group=apps --resource=deployments,replicasets
-
 sudo kubectl -n "$NS" create rolebinding srek3s-sentinel \
   --role=srek3s-sentinel \
   --serviceaccount=srek3s-system:srek3s-sentinel
+
+# 2. the SCOPE — deploy/sentinel.yaml, env: WATCH_NAMESPACE
+#    (or -namespace payments when running outside the cluster)
 ```
 
-Then set the Sentinel's scope to that same namespace — in `deploy/sentinel.yaml`,
-`env: WATCH_NAMESPACE: "payments"`, or with `-namespace payments` when running
-outside the cluster. **Setting the Role without setting the scope leaves the
-Sentinel watching everything and being refused for all of it; setting the scope
-without the Role leaves it watching one namespace and being refused for that
-one.** The two edits travel together or not at all.
+**One half alone is also silence.** Grant without scope → still watching every
+namespace, refused for all of them. Scope without grant → watching one namespace,
+refused for that one. There is no wildcard form, deliberately: covering many
+namespaces means many narrow Roles to review, not one wide Role.
 
-Confirm it before trusting it:
+Confirm before you trust it. The third command is the guard:
 
 ```bash
 sudo kubectl auth can-i list pods -n "$NS" \
   --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: yes
 sudo kubectl auth can-i create pods -n "$NS" \
-  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: no
+  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: no  <- watcher, not actor
 sudo kubectl auth can-i list pods --all-namespaces \
-  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: no
+  --as=system:serviceaccount:srek3s-system:srek3s-sentinel   # must be: no  <- pairing intact
 ```
 
-The third command is the one that catches this defect specifically: it asks the
-exact question `WATCH_NAMESPACE: ""` implies, and its answer is what the Sentinel
-will find when it tries.
-
-Two things to keep straight. First, **read only**: the verbs above are
-`get,list,watch` and nothing else, and the second command is the one that
-matters — it is the difference between a watcher and an actor. Second, **the
-RoleBinding lives in the target namespace and points back at `srek3s-system`**:
-that keeps a single ServiceAccount, and a single identity to audit, while the
-grant itself stays narrow. Covering many namespaces means many narrow Roles to
-review, not one wide Role.
-
-Do this once per namespace you want watched. There is no wildcard form, and that
-is the intended shape: every namespace in the grant is one somebody chose to put
-this thing in.
+Note the subject namespace in `--as`: the RoleBinding lives in `$NS` but refers
+back to `srek3s-system`. One ServiceAccount, one identity to audit, one token to
+revoke — while the grant stays narrow. Do this once per namespace you want watched.
 
 ### The agent's manifest root ships empty
 
@@ -682,12 +682,13 @@ not the same experiment.
 > refers to it by a name that does not exist.
 >
 > **A fourth thing these commands do not prove.** All four of Layer 1's and Layer
-> 2's checks pass on the manifests as committed, and the deployment still cannot
-> watch anything, because `WATCH_NAMESPACE: ""` asks for a grant the `Role` does
-> not confer. See
+> 2's checks pass on the manifests as committed, and that is now the *correct*
+> outcome rather than a lucky one — the watch scope and the granted namespace agree.
+> They still would not have caught the earlier mismatch, because each assertion is
+> about the `Role` and none of them was about the pairing. See
 > [§1](#rbac-is-namespace-scoped-and-that-is-deliberate). "Every test green" is a
-> statement about the tests, and the tests here are each about a different thing
-> than the one that broke.
+> statement about the tests, and a suite can be entirely green while the
+> composition it never checked is broken.
 
 ---
 
@@ -695,7 +696,7 @@ not the same experiment.
 
 | Symptom | First thing to check |
 |---|---|
-| **Sentinel running, no incidents, no errors, nothing happening anywhere** | **`kubectl auth can-i list pods --all-namespaces` as the Sentinel's SA.** If that is `no` and `watch_namespace` is empty, this is the scope/RBAC mismatch — [§1](#rbac-is-namespace-scoped-and-that-is-deliberate) |
+| **Sentinel running, no incidents, no errors, nothing happening anywhere** | The watch scope and the grant disagree. Compare `WATCH_NAMESPACE` in `deploy/sentinel.yaml` against the namespaces in `deploy/rbac.yaml` — `srek3s-system` and `srek3s-system` as shipped. If you widened one, widen the other: [§1](#rbac-is-namespace-scoped-and-that-is-deliberate) |
 | Sentinel running, no incidents, pod visibly crash-looping | `dedup_suppressed` in the stats line — [§2](#2-observing-the-logs) |
 | `dispatch failed … agent unreachable` | The agent pod; then `-agent-url` for a doubled path |
 | Every incident is Tier-2 with `no manifest provider` | `SREK3S_MANIFEST_ROOT` is unset or empty, **or** the `/manifests` volume is still an `emptyDir` — [§1](#the-agents-manifest-root-ships-empty). If you *have* wired a checkout, also check `SREK3S_TARGET_MANIFEST`: its default, `deploy/payments/checkout-api.yaml`, does not exist in this repository |
