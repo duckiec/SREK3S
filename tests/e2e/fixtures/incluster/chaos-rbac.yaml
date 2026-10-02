@@ -1,0 +1,91 @@
+# The Sentinel's grant in the chaos namespace.
+#
+# WHY THIS IS NOT IN extra-resources.yaml
+# ---------------------------------------
+# It was, and that was a bug. This file is applied by `kubectl apply -f` directly
+# rather than through the overlay's kustomization, and the reason is the trap
+# deploy/base/kustomization.yaml documents at length:
+#
+#   "a global `namespace:` transform is only safe in a kustomization whose
+#    Namespace objects already carry the target name. Adding a second namespace
+#    forces a choice between a collision (transform on) and an unnamespaced
+#    object (transform off)."
+#
+# The overlay inherits `namespace: srek3s-system` from the deploy base. With the
+# grant inside extra-resources.yaml, kustomize rewrote this Role and RoleBinding
+# out of sentinel-chaos and into srek3s-system, leaving the roleRef pointing at a
+# Role in a namespace the binding was not in. Applying then failed:
+#
+#   [resource mapping not found for name: "srek3s-sentinel" namespace:
+#    "sentinel-chaos" from "tests/e2e/fixtures/incluster": no matches for kind
+#    "Role" in version "rbac.authorization.k8s.io"]
+#
+# Note what that failure looks like: it is a kustomize *build* error about a
+# resource that reads perfectly well on its own. Nothing in the YAML is invalid,
+# and no linter here would ever have said otherwise. The defect only exists in the
+# composition, which is precisely why the offline tests could not see it and the
+# apiserver could.
+#
+# This is the same shape as deploy/overlays/local-live/chaos-rbac.yaml, which
+# solves the identical problem the same way. One convention, two users, rather
+# than two conventions.
+#
+# Why the grant exists at all: deploy/rbac.yaml grants the Sentinel's
+# ServiceAccount a read-only Role in `srek3s-system` only, so a Sentinel scoped to
+# any other namespace is unauthorised today. That is a real gap in production and
+# is filed as one — but shipping a Role bound to a disposable chaos namespace
+# inside the production set would put a grant to a namespace that does not exist
+# in production into every deployment.
+#
+# Read-only, and an exact mirror of deploy/rbac.yaml's Role — all three rules,
+# including the apps-group one. The first draft of this fixture carried only
+# pods, pods/log and events, and
+# test_the_chaos_grant_is_read_only_and_mirrors_the_shipped_role failed it: the
+# watcher reads deployments and replicasets, so a Role that omits them would have
+# left the in-cluster Sentinel unable to do its job while every other gate stayed
+# green. The test asserts against the shipped Role rather than a hand-kept list
+# for exactly that reason — a hand-kept list is a fourth thing to forget to
+# update.
+#
+# A fixture that granted *more* would be worse than useless: it would make the
+# run's read-only evidence describe the fixture rather than the thing shipped, and
+# a reader would have no way to tell.
+apiVersion: rbac.authorization.k8s.io
+kind: Role
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io
+kind: RoleBinding
+metadata:
+  name: srek3s-sentinel
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-sentinel
+    app.kubernetes.io/part-of: srek3s
+    srek3s.io/fixture: e2e-incluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: srek3s-sentinel
+subjects:
+  # The Sentinel's real ServiceAccount, from deploy/rbac.yaml. Not a new one:
+  # the identity under test is the one production uses.
+  - kind: ServiceAccount
+    name: srek3s-sentinel
+    namespace: srek3s-system

@@ -1530,6 +1530,16 @@ jobs:
           # is idempotent, so the overlay in the next step reconciles it.
           kubectl apply -f deploy/namespace.yaml
 
+          # The chaos-namespace grant, applied OUTSIDE kustomize on purpose.
+          #
+          # It cannot be a resource of the incluster overlay: that kustomization
+          # inherits `namespace: srek3s-system` from the deploy base, so kustomize
+          # would rewrite this Role and RoleBinding out of sentinel-chaos and the
+          # roleRef would stop resolving — a build-time error about a file that is
+          # individually valid. Same trap, same remedy as
+          # deploy/overlays/local-live/chaos-rbac.yaml.
+          kubectl apply -f tests/e2e/fixtures/incluster/chaos-rbac.yaml
+
           # --from-file, not a committed ConfigMap body. The script that runs
           # in-cluster is then byte-identical to the one the offline tests
           # import and the host-process leg runs. A transcribed copy would be a

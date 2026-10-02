@@ -123,7 +123,21 @@ def named(documents: list[dict[str, Any]], kind: str, name: str) -> dict[str, An
 
 @pytest.fixture(scope="module")
 def extra() -> list[dict[str, Any]]:
-    return load(OVERLAY / "extra-resources.yaml")
+    """Every object the in-cluster leg applies from this fixture directory.
+
+    Two files, because they are applied two different ways. `extra-resources.yaml`
+    goes through the overlay's kustomization and is therefore subject to its
+    `namespace:` transform; `chaos-rbac.yaml` is applied with `kubectl apply -f`
+    precisely so it is not, and has to live somewhere other than sentinel-chaos.
+
+    They are unioned here so that every assertion below — the chaos Role mirroring
+    the shipped one, the RoleBinding naming the real ServiceAccount, the fixture
+    marker on every object, nothing created in a production namespace by accident
+    — covers both without special-casing either. A fixture list that silently
+    covered only the kustomized half would be a test that passes while half the
+    objects under test go unchecked.
+    """
+    return load(OVERLAY / "extra-resources.yaml") + load(OVERLAY / "chaos-rbac.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -435,13 +449,81 @@ def test_the_chaos_namespace_exists_in_the_fixtures() -> None:
     Applying the overlay before the chaos namespace exists fails with
     "namespace not found" - the same ordering trap deploy/kustomization.yaml
     documents for its own namespace.yaml.
+
+    Read from `chaos-rbac.yaml` rather than through the `extra` fixture, because
+    this is specifically about WHERE the grant is applied from. It is the file
+    the workflow hands to `kubectl apply -f`, outside kustomize, precisely so the
+    overlay's `namespace:` transform cannot move it out of the namespace it binds
+    into. Asserting against the union would let a future move back into
+    extra-resources.yaml pass this test while reintroducing that defect.
     """
     chaos = one(load(DEPLOY / "chaos" / "namespace.yaml"), "Namespace")
     assert chaos["metadata"]["name"] == "sentinel-chaos"
     assert (
-        one(load(OVERLAY / "extra-resources.yaml"), "Role")["metadata"]["namespace"]
+        one(load(OVERLAY / "chaos-rbac.yaml"), "Role")["metadata"]["namespace"]
         == chaos["metadata"]["name"]
     )
+
+
+def test_the_chaos_grant_is_not_a_resource_of_the_overlay(
+    kustomization: dict[str, Any],
+) -> None:
+    """Listing it would hand it to the namespace transform, which takes it.
+
+    A kustomization that lists a file belonging to another namespace as a
+    resource gets every namespaced object in it rewritten to the kustomization's
+    `namespace:`, silently. The RoleBinding then references a Role that is not in
+    its own namespace, and the build fails with "resource mapping not found" — a
+    message about a manifest that is individually valid, which is exactly why no
+    offline lint caught it and why this is asserted directly.
+
+    Asserted on the resource LIST rather than on a rendered output, so it holds
+    without kustomize installed and without a cluster.
+    """
+    listed = [str(entry) for entry in kustomization["resources"]]
+    assert not any("chaos-rbac" in entry for entry in listed), (
+        "chaos-rbac.yaml is listed as an overlay resource, so kustomize will "
+        "rewrite it out of sentinel-chaos and the roleRef will stop resolving. "
+        f"It must be applied by kubectl -f. Listed: {listed}"
+    )
+
+
+def test_the_chaos_grant_file_exists_and_is_applied_by_the_workflow() -> None:
+    """The file is only correct because something applies it directly.
+
+    Being absent from the overlay's resources is what makes the grant safe from
+    the namespace transform, and it is also what makes it invisible: nothing in
+    the render path touches it. Deleting it, renaming it, or dropping the
+    workflow step that applies it would leave every other test here green while
+    the in-cluster Sentinel starts with no grant at all — silently unauthorised,
+    which is precisely the state this leg exists to rule out.
+
+    So the pair is asserted together: the file is present, and the e2e job
+    reaches it with `kubectl apply -f` rather than through `apply -k`.
+    """
+    grant = OVERLAY / "chaos-rbac.yaml"
+    assert grant.is_file(), f"{grant} is missing but the job applies it by path"
+    assert one(load(grant), "Role"), f"{grant} carries no Role"
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "e2e-detonation.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    bodies = "\n".join(
+        step.get("run", "")
+        for job in (workflow.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+    )
+
+    relative = grant.relative_to(REPO_ROOT).as_posix()
+    assert f"kubectl apply -f {relative}" in bodies, (
+        f"the e2e job does not apply {relative} directly; without it the "
+        "in-cluster Sentinel runs with no grant in sentinel-chaos"
+    )
+    assert (
+        f"apply -k {relative}" not in bodies
+    ), f"{relative} must not go through the overlay's namespace transform"
 
 
 # ---------------------------------------------------------------------------

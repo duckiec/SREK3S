@@ -24,6 +24,14 @@
 # Three things here could arguably belong in production. They are here anyway,
 # and that is a deliberate line.
 #
+# The Sentinel's grant in the chaos namespace now lives in chaos-rbac.yaml and is
+# applied by `kubectl apply -f` rather than through this kustomization.
+#
+# It cannot live here: this overlay inherits `namespace: srek3s-system` from the
+# deploy base, so kustomize rewrote the grant out of sentinel-chaos and the
+# roleRef stopped resolving. See chaos-rbac.yaml for the full account, and
+# deploy/base/kustomization.yaml for the transform trap it hits.
+#
 # 1. `chaos-rbac.yaml` grants the Sentinel's ServiceAccount a read-only Role in
 #    `sentinel-chaos`. deploy/rbac.yaml grants one in `srek3s-system` only, so a
 #    Sentinel scoped to any other namespace is unauthorised today. That is a
@@ -260,61 +268,6 @@ spec:
       protocol: TCP
       port: 8000
       targetPort: 8000
----
-# The Sentinel's grant in the chaos namespace.
-#
-# Read-only, and an exact mirror of deploy/rbac.yaml's Role - all three rules,
-# including the apps-group one. The first draft of this fixture carried only
-# pods, pods/log and events, and
-# test_the_chaos_grant_is_read_only_and_mirrors_the_shipped_role failed it: the
-# watcher reads deployments and replicasets, so a Role that omits them would have
-# left the in-cluster Sentinel unable to do its job while every other gate stayed
-# green. The test is asserting against the shipped Role rather than a hand-kept
-# list for exactly that reason - a hand-kept list is a fourth thing to forget to
-# update.
-#
-# A fixture that granted *more* would be worse than useless: it would make the
-# run's read-only evidence describe the fixture rather than the thing shipped,
-# and a reader would have no way to tell.
-apiVersion: rbac.authorization.k8s.io
-kind: Role
-metadata:
-  name: srek3s-sentinel
-  namespace: sentinel-chaos
-  labels:
-    app.kubernetes.io/name: srek3s-sentinel
-    app.kubernetes.io/part-of: srek3s
-    srek3s.io/fixture: e2e-incluster
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "pods/log"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io
-kind: RoleBinding
-metadata:
-  name: srek3s-sentinel
-  namespace: sentinel-chaos
-  labels:
-    app.kubernetes.io/name: srek3s-sentinel
-    app.kubernetes.io/part-of: srek3s
-    srek3s.io/fixture: e2e-incluster
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: srek3s-sentinel
-subjects:
-  # The Sentinel's real ServiceAccount, from deploy/rbac.yaml. Not a new one:
-  # the identity under test is the one production uses.
-  - kind: ServiceAccount
-    name: srek3s-sentinel
-    namespace: srek3s-system
 ---
 # The routing probe.
 #
