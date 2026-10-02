@@ -140,11 +140,27 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 		ctx = context.Background()
 	}
 
+	// uid/gid are reported here, not asserted by an operator running `id -u`.
+	//
+	// The shipped image is gcr.io/distroless/static: no shell, no `id`, no coreutils.
+	// So the effective UID of a running Sentinel cannot be observed from inside it by
+	// any means other than the process reporting it. A deployment that silently ran
+	// as the wrong user would be invisible — `kubectl exec -- id -u` fails with
+	// "executable file not found", which is indistinguishable from a pod that is not
+	// running at all.
+	//
+	// This is production observability, not a test affordance: it is how an operator
+	// confirms a hardening property that cannot be confirmed any other way. The
+	// alternative — reading `runAsUser` from the manifest — asserts the request, not
+	// the outcome, and a manifest that disagrees with the runtime is precisely the
+	// case worth catching.
 	log.Info("sentinel starting",
 		"version", version,
 		"namespace", namespaceOrAll(*namespace),
 		"workers", *workers,
 		"agent_url", *agentURL,
+		"uid", os.Getuid(),
+		"gid", os.Getgid(),
 	)
 
 	client, err := k8s.NewClientset(*kubeconfig)

@@ -1917,10 +1917,49 @@ jobs:
           #
           # It went unnoticed because the leg had never reached this step: it died
           # earlier, every run, for six commits.
+          # THE CAPTURE PROXY MUST BE SERVING BEFORE THE SENTINEL IS POINTED AT IT.
+          #
+          # The Sentinel's agent_url is `http://srek3s-capture:8000`. On 2026-10-02
+          # it logged, milliseconds after starting:
+          #
+          #   dispatch failed ... Post "http://srek3s-capture:8000/v1/incidents":
+          #     dial tcp 10.43.233.115:8000: connect: connection refused
+          #
+          # A Service with no ready endpoints is a valid object and a total routing
+          # failure — the same empty-endpoint signature the image-import assertion
+          # handles with a bounded poll. `kubectl apply -k` returns when the objects
+          # are CREATED, not when the pods are serving, so the Sentinel was being
+          # pointed at an address with nothing behind it.
+          #
+          # A bounded poll on the condition, not a sleep: it waits for ready
+          # endpoints, fails if they never arrive, dumps pod state on timeout.
+          capture_deadline=$((SECONDS + 120))
+          capture_ready=""
+          while [ "$SECONDS" -lt "$capture_deadline" ]; do
+            capture_ready=$(kubectl -n srek3s-system get endpoints srek3s-capture \
+                              -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -n "$capture_ready" ]; then
+              break
+            fi
+            echo "  waiting for srek3s-capture endpoints ..."
+            kubectl -n srek3s-system get pods -l srek3s.io/capture=true \
+              -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready,PHASE:.status.phase' || true
+            sleep 3
+          done
+          if [ -z "$capture_ready" ]; then
+            echo "::error::srek3s-capture published no ready endpoints within 120s;"
+            echo "::error::the Sentinel's agent_url would resolve to nothing"
+            kubectl -n srek3s-system describe deployment srek3s-capture || true
+            kubectl -n srek3s-system get events --sort-by=.lastTimestamp | tail -20 || true
+            exit 1
+          fi
+          echo "  capture proxy has ready endpoints: $capture_ready"
+
           kubectl -n srek3s-system patch deployment srek3s-sentinel --type=strategic -p '{
             "spec": {"template": {"spec": {"containers": [
               {"name": "sentinel", "env": [
-                {"name": "SREK3S_AGENT_URL", "value": "http://srek3s-capture:8000"}
+                {"name": "SREK3S_AGENT_URL", "value": "http://srek3s-capture:8000"},
+                {"name": "WATCH_NAMESPACE", "value": "sentinel-chaos"}
               ]}
             ]}}}
           }' >/dev/null
@@ -1954,13 +1993,52 @@ jobs:
           # manifest. deploy/sentinel.yaml and cmd/sentinel/Dockerfile both declare
           # 10001 and a test asserts they agree; this asserts the running process
           # agrees with both.
-          uid="$(kubectl -n srek3s-system exec deploy/srek3s-sentinel -- id -u 2>/dev/null || echo unknown)"
-          echo "  in-container uid: $uid"
-          if [ "$uid" != "10001" ]; then
-            echo "::error::the in-cluster Sentinel runs as uid $uid, not 10001"
+          #
+          # READ FROM THE STARTUP LOG, NOT `kubectl exec -- id -u`.
+          #
+          # The shipped image is gcr.io/distroless/static: no shell, no `id`, no
+          # coreutils. `kubectl exec -- id -u` therefore fails with "executable
+          # file not found", which the previous form swallowed via
+          # `|| echo unknown` and then reported as:
+          #
+          #     in-container uid: unknown
+          #     ::[error]the in-cluster Sentinel runs as uid unknown, not 10001
+          #
+          # A real failure, but a false accusation: the pod runs as 10001, and
+          # `USER 10001:10001` in the Dockerfile says so. The assertion could not
+          # run, which means it was not asserting anything — and an assertion that
+          # cannot run is worse than none, because it looks like coverage.
+          #
+          # Not fixed by adding `id` to the image: the absence of a shell is the
+          # hardening. The Sentinel reports its own effective uid and gid in its
+          # startup log instead, which is production observability rather than a
+          # test affordance — in a shell-less container it is the only way to
+          # observe the property at all. Reading `runAsUser` from the manifest
+          # instead would assert the REQUEST, not the outcome.
+          sentinel_log="$(kubectl -n srek3s-system logs deployment/srek3s-sentinel \
+                            --tail=40 2>/dev/null || true)"
+          echo "  sentinel startup record:"
+          echo "$sentinel_log" | grep '"msg":"sentinel starting"' | sed 's/^/    /' || true
+
+          uid_ok=0
+          gid_ok=0
+          # Checked independently rather than as one ordered pattern. A single
+          # `*'"uid":10001'*'"gid":10001'*` also works today, because main.go
+          # emits uid before gid — but it makes the assertion depend on the ORDER
+          # OF FIELDS IN A LOG LINE, so reordering them would fail it for no real
+          # reason. Two independent checks cannot have that failure mode.
+          case "$sentinel_log" in *'"uid":10001'*) uid_ok=1 ;; esac
+          case "$sentinel_log" in *'"gid":10001'*) gid_ok=1 ;; esac
+
+          if [ "$uid_ok" = 1 ] && [ "$gid_ok" = 1 ]; then
+            echo "  ok: the in-cluster Sentinel runs as UID/GID 10001 (observed from inside)"
+          else
+            echo "::error::the in-cluster Sentinel reported uid_ok=$uid_ok gid_ok=$gid_ok;"
+            echo "::error::observed from its own startup log, not from the manifest"
+            echo "--- the Sentinel's log ---"
+            echo "$sentinel_log"
             exit 1
           fi
-          echo "  ok: the in-cluster Sentinel runs as UID 10001"
 
           # The -version exec that the liveness probe depends on. Asserted through
           # a rollout already, but explicitly here so a failure names the probe
