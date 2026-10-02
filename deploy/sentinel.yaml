@@ -28,10 +28,39 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: srek3s-sentinel
+      # THE DISCRIMINATOR. A Deployment's selector must identify its OWN pods and
+      # nothing else on the cluster, and `app.kubernetes.io/name` alone does not.
+      #
+      # The e2e fixtures — the capture proxy and the route probe — deliberately
+      # impersonate `app.kubernetes.io/name: srek3s-sentinel`, because that is the
+      # label deploy/agent.yaml's ingress NetworkPolicy admits. So the Sentinel's
+      # selector also matched three other components' pods:
+      #
+      #     selector of srek3s-sentinel -> matched by
+      #       ['srek3s-capture', 'srek3s-route-probe', 'srek3s-sentinel']
+      #
+      # and `kubectl logs deployment/srek3s-sentinel` returned the CAPTURE PROXY's
+      # stdout. The step asserting the Sentinel reported its namespace scope read
+      # the wrong component entirely and reported "the in-cluster Sentinel did not
+      # report a namespace scope" — a confident, specific, wrong answer.
+      #
+      # This label is the one thing a fixture cannot claim without also declaring
+      # itself to be the Sentinel, which is the point: impersonating a network
+      # identity and claiming to be a workload are different acts and are now
+      # expressed by different labels.
+      #
+      # NOTE: `spec.selector` is IMMUTABLE. Upgrading an existing installation
+      # requires deleting the Deployment first. See UPGRADING.md.
+      srek3s.io/component: sentinel
   template:
     metadata:
       labels:
         app.kubernetes.io/name: srek3s-sentinel
+        # Must mirror spec.selector.matchLabels exactly, or the Deployment is
+        # rejected with "`selector` does not match template `labels`". Kept
+        # adjacent to it for that reason: they are one declaration split in two,
+        # and the reason they are split at all is Kubernetes' immutability rule.
+        srek3s.io/component: sentinel
         # Explicit, and also supplied by deploy/kustomization.yaml's
         # commonLabels. Written here so the file and the render agree — see the
         # note on the selector in deploy/service.yaml for why that divergence

@@ -267,6 +267,86 @@ def rendered_overlay() -> list[dict[str, Any]]:
     return render(OVERLAY)
 
 
+def test_no_rendered_deployments_selector_can_reach_another_components_pods(
+    rendered_overlay: list[dict[str, Any]],
+) -> None:
+    """Every Deployment must select its own pods and nobody else's.
+
+    This is a mathematical property of the rendered manifests, and it is the
+    invariant whose absence made an assertion read the wrong component:
+
+        selector of srek3s-sentinel -> matched by
+          ['srek3s-capture', 'srek3s-route-probe', 'srek3s-sentinel']
+
+    The capture proxy and the route probe impersonate
+    `app.kubernetes.io/name: srek3s-sentinel` on purpose — that is the label the
+    agent's ingress NetworkPolicy admits — and that label was also the Sentinel
+    Deployment's entire selector. So `kubectl logs deployment/srek3s-sentinel`
+    returned the CAPTURE PROXY's stdout, and the step asserting the Sentinel
+    reported its namespace scope read the wrong program and produced a confident,
+    specific, wrong answer.
+
+    Nothing about impersonating a network identity should make a workload
+    indistinguishable from the real workload. `srek3s.io/component` is the
+    discriminator: it is the one label a fixture cannot claim without declaring
+    itself to be the component it is imitating.
+
+    Asserted on the RENDER, because that is where a transform could reintroduce
+    the collision — and a transform did, once, via `commonLabels`.
+    """
+    deployments = {
+        d["metadata"]["name"]: d
+        for d in rendered_overlay
+        if d.get("kind") == "Deployment"
+    }
+    assert len(deployments) >= 2, (
+        "expected several Deployments to compare; the collision check would be "
+        "vacuous with fewer"
+    )
+
+    collisions: list[str] = []
+    for owner, deployment in deployments.items():
+        selector = deployment["spec"]["selector"]["matchLabels"]
+        for other, candidate in deployments.items():
+            if other == owner:
+                continue
+            labels = candidate["spec"]["template"]["metadata"]["labels"]
+            if _selected_by(selector, labels):
+                collisions.append(
+                    f"{owner}'s selector {selector} also matches {other}'s pods "
+                    f"{labels}; `kubectl logs deployment/{owner}` may read "
+                    f"{other}"
+                )
+
+    assert not collisions, (
+        "a Deployment selector matched another component's pods. Label "
+        "impersonation for NetworkPolicy admission must not make a fixture "
+        "indistinguishable from the workload it imitates: " + "; ".join(collisions)
+    )
+
+
+def test_each_rendered_deployment_selector_is_unique(
+    rendered_overlay: list[dict[str, Any]],
+) -> None:
+    """No two Deployments may share a selector.
+
+    A shared selector is the degenerate case of the collision above: two
+    Deployments whose pods are mutually reachable, so neither can be addressed by
+    name at all.
+    """
+    by_selector: dict[tuple[tuple[str, str], ...], list[str]] = {}
+    for name, deployment in (
+        (d["metadata"]["name"], d)
+        for d in rendered_overlay
+        if d.get("kind") == "Deployment"
+    ):
+        key = tuple(sorted(deployment["spec"]["selector"]["matchLabels"].items()))
+        by_selector.setdefault(key, []).append(name)
+
+    shared = {str(dict(k)): v for k, v in by_selector.items() if len(v) > 1}
+    assert not shared, f"two or more rendered Deployments share a selector: {shared}"
+
+
 def _netpol(documents: list[dict[str, Any]], name: str) -> dict[str, Any]:
     return next(
         d
