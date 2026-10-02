@@ -518,8 +518,9 @@ with a read-only root and no mounted token. It does not detonate anything; that
 chain is the detonation leg's job, and duplicating it would re-prove a layer that
 is not in question to cover one that is.
 
-Three of the 819 Python tests skip locally and print `BLOCKED DEPENDENCY, not a
-pass`. They need a reachable cluster. On the current `Fedora 44` / `linux/aarch64`
+Four of the 819 Python tests skip and print `BLOCKED DEPENDENCY, not a
+pass`. Three need a reachable cluster. The fourth needs a filesystem that folds
+case, which is a Windows property — CI is `ubuntu-latest`, so it skips there too. On the current `Fedora 44` / `linux/aarch64`
 host `go test -race` and the container build are **no longer** blocked — `gcc` is
 installed and Docker is running (behind `sudo`) — so they can be run locally and
 must be *reported as run*, not as blocked. On the earlier `windows/arm64` host
@@ -633,7 +634,7 @@ Or individually:
 ```bash
 PY=~/SREK3S/.venv311/bin/python
 go test -race ./...                 # 819 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 819 passed, 3 skipped
+$PY -m pytest agent/tests/ -q       # 819 passed, 4 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/

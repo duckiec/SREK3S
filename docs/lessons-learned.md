@@ -1032,6 +1032,64 @@ nobody asked with a confidence nobody had earned.
 
 ---
 
+### `Path.exists()` Is Case-Insensitive On Windows And Case-Sensitive On Linux (v1.0.1 follow-on)
+
+- **What happened:** `AGENTS.md` was tracked in git as `AGENTS.MD` — an uppercase
+  file extension — while every other markdown file in the repository used
+  lowercase, and while `ARCHITECTURE.md` §3's layout tree names it `AGENTS.md`.
+  The layout validator added earlier in this phase, which parses that tree and
+  asserts every path it names exists, passed on every local run.
+  It would have failed on **every** CI run of the same commit, on `ubuntu-latest`,
+  because `_ROOT / "AGENTS.md"` does not resolve on ext4 when the file on disk is
+  `AGENTS.MD`.
+
+  Found while committing unrelated work, not by a gate. The sequence was:
+  `git status` reported a clean tree, so the file looked tracked and current;
+  `git show HEAD:AGENTS.md` failed with *"path exists on disk, but not in
+  'HEAD'"*, which is the message git gives when the name differs in case. The
+  check that located it was comparing the git index against the layout tree
+  entry-by-entry rather than asking `Path.exists()`.
+
+- **Why it is a problem:** The validator was *weaker on the machine that ran it
+  most often than on the machine that runs it in CI.* `pathlib.Path.exists()`
+  resolves case-insensitively on NTFS and case-sensitively on ext4, so the same
+  assertion had two different meanings depending on where it executed. A gate
+  whose behaviour depends on the filesystem it runs on is not a gate; it is a
+  coin flip that lands green on the developer's desk.
+
+  The specific damage is a **latent red build**. The commit that introduced the
+  validator (`e4011eb`, the v1.0.0 README) is the same commit that introduced the
+  failure, so CI has been failing — or would have been, on the first run since —
+  for a reason that has nothing to do with anything anyone changed. The next
+  person to push would have found an unexplained failure in a check they had
+  written, on a file they had not touched, and the cheapest available response
+  would have been to delete the check.
+
+  It is also the fourth instance of the same shape in this repository, which is
+  what makes it worth more than a one-line `git mv`: a document or a check
+  asserts something about the filesystem, and nothing verifies that the
+  assertion is true *on every filesystem the project runs on*.
+
+- **How we fixed it:** `git mv AGENTS.MD AGENTS.md`, in two steps, because a
+  case-insensitive filesystem cannot perform a case-only rename in one. The
+  intermediate name is what makes it work: the first move gets the file off the
+  tracked name, the second puts it back under the correct casing.
+
+  The fix that matters is in the check, not the filename.
+  `test_architecture_layout.py` no longer calls `Path.exists()`. It walks the
+  path one component at a time through `os.listdir()` and compares each part
+  against the directory's actual entries as exact strings, which behaves
+  identically on NTFS and ext4. A developer on Windows and a runner on Linux now
+  get the same answer to the same question.
+
+  When a path fails the exact check but succeeds a case-insensitive one, the
+  failure is reported as a *spelling* problem and names what the file is actually
+  called — `"AGENTS.md (declared as a file, but the file on disk is spelled
+  'AGENTS.MD' - a clone on a case-sensitive filesystem will not have this path)"`.
+  On a case-insensitive filesystem "not on disk" and "spelled differently" are
+  indistinguishable by probing, and a reader left to guess which one occurred
+  will guess wrong.
+
 ## 26. Watch Scope And Grant Disagree, And Neither Test Compares Them (v1.0.1 follow-on)
 
 **Status of this entry, stated before anything else: this is a reconstruction,
@@ -1623,3 +1681,65 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   that it did — the same rule this file keeps arriving at for negative controls. A
   verification step that can destroy the thing it is verifying needs a stronger
   completion check than one that only reads.
+
+## 31. A Negative Control That Could Only Ever Pass On NTFS, In A Commit About Windows Case-Folding (v1.0.2)
+
+- **What happened:** Merging `fa1e89f` (pushed directly to GitHub, never run locally
+  on this host) surfaced a failing test:
+  `test_the_case_exact_check_fails_on_a_wrongly_cased_path`. That commit is *about*
+  the fact that `Path.exists()` folds case on Windows and does not on Linux, it
+  rewrites `_exists_exact` to walk `os.listdir()` component by component, and it
+  adds this control. On this host — Fedora 44, ext4 — the control fails.
+
+  Two assertions are host-dependent, and both require the filesystem to **fold**
+  case:
+
+      assert (_ROOT / flipped).exists(), "control is vacuous on a case-insensitive
+                                          filesystem: ..."
+
+      assert "spelled" in reported[0], ...
+
+  The first is visible. The second was **masked by it** and only appeared after the
+  first was worked around — which is the more dangerous half, because it is not a
+  precondition at all but an assertion on output. `_unresolved` reaches the spelling
+  branch only when `not _exists_exact(path)` **and** `target.exists()`, so on ext4
+  the diagnostic is unreachable by construction and `"spelled" in reported[0]` can
+  never be true. The control could only ever pass where case folds.
+
+- **Why it is a problem:** CI runs on `ubuntu-latest` — ext4. So this control fails
+  on **every CI run**, in the one commit whose entire subject is that the gate was
+  weaker on the machine that ran it than on the machine that runs it in CI. The
+  commit message reasons correctly about the mechanism and then encodes the very
+  assumption it had just argued against, as a hard `assert`. Its own post-mortem
+  even records that an earlier version of this control "asserted a case-insensitive
+  probe succeeds, which holds on Windows and would raise FileNotFoundError on Linux,
+  erroring at collection instead of tripping the guard" — so the hazard was
+  identified, documented, and then reintroduced in the same shape one commit later.
+  Nothing local could have caught it: **the commit was never run on a
+  case-sensitive filesystem.**
+
+- **How we fixed it:** The control is split. Host-independent assertions stay
+  ungated and run everywhere — `_exists_exact` resolves the real name, rejects the
+  case-flipped one, and an absent path is reported as *absent*. The two
+  host-dependent assertions move behind a single `if not (_ROOT / flipped).exists():`
+  gate that calls `pytest.skip` with a reason stating it is a **BLOCKED DEPENDENCY,
+  not a pass**, which diagnostic is unreachable here and why. The skip branch
+  gained its own assertion (`"not on disk" in reported[0]`), so gating costs no
+  coverage rather than simply declining to run.
+
+  **What has not been verified:** the gated half — that the report names the
+  spelling problem and names the file's real spelling — cannot be observed on this
+  host and was not observed. It remains unexercised here, exactly as it was
+  unexercised before this change; what changed is that it no longer fails a suite it
+  has no way to pass.
+
+- **The generalisable form:** **A control inherits the host assumptions of the
+  mechanism it controls.** When a control's purpose is to demonstrate that check A is
+  stricter than probe B, the control needs a filesystem where B accepts the input and
+  A does not — and if that host property does not hold, the control is asserting
+  something about the *host*, not about the code. The tell is an assertion whose
+  failure message describes the machine rather than the defect. And the second
+  lesson is about masking: this one had two independent host-dependent assertions,
+  and fixing the visible one revealed the hidden one. **Fixing a failing test
+  without asking what else was behind it is how a masked defect gets promoted to
+  "fixed".**
