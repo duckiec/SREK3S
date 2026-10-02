@@ -1733,6 +1733,18 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   unexercised before this change; what changed is that it no longer fails a suite it
   has no way to pass.
 
+  **SUPERSEDED BY OBSERVATION (2026-10-01).** The inference in this entry that CI
+  would fail is no longer an inference. Run #68 on `fa1e89f` was read from the
+  GitHub API and it failed, in CI, at exactly this test:
+
+      FAILED agent/tests/test_architecture_layout.py::test_the_case_exact_check_fails_on_a_wrongly_cased_path
+      AssertionError: control is vacuous on a case-insensitive filesystem
+      1 failed, 766 passed, 3 skipped
+
+  Run #69, on the merge that restructured this control, is green across all three
+  jobs. The mechanism predicted here from a local measurement was confirmed by the
+  thing it predicted. See §32.
+
 - **The generalisable form:** **A control inherits the host assumptions of the
   mechanism it controls.** When a control's purpose is to demonstrate that check A is
   stricter than probe B, the control needs a filesystem where B accepts the input and
@@ -1743,3 +1755,135 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   and fixing the visible one revealed the hidden one. **Fixing a failing test
   without asking what else was behind it is how a masked defect gets promoted to
   "fixed".**
+
+## 32. A CI Failure Blamed On The Merge That Fixed It (v1.0.2)
+
+- **What happened:** A request arrived asserting that "the recent merge to main
+  broke the GitHub Actions CI pipeline" and asking which step failed. The merge in
+  question was `d90cf61`. The actual state, read from the GitHub API rather than
+  assumed:
+
+  | Run | SHA | Conclusion |
+  |---|---|---|
+  | #63–#67 | various | **failure** |
+  | #68 | `fa1e89f` | **failure** |
+  | #69 | `d90cf61` | **success**, all 3 jobs, every step green |
+
+  Six consecutive red runs, all of them predating the merge. The merge is the
+  first green run in seven. The premise was inverted.
+
+- **Why it is a problem:** Not because the premise was wrong — that cost one API
+  call to establish. Because the *correct* version of the report was already
+  available and more valuable: run #68's log contains the literal failure that §31
+  predicted, observed rather than inferred:
+
+      FAILED agent/tests/test_architecture_layout.py::test_the_case_exact_check_fails_on_a_wrongly_cased_path
+      AssertionError: control is vacuous on a case-insensitive filesystem
+      1 failed, 766 passed, 3 skipped
+
+  And §31 had been written as "That CI would have failed is inferred from the
+  mechanism measured here; no CI run has been witnessed." It has now been
+  witnessed. A merge presented as a regression invites a rollback of the fix, and
+  the rollback would restore a control that cannot pass on any Linux runner.
+
+- **How we fixed it:** Reported the divergence before acting on the request, with
+  the run table as evidence. §31's inference is annotated as now-observed rather
+  than edited to read as though it had always been. The work that was actually
+  worth doing — hardening the control so it skips honestly on ext4 — had already
+  been done in `d90cf61`, and CI agreed.
+
+- **The generalisable form:** "The last change broke it" is the most common first
+  report about a red pipeline and the most expensive thing to act on, because the
+  most recent change is the one most likely to be *innocent* — a red run that
+  predates it is a red run someone has been living with, and the newest commit is
+  the easiest thing to revert. **Read the run list before the theory.** Six red
+  runs ending at the previous commit and one green at the merge is a completely
+  different problem from "the merge broke it", and only one of them is fixed by
+  reverting.
+
+## 33. A Step Named "Check" That Contained No Check (v1.0.2)
+
+- **What happened:** Reading `release.yaml` as part of a CI review turned up a step
+  named **"Check the tag against the committed image references"**. It greps the
+  committed manifests, echoes them, prints a NOTE about the registry mismatch, and
+  reaches the end of the script. There is no comparison. It has no branch that
+  exits non-zero. It cannot fail, and it sits in the release path.
+
+- **Why it is a problem:** It is the exact failure this file keeps recording, in
+  the place where being wrong costs the most: a guard that cannot fail wearing the
+  name of one that can. A reviewer skimming names — which is how workflows get
+  reviewed — reads "Check" and moves on. Worse, its existence suggests the
+  tag/manifest consistency problem is handled, and the day it is handled *wrong*
+  the reader will not look for the second place.
+
+  The honest constraint is that a real equality gate is unavailable: the manifests
+  carry `registry.internal/srek3s-*:0.1.0` while a release publishes the tag, so
+  asserting equality is a permanent red build over a documented registry mismatch.
+
+- **How we fixed it:** Renamed to **"Report the committed image references (not a
+  gate)"** and recorded, in the step itself, why it is a report and what would make
+  it a real check. The asymmetry is now in the name and in the comment, so the next
+  person is told what to do instead of what was assumed.
+
+- **Also fixed in the same review: a check that counted instead of naming.**
+  "Verify both images are multi-arch" asserted `len(manifests) >= 2`. A manifest
+  list carrying two entries for the *same* architecture satisfies that, and the
+  step's own comment claimed the guarantee was "a node that cannot use one of them
+  fails visibly at pull time rather than running the wrong binary" — a claim that
+  requires both architectures specifically. It now parses the `os/architecture`
+  pairs and requires `linux/amd64` and `linux/arm64` **by name**. Verified against
+  seven manifest shapes: amd64+arm64 passes, amd64-only, arm64-only, empty,
+  platform-less entries, and **two amd64 entries** are all refused.
+
+- **The generalisable form:** A threshold is not a specification. `>= 2` encodes
+  "at least two of something"; "amd64 and arm64" encodes "both of these". They
+  differ on exactly the input the check exists to catch. And a step's *name* is an
+  assertion a reader will trust without reading the body — which makes a name that
+  overclaims a defect in its own right, independent of whatever the body does.
+
+## 34. An Embedded Script Written To Work Around Its Own Host, Then Shipped That Way (v1.0.2)
+
+- **What happened:** While rewriting `release.yaml`'s manifest verification, the
+  embedded parser had to avoid single quotes — it was being passed to
+  `python3 -c '...'`, and a single-quoted shell string cannot contain one. The
+  first draft solved this with a no-op:
+
+      out.add(f"{p[chr(39)+chr(39)] if False else p['os']}/{p['architecture']}")
+
+  It evaluates correctly. It is unreadable, it says nothing about why the
+  constraint exists, and a later reader cannot tell it from a typo. In the same
+  edit, `timeout-minutes: 20` was placed *after* `run: |`, putting a YAML key
+  inside a shell script body where it would have executed as a command.
+
+- **Why it is a problem:** Both would have been caught by the cheapest possible
+  check — the workflow auditor, which already parses every `run:` block with
+  `bash -n` — but it was not run until after both were written. The `chr(39)`
+  construct is the more interesting of the two, because it is a *workaround that
+  survives review*: it is valid, it produces the right value, and no test fails.
+  The honest signal that it is wrong is that nobody could explain it, and I could
+  not, which is the moment to remove the constraint rather than to encode it.
+
+- **How we fixed it:** Removed the constraint instead of encoding it. The raw
+  manifest JSON goes to a temp file and the parser is a `<<'PY'` heredoc — a
+  *quoted* heredoc, which the shell does not interpret at all, so the Python can use
+  whatever quoting it likes. That also matches the shape the surrounding comment
+  already demanded for an unrelated reason (piping into a reader is a SIGPIPE race
+  under `pipefail`), so the fix reduced the number of concepts rather than adding
+  one. `timeout-minutes` moved above `run:`.
+
+  Both scripts were then extracted from the shipped YAML and executed against
+  real inputs: the parser against seven manifest shapes, and the CI skip ratchet
+  against eight synthetic pytest reports. The ratchet run found two further holes
+  — it passed a report containing `1 failed`, and passed one containing
+  `3 errors` — both fixed and both now covered by a case.
+
+- **The generalisable form:** **A workaround that cannot fail is not a working
+  solution, it is an undocumented constraint.** When you find yourself encoding
+  something bizarre, the question is not "what expression produces the value" but
+  "why is the constraint here at all" — and the answer is usually that a different
+  shape has no problem. Separately: a heredoc is the right tool for embedded code
+  almost always, and the fact that this workflow already needed `pipefail`-safe
+  capture meant the constraint-solving rewrite could *reduce* complexity instead of
+  adding it. And an embedded script nobody can run locally is an untested script —
+  extracting it from the YAML and executing it against real inputs is cheap, and it
+  found two defects on its first run.

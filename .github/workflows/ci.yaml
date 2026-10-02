@@ -2,12 +2,52 @@ name: ci
 
 # Remote execution of the AGENTS.md §4 quality gates.
 #
-# Why this exists: gate G3 is `go test -race`, and the Go race detector is not
-# supported on windows/arm64, which is the primary development host. G3 is
-# never waived (ARCHITECTURE.md AD-10), so it runs here on ubuntu-latest
-# instead. This workflow is the authoritative G3 record, and it is also the
-# authoritative measurement of the 20 MiB/s scrubber throughput target, which is
-# asserted at full strength only on the linux target platform.
+# WHY THIS EXISTS. Gate G3 is `go test -race`, and the Go race detector is not
+# available on the `windows/arm64` host that was the primary development target.
+# G3 is never waived (ARCHITECTURE.md AD-10), so it runs here on ubuntu-latest
+# instead. This workflow is also the authoritative measurement of the scrubber
+# throughput target, which is asserted only on the linux target platform.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS WORKFLOW DECIDES, AND WHAT IT DOES NOT
+# ---------------------------------------------------------------------------
+# It decides everything that is decidable without a cluster, on every pull
+# request. It decides nothing about a running cluster — that is
+# `e2e-detonation.yaml`, which needs a kubeconfig this workflow must never hold.
+#
+# ---------------------------------------------------------------------------
+# THE SKIP POLICY, STATED EXPLICITLY
+# ---------------------------------------------------------------------------
+# `pytest` exits 0 when a test is skipped. It also exits 0 when EVERY test is
+# skipped. Those are the same exit code, so "the suite is green" is not by itself
+# evidence that anything ran — and a suite that has been quietly emptied is the
+# exact failure this repository keeps finding.
+#
+# So skips are handled in three places rather than left to pytest's default:
+#
+#   1. `-rs` prints every skip and its reason, so a skip is legible in the log
+#      rather than being a number.
+#   2. A ratchet step fails the build when the skip count RISES. Adding a skip to
+#      get to green is then a deliberate, reviewable edit rather than a free
+#      action. The count FALLING is allowed: a previously blocked dependency
+#      becoming runnable is strictly better and must not require editing this file
+#      to be recorded.
+#   3. A host probe prints the filesystem's case behaviour, because one skip is
+#      conditional on it and an unexplained skip is indistinguishable from a
+#      quietly deleted test.
+#
+# Each current skip is a BLOCKED DEPENDENCY with a named reason, not a pass:
+# three need a reachable cluster, and one needs a filesystem that folds case.
+#
+# ---------------------------------------------------------------------------
+# ACTION VERSIONS
+# ---------------------------------------------------------------------------
+# Pinned to majors, verified against the upstream release API rather than from
+# memory. Run #68 (2026-10-01) emitted: "Node.js 20 is deprecated. The following
+# actions target Node.js 20 but are being forced to run on Node.js 24:
+# actions/checkout@v4, actions/setup-python@v5." A warning today is a hard
+# failure when the forced runtime is withdrawn, so every action here is on a
+# major that does not target Node 20.
 
 on:
   push:
@@ -16,17 +56,73 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege for the whole workflow. No job here holds `packages: write`;
+# `release.yaml` is the only workflow that may, and only on its publishing job.
+# `agent/tests/test_workflows.py` asserts both halves by reading the structure,
+# because a grep cannot tell a comment explaining what is *not* done from a step
+# that does it.
 permissions:
   contents: read
 
+# One run per ref. A push supersedes an in-flight run on the same ref and cancels
+# it, so the check a reviewer reads is the one matching HEAD rather than the
+# slowest one queued behind it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   GO_VERSION: "1.23"
+  PYTHON_VERSION: "3.11"
+  # Known-blocked tests. See the skip policy above; do not raise this number to
+  # make a build pass — raise it only after establishing what the new skip is.
+  EXPECTED_SKIPS: "4"
 
 jobs:
+  # -------------------------------------------------------------------------
+  # First, and cheapest. Nothing else matters if the workflow definitions are
+  # broken.
+  # -------------------------------------------------------------------------
+  workflow-audit:
+    name: Workflow definition audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Deliberately not `needs:`-chained to the gates below, for the same reason
+    # the multi-arch job is independent: a workflow-defect failure is a different
+    # diagnosis from a test failure, and serialising them makes a red run
+    # ambiguous about which thing broke.
+    #
+    # `scripts/audit_workflow.py` existed to catch four CI failures in a row that
+    # were shell defects — a `kubectl` contacting the apiserver before it existed,
+    # an unpiped `curl | sh` that exits 0 on a failed download, a `producer |
+    # grep -q` SIGPIPE race that reports a passing check as failing, and a
+    # multi-command `if` whose branch is decided by the last command alone. It was
+    # wired only into `e2e-detonation.yaml`, so the gate that audits CI never ran
+    # on a pull request. It is a pre-push habit that nothing enforced, which is the
+    # same as not existing.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the auditor's only dependency
+        # The auditor reads workflows with PyYAML and shells out to `bash -n`.
+        # Pinned rather than ranged for the same reason the runtime image is:
+        # a gate should not change because an upstream release happened.
+        run: python -m pip install --disable-pip-version-check "pyyaml==6.0.2"
+
+      - name: Audit the workflow definitions
+        # --strict promotes WARN to failure. The baseline is zero WARN: the one
+        # WARN the auditor can emit is "no bash found", which cannot happen on a
+        # Linux runner, and a warning that cannot fire here should not be a
+        # warning that is tolerated here.
+        run: python scripts/audit_workflow.py --strict
+
   go-gates:
     name: Go quality gates (G1, G2, G3)
     runs-on: ubuntu-latest
@@ -34,10 +130,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -54,11 +150,11 @@ jobs:
       - name: G1 — go vet
         run: go vet ./...
 
-      # Not in AGENTS.md 4, but it is the check that would have caught a real
-      # outage. A helper defined only in a "!race"-tagged file is undefined
-      # under the -race build, so G3 fails to compile while G1 and G2 pass:
-      # those two typecheck the other variant. This typechecks the -race file
-      # set without needing a race runtime.
+      # Not in AGENTS.md §4, but it is the check that would have caught a real
+      # outage. A helper defined only in a "!race"-tagged file is undefined under
+      # the -race build, so G3 fails to compile while G1 and G2 pass: those two
+      # typecheck the other variant. This typechecks the -race file set without
+      # needing a race runtime.
       - name: Typecheck -race build variant
         run: go vet -tags race ./...
 
@@ -74,11 +170,11 @@ jobs:
       # into G3, so a failure names which pass condition broke.
       #
       # The comment on the -run filter is not decoration. A -run pattern that
-      # matches nothing exits 0, and that is exactly how this command reported
-      # success while asserting nothing: no test was named TestNilPointerSafety,
-      # so item 1 of its five pass conditions had no test behind it.
-      # TestTerminalCommandFiltersMatchRealTests is the guard, and it lives in the
-      # Go suite so it runs whether or not this step does.
+      # matches nothing exits 0, and that is exactly how this command once
+      # reported success while asserting nothing: no test was named
+      # TestNilPointerSafety, so item 1 of its five pass conditions had no test
+      # behind it. TestTerminalCommandFiltersMatchRealTests is the guard, and it
+      # lives in the Go suite so it runs whether or not this step does.
       - name: M3 terminal validation
         run: |
           go test -race -timeout 30s \
@@ -104,19 +200,19 @@ jobs:
   python-gates:
     name: Python quality gates (G4, G5, G6)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
         with:
           # Pinned exactly, not to a range. The runtime image is
           # python:3.11-slim (ARCH §2), and a floating 3.11.x would let the gate
           # pass on an interpreter the container never runs.
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: agent/requirements.txt
 
@@ -128,8 +224,8 @@ jobs:
       - name: Reject GPU/torch dependencies (ARCH §2)
         # AGENTS.md §2 forbids PyTorch, CUDA and GPU dependencies absolutely.
         # Checked against non-comment lines only: the file's own header explains
-        # the prohibition in prose, and a naive grep matches its own
-        # documentation and fails the build for the wrong reason.
+        # the prohibition in prose, and a naive grep matches its own documentation
+        # and fails the build for the wrong reason.
         run: |
           if grep -vE '^\s*#' agent/requirements.txt \
              | grep -iE 'torch|cuda|cupy|nvidia|onnxruntime-gpu'; then
@@ -147,8 +243,123 @@ jobs:
       - name: G6 — mypy --strict
         run: mypy --strict agent/ tests/
 
+      # Print the host's case behaviour before the suite runs, so the one
+      # case-conditional skip has a visible cause in the log rather than appearing
+      # as an unexplained number. `Path.exists()` folds case on NTFS and does not
+      # on ext4, and this repository runs on both — that asymmetry made a negative
+      # control unreachable rather than failing, once, and the fix was only possible
+      # because the mechanism was written down. See docs/lessons-learned.md §31.
+      - name: Probe host case-sensitivity (explains one expected skip)
+        run: |
+          python - <<'PY'
+          import pathlib, tempfile
+
+          directory = pathlib.Path(tempfile.gettempdir())
+          probe = directory / "SREK3S_CASE_PROBE"
+          try:
+              probe.write_text("x", encoding="utf-8")
+              # The question that decides the skip: does a differently-cased
+              # spelling of a file that exists resolve?
+              folded = (directory / probe.name.lower()).exists()
+          finally:
+              probe.unlink(missing_ok=True)
+
+          print(f"  temp dir              : {directory}")
+          print(f"  case is folded        : {folded}")
+          if folded:
+              print("  case-conditional test : will RUN here")
+          else:
+              print("  case-conditional test : will SKIP here (ext4-like), by design")
+          PY
+
+      # `tee` so the report is both streamed live and available to the ratchet
+      # below. `|| rc=${PIPESTATUS[0]}` rather than bare `set -e`, because errexit
+      # would abandon the pipeline before PIPESTATUS could be read — and the
+      # failure has to be reported, not swallowed by a missing variable.
+      #
+      # `-rs` prints each skip with its reason. Without it a skip is a bare count
+      # and the reader has to guess which of the four it is.
       - name: Python unit tests
-        run: pytest agent/tests/ -q
+        timeout-minutes: 8
+        run: |
+          rc=0
+          pytest agent/tests/ -q -rs 2>&1 | tee "$RUNNER_TEMP/pytest-report.txt" || rc=${PIPESTATUS[0]}
+          echo "pytest exit code: $rc"
+          exit "$rc"
+
+      # The ratchet. A skip is a BLOCKED DEPENDENCY with a named cause, so the
+      # count is expected to be non-zero and the expectation is explicit. What is
+      # NOT acceptable is the count silently rising, because the cheapest way to
+      # make a red build green is to skip the test that is red.
+      #
+      # Rising fails. Falling passes, deliberately: a blocked dependency becoming
+      # runnable is an improvement, and requiring this file to be edited to record
+      # an improvement is a tax that teaches people to leave EXPECTED_SKIPS high.
+      #
+      # The parser is strict on purpose. If it cannot find the summary line it
+      # fails rather than assuming a count, because "I could not tell how many
+      # tests ran" must not read as "the number was fine".
+      - name: Skip ratchet (a rising skip count means coverage was dropped)
+        timeout-minutes: 3
+        run: |
+          python - "$RUNNER_TEMP/pytest-report.txt" "$EXPECTED_SKIPS" <<'PY'
+          import pathlib, re, sys
+
+          report_path, expected_raw = sys.argv[1], sys.argv[2]
+          expected = int(expected_raw)
+          text = pathlib.Path(report_path).read_text(encoding="utf-8", errors="replace")
+
+          summary = [l for l in text.splitlines() if " passed" in l or " skipped" in l]
+          if not summary:
+              print("::error::could not find a pytest summary line in the report; "
+                    "the ratchet is refusing to guess a skip count")
+              raise SystemExit(1)
+          line = summary[-1].strip()
+
+          ran = re.search(r"(\d+) passed", line)
+          skipped = re.search(r"(\d+) skipped", line)
+          # `error`/`errors` as well as `failed`: pytest counts collection and
+          # setup errors separately and exits non-zero for them too, so a ratchet
+          # that recognises only `failed` passes a report pytest considered red.
+          # The optional `s` matters — both spellings come from the same path.
+          failed = re.search(r"(\d+) (?:failed|errors?)", line)
+          if not ran and not skipped:
+              print(f"::error::pytest summary line {line!r} contains no test counts")
+              raise SystemExit(1)
+          n_passed = int(ran.group(1)) if ran else 0
+          n_skipped = int(skipped.group(1)) if skipped else 0
+          n_failed = int(failed.group(1)) if failed else 0
+
+          # Refuse a red report even though the skip arithmetic would pass. The
+          # pytest step already exits non-zero on a failure, so this cannot be
+          # reached today — it is here so the ratchet is correct on its own terms
+          # rather than correct only because of where it sits in the job, which is
+          # a property `if: always()` would remove in one line.
+          if n_failed:
+              print(f"::error::report records {n_failed} failing test(s); the skip "
+                    "baseline is meaningless against a red report")
+              raise SystemExit(1)
+
+          print(f"  summary            : {line}")
+          print(f"  expected skips     : {expected}")
+          print(f"  actual skips       : {n_skipped}")
+          print(f"  tests that ran     : {n_passed}")
+
+          if n_passed == 0:
+              print("::error::zero tests passed; a green exit with no executed test "
+                    "is not a passing suite")
+              raise SystemExit(1)
+          if n_skipped > expected:
+              print(f"::error::skip count rose from {expected} to {n_skipped}. "
+                    "Establish what the new skip is and record it deliberately; do "
+                    "not raise EXPECTED_SKIPS to make a build pass.")
+              raise SystemExit(1)
+          if n_skipped < expected:
+              print(f"  note: skip count fell from {expected} to {n_skipped}. "
+                    "Lower EXPECTED_SKIPS to record the improvement.")
+          else:
+              print("  skip count matches the recorded baseline")
+          PY
 
       - name: No mutation verbs in the schema (ARCH 5.4 I-B5)
         # I-B5: neither contract may contain a field capable of expressing a
@@ -156,10 +367,11 @@ jobs:
         # `kubectl_command` field would be the single most consequential
         # regression this project can suffer.
         #
-        # Introspected with `ast` rather than grepped. A grep on source text
-        # cannot distinguish a field from a comment or a docstring, and an
-        # earlier version of this step required quoted names, which Python
-        # field declarations never use - so it could not have failed.
+        # Introspected with `ast` rather than grepped. A grep on source text cannot
+        # distinguish a field from a comment or a docstring, and an earlier version
+        # of this step required quoted names, which Python field declarations never
+        # use — so it could not have failed.
+        timeout-minutes: 3
         run: |
           python - <<'PY'
           import ast, sys, pathlib
@@ -208,6 +420,7 @@ jobs:
       # agent/agent/, which does not exist, and the build would fail before
       # reaching any of the hardening it exists to verify.
       - name: Container build (hardened agent image)
+        timeout-minutes: 8
         run: |
           docker build -t srek3s-agent:ci -f agent/Dockerfile .
           echo "image built:"
@@ -215,9 +428,10 @@ jobs:
 
       # A successful build is not proof the image can start. This catches the
       # failure where the ENTRYPOINT names a module that does not resolve, or the
-      # app cannot be imported as the unprivileged runtime user - both of which
+      # app cannot be imported as the unprivileged runtime user — both of which
       # would otherwise surface only at deploy time.
       - name: Container runtime smoke (entrypoint resolves, runs as UID 10001)
+        timeout-minutes: 5
         run: |
           echo "--- entrypoint target main:app must import ---"
           docker run --rm --entrypoint python srek3s-agent:ci \
@@ -242,8 +456,8 @@ jobs:
     #
     # Before the BuildKit refactor, both Dockerfiles compiled for whatever CPU
     # happened to be running the build. That is invisible on a single-architecture
-    # CI runner: the image builds, the tests pass, and the Dockerfile is wrong.
-    # It becomes visible only when someone runs `docker buildx build
+    # CI runner: the image builds, the tests pass, and the Dockerfile is wrong. It
+    # becomes visible only when someone runs `docker buildx build
     # --platform=linux/arm64` on an amd64 machine and discovers the binary inside
     # is an amd64 binary wearing an arm64 label — a defect that passes every gate
     # in this workflow and fails at pod start, on a real cluster, with an
@@ -257,24 +471,24 @@ jobs:
     # serialising them would make a red run ambiguous about which thing broke.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # QEMU is what makes a foreign-architecture RUN instruction work. BuildKit
       # cannot execute `go build` or `apt-get install` for another CPU without it,
       # and the failure is a bare `exec format error` from inside a build step —
       # which reads as a broken Dockerfile rather than as a missing emulator.
       - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Show the buildx builder and its platforms
         run: docker buildx inspect --bootstrap
 
-      # `--output type=cacheonly` IS THE DRY RUN, and it is the right mechanism
+      # `--output type=cacheonly` IS THE dry run, and it is the right mechanism
       # rather than `--push` to a throwaway tag or `--load` with a fake platform.
       #
       #   * `--load` cannot be combined with a multi-platform build at all; buildx
@@ -289,7 +503,7 @@ jobs:
       # likely of the two to fail: `pip install` resolves a full dependency tree
       # for a foreign architecture, which is where a missing wheel surfaces.
       - name: Dry-run build — agent (linux/amd64 + linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/Dockerfile
@@ -299,7 +513,7 @@ jobs:
           tags: srek3s-agent:dry-run
 
       - name: Dry-run build — sentinel (linux/amd64 + linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: cmd/sentinel/Dockerfile
@@ -314,11 +528,11 @@ jobs:
       #
       # The Sentinel's entrypoint smoke test (`RUN /out/sentinel -version`) is
       # SKIPPED during a cross build by design: the binary is arm64 and the builder
-      # is amd64, so executing it needs a binfmt handler. The Dockerfile prints
-      # that it skipped and names `make verify-images` as the check that does
-      # execute it. This step therefore asserts the skip was VISIBLE rather than
-      # silent, because a build that quietly stopped verifying itself is exactly
-      # the shape of failure this repository keeps finding.
+      # is amd64, so executing it needs a binfmt handler. The Dockerfile prints that
+      # it skipped and names `make verify-images` as the check that does execute it.
+      # This step therefore asserts the skip was VISIBLE rather than silent, because
+      # a build that quietly stopped verifying itself is exactly the shape of
+      # failure this repository keeps finding.
       - name: Re-derive the architecture the dry run could not check
         run: |
           echo "The Sentinel Dockerfile gates its entrypoint smoke test on"

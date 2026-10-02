@@ -684,7 +684,7 @@ exactly like a working setup.
 | AC-4 | Container build + runtime smoke | Asserts UID 10001, imports `main:app` |
 | Layout | `test_architecture_layout.py` | `ARCHITECTURE.md` ↔ filesystem parity, both directions |
 | Routing | `test_the_agent_service_routes_the_sentinels_default_endpoint` | Service ↔ pod labels ↔ bind port ↔ Sentinel default |
-| Workflow | `scripts/audit_workflow.py` | CI definition audit |
+| Workflow | `scripts/audit_workflow.py --strict` | Audits every workflow's own shell: `bash -n`, unpiped `curl \| sh`, `producer \| grep -q` SIGPIPE races, multi-command `if` conditions, and referenced paths that do not exist. Runs as the first CI job, so a broken `run:` block is caught before it executes rather than by whoever pushes next. |
 | Manifests | `test_deploy_manifests.py` | PSA compliance, RBAC shape, hardening block |
 | Chaos fixtures | `test_chaos_fixtures.py` | **Executes** each fixture's script; asserts the failure is the one under test |
 | Images | `test_sentinel_image.py` | Stage split, `CGO_ENABLED=0`, cross-compile ARGs |
@@ -725,9 +725,10 @@ deploy/                k3s manifests; service.yaml routes to the agent;
                        chaos/ holds the deliberate-failure fixtures
 tests/fixtures/        incident corpus, chaos manifests, golden expected output
 scripts/               audit_workflow.py — audits the CI definition itself;
-                       bootstrap.sh — host pre-flight (make doctor)
-.github/workflows/     ci.yaml (gates + multi-arch dry run), release.yaml (GHCR),
-                       e2e-detonation.yaml (live cluster)
+                       bootstrap.sh — host pre-flight (make doctor);
+                       gotest.ps1 — Windows-only G3 workaround, retained
+.github/workflows/     ci.yaml (audit, Go + Python gates, multi-arch dry run),
+                       release.yaml (tag-gated GHCR publish), e2e-detonation.yaml
 ENGINEERING.md         the fail-closed argument, for people who will change it
 docs/                  runbook, lessons learned, offline install, CI triage
 ```

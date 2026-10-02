@@ -73,6 +73,17 @@ ci-g3-output.txt
 opencode.json
 .mcp.json
 
+# Local agent tooling. `.opencode/agents/*.md` are subagent definitions for the
+# operator's own editor harness — three files tracked until a purge found them
+# referenced by no document, no Makefile target, and nothing in ARCHITECTURE.md's
+# layout tree. They are configuration, not product, and a consumer cloning this
+# repository should get the tool rather than the author's tooling.
+#
+# Ignored rather than merely deleted, for the reason the entry above gives: a
+# directory that regenerates on every session is untracked noise that the next
+# `git add -A` sweeps straight back into the history.
+.opencode/
+
 # Environment files, matched at any depth rather than only at the repository
 # root. A first attempt anchored these with a leading slash so that
 # `.env.example` would survive by accident; a negative control then showed the
@@ -129,3 +140,19 @@ service-account*.json
 # because it is unexpected in a Go/Python repository and should be recognised
 # when someone finds it.
 /github-mcp-server
+
+# ---------------------------------------------------------------------------
+# Additional caches and editor droppings
+#
+# The entries above cover what this project's own gate commands create. These
+# cover what a contributor's tooling creates while running them, which is the same
+# leak by a different route: `ruff`, `tox`, and editor merge artefacts were all
+# unhandled, and `.pytest_cache` appearing under a test subdirectory rather than at
+# the root is exactly the shape a single anchored entry misses.
+# ---------------------------------------------------------------------------
+.ruff_cache/
+.tox/
+*.orig
+*.rej
+*.bak
+**/.pytest_cache/

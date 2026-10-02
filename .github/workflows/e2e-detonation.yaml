@@ -1,5 +1,11 @@
 name: e2e-detonation
 
+# ACTION VERSIONS. Pinned to the same verified majors as ci.yaml and release.yaml.
+# Run #68 (2026-10-01) emitted: "Node.js 20 is deprecated. The following actions
+# target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4,
+# actions/setup-python@v5." A warning today is a hard failure when the forced
+# runtime is withdrawn, and this is the slowest workflow to have that happen.
+
 # Milestone 4: the full pipeline against a real cluster.
 #
 # Why this exists and why it is separate from ci.yaml
@@ -76,7 +82,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         # Full history. `git apply --check` and the agent's I-B2 verification both
         # initialise throwaway repositories, and a shallow clone changes what
         # `git init` can see about the parent - which is a difference between this
@@ -86,13 +92,13 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip

@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # A semantic version, and nothing else. `v1.2.3-rc1` is allowed; `latest`,
       # `main`, and `foo` are not, because a release tag that is not a version
@@ -75,7 +75,7 @@ jobs:
       # The committed image tags and this workflow's outputs must describe the same
       # release. They are written in different files today, which is exactly why a
       # mismatch would not otherwise be caught.
-      - name: Check the tag against the committed image references
+      - name: Report the committed image references (not a gate)
         run: |
           version="${{ steps.tag.outputs.version }}"
           echo "manifests declare:"
@@ -90,6 +90,16 @@ jobs:
           echo "in-cluster tag. GHCR images are published under a different"
           echo "registry, so deploying from this repository requires rewriting"
           echo "the image reference — see README 'Publishing'."
+          echo
+          echo "This step is a REPORT and deliberately cannot fail. An earlier"
+          echo "version was named 'Check the tag against the committed image"
+          echo "references' while containing no comparison and no non-zero exit"
+          echo "- a guard that cannot fail, wearing a name that says it can."
+          echo "An equality assertion is not available either: the manifests"
+          echo "carry 0.1.0 and a release publishes the tag, so that would be a"
+          echo "permanent red build over a documented registry mismatch. If the"
+          echo "manifests are ever repointed at the published registry, this"
+          echo "becomes a real check and the name becomes accurate again."
 
   publish:
     name: Publish multi-arch images to GHCR
@@ -102,21 +112,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # The default GITHUB_TOKEN, which is correct and is the point: no long-lived
       # registry credential is stored in this repository, so there is nothing to
       # leak, rotate, or accidentally print in a log.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -142,7 +152,8 @@ jobs:
       # name is a support ticket. `:latest` is documented in the README as
       # unsuitable for production, because it moves.
       - name: Build and push the Sentinel (multi-arch)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
+        timeout-minutes: 20
         with:
           context: .
           file: cmd/sentinel/Dockerfile
@@ -164,7 +175,8 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Build and push the Agent (multi-arch)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
+        timeout-minutes: 20
         with:
           context: .
           file: agent/Dockerfile
@@ -185,21 +197,70 @@ jobs:
       # release that works on the machine that built it and nowhere else. Reading
       # the manifest list back is the only way to know what was actually published.
       - name: Verify both images are multi-arch
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
           version="${{ needs.validate-tag.outputs.version }}"
+
+          # A push that reports success but produced a single-platform image is a
+          # release that works on the machine that built it and nowhere else.
+          # Reading the manifest list back is the only way to know what was
+          # actually published rather than what was requested.
+          #
+          # The raw JSON goes to a file and the parser is a quoted heredoc, so the
+          # shell's quote handling is out of the picture entirely. Piping into
+          # `python3 -c '...'` would force the Python to avoid single quotes, and
+          # `inspect --raw | grep -q` is worse: `grep -q` exits on first match,
+          # the writer takes SIGPIPE and dies 141, and pipefail reports a passing
+          # check as failing. Measured on this project at 60 failures in 60 runs.
+          # See docs/lessons-learned.md.
+          manifest=$(mktemp)
           for image in "${{ steps.refs.outputs.sentinel }}" "${{ steps.refs.outputs.agent }}"; do
             echo "--- $image:$version"
-            raw=$(docker buildx imagetools inspect "$image:$version" --raw)
-            count=$(printf '%s' "$raw" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("manifests", [])))')
-            echo "  platform entries: $count"
-            if [ "$count" -lt 2 ]; then
-              echo "::error::$image:$version is single-architecture ($count manifest entries); a release must cover amd64 and arm64"
-              exit 1
-            fi
-            docker buildx imagetools inspect "$image:$version" | sed 's/^/  /'
+            docker buildx imagetools inspect "$image:$version" --raw > "$manifest"
+
+            platforms=$(python3 - "$manifest" <<'PY'
+          import json, sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              document = json.load(handle)
+
+          found = set()
+          for entry in document.get("manifests", []):
+              platform = entry.get("platform") or {}
+              operating_system, architecture = platform.get("os"), platform.get("architecture")
+              if operating_system and architecture:
+                  found.add(f"{operating_system}/{architecture}")
+          print(" ".join(sorted(found)))
+          PY
+            )
+
+            echo "  platforms: $platforms"
+
+            # By NAME, not by count. The previous version asserted
+            # len(manifests) >= 2, which a manifest list carrying two entries for
+            # the SAME architecture satisfies. The step's own comment claimed the
+            # guarantee was "a node that cannot use one of them fails visibly at
+            # pull time rather than running the wrong binary" - and that claim
+            # needs both architectures specifically, so both are required by name.
+            missing=0
+            for required in linux/amd64 linux/arm64; do
+              case " $platforms " in
+                *" $required "*)
+                  echo "  [ok] $required"
+                  ;;
+                *)
+                  echo "::error::$image:$version is missing $required (found: ${platforms:-none}); a release must cover amd64 and arm64"
+                  missing=1
+                  ;;
+              esac
+            done
+            test "$missing" -eq 0
           done
+          rm -f "$manifest"
+
           echo
-          echo "both images published as multi-arch manifest lists"
+          echo "both images published as amd64+arm64 manifest lists"
 
       - name: Summarise the release
         run: |

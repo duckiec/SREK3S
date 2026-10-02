@@ -210,7 +210,6 @@ SREK3S/
 │
 │
 └── tests/
-    ├── benchmarks/         # load generation for the saturation gates
     ├── e2e/                # detonation harness: runner, capture proxy, in-cluster overlay
         ├── capture_proxy.py          # stdlib-only wire instrument; Sentinel to agent
         ├── runner.py                 # samples the lifecycle; asserts ROADMAP 4.2.x

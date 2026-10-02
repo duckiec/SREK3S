@@ -418,11 +418,40 @@ Current state on the development host (Linux aarch64, k3s v1.36.4):
 | G2 | `gofmt -l .` empty | pass |
 | G3 | `go test -race ./...` | pass |
 | G4/G5/G6 | `black` / `flake8` / `mypy --strict` | pass |
-| — | `pytest agent/tests/` | **811 passed, 3 skipped** |
+| — | `pytest agent/tests/` | **819 passed, 4 skipped** |
 | — | `docker buildx build` both images | pass, both entrypoints executed |
+| — | `scripts/audit_workflow.py --strict` | pass, 0 findings across 3 workflows |
 
-The 3 skips are a **blocked dependency, not a pass**: a live-cluster round-trip
-that needs a reachable apiserver and this host's kubeconfig is root-owned.
+The 4 skips are **blocked dependencies, not passes**, and they are two kinds:
+
+| Skips | Blocked on | Applies on CI |
+|---|---|---|
+| 3 | a reachable apiserver; this host's kubeconfig is root-owned, and `sudo` is required to read it | yes |
+| 1 | a filesystem that folds case — `Path.exists()` accepts a differently-cased spelling on NTFS and does not on ext4 | yes, CI is also ext4 |
+
+The fourth is `test_the_case_exact_check_fails_on_a_wrongly_cased_path`. Its
+subject is a negative control whose whole purpose is to show that the exact-case
+path check is *stricter* than the platform's own probe, which is only observable
+where the platform probe is more permissive. On a case-sensitive filesystem both
+probes agree, so there is no difference left to demonstrate and the control skips
+rather than asserting something only NTFS can be true of. It skips rather than
+passes deliberately: the assertions it *can* make — that the real name resolves,
+that the case-flipped one does not, and that an absent path is reported as absent
+— all run on every host, and the skip message says which ones those are.
+
+`ci.yaml` ratchets this number. `pytest` exits 0 when a test is skipped and also
+exits 0 when every test is skipped, so a green build is not by itself evidence
+that anything ran. The ratchet fails when the skip count *rises*, which is what
+turns "skip the test that is red" from a free action into a reviewable edit. It
+tolerates a *falling* count, because a blocked dependency becoming runnable is an
+improvement and should not require editing a file to be recorded.
+
+Because the number appears in three places — this table, `README.md`, and the
+`EXPECTED_SKIPS` constant in `ci.yaml` — a divergence between them is a
+discrepancy a reader can find but not one a gate catches. The ratchet makes the
+workflow fail if the count rises without the constant being raised deliberately;
+it does not check that this table agrees, and that limitation is stated here
+rather than left to be discovered.
 
 CI on `ubuntu-latest` remains the **platform authority** for published figures. A
 local pass is additional evidence, never a substitute — the two build different
