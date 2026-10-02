@@ -8,7 +8,7 @@
 [![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-819%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-906%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
 It reads your crashing containers, works out *why*, and hands you a reviewed
 `git diff`. **It can never change your cluster** — enforced by RBAC, not by
@@ -96,11 +96,19 @@ the patch is thrown away and the incident escalates.
 
 ---
 
-## Optional: the Gemini API key
+## Optional: a model, from any provider
 
-**The system runs fine without it.** Tier, patch, and every validation flag are
+**The system runs fine without one.** Tier, patch, and every validation flag are
 computed deterministically; a model — when present — writes only the prose in a
-Tier-2 explanation a human already has to read.
+Tier-2 explanation a human already has to read. It cannot return a tier or a
+patch, because the schema it is handed has no field to return one in.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | `gemini` or `openai`. Any server speaking the OpenAI chat-completions protocol works. |
+| `LLM_BASE_URL` | *(provider default)* | Repoints the OpenAI-protocol adapter at a local **Ollama, vLLM or LM Studio** endpoint. |
+| `LLM_MODEL` | per provider | Model name. `GEMINI_MODEL` wins if set, so an existing pin keeps working. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | — | One credential. Absent means "no model", not "no agent". |
 
 ```bash
 # locally: .env or .env.local, both gitignored
@@ -112,9 +120,25 @@ kubectl -n srek3s-system create secret generic srek3s-secrets \
 kubectl -n srek3s-system rollout restart deployment/srek3s-agent
 ```
 
-`optional: true` on that reference is load-bearing — without it a cluster with no
-Secret produces pods stuck in `CreateContainerConfigError`, and an operator who
-wants no model at all could not run the agent.
+Fully self-hosted, no egress and no key:
+
+```yaml
+env:
+  - name: LLM_PROVIDER
+    value: openai
+  - name: LLM_BASE_URL
+    value: http://ollama.srek3s-system.svc:11434/v1
+```
+
+> **A local endpoint is not wired through by default.** The NetworkPolicy in
+> `deploy/agent.yaml` permits egress on **TCP 443** to `0.0.0.0/0` and nothing
+> else, so Ollama's `11434` or vLLM's `8000` is refused by the network rather
+> than by the code. Widening that rule is an egress decision with a real blast
+> radius, so it is yours to make deliberately.
+
+`optional: true` on the Secret reference is load-bearing — without it a cluster
+with no Secret produces pods stuck in `CreateContainerConfigError`, and an
+operator who wants no model at all could not run the agent.
 
 To send raw log text to the model (which is what makes an RCA worth reading), set
 `SREK3S_LOG_TEXT_EVIDENCE=true`. It defaults to **off** — sending
@@ -630,8 +654,8 @@ Or individually:
 
 ```bash
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 819 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 819 passed, 4 skipped
+go test -race ./...                 # 906 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 906 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/

@@ -203,7 +203,7 @@ right name; which of `pull` or `import` fills it first is what differs.
 (aarch64)` under WSL2 with a working Docker daemon and a live single-node k3s
 **v1.36.4+k3s1**, which is precisely the configuration mechanism B requires and
 which, until now, did not exist anywhere in this project's development
-environment. `ROADMAP.md` `ENV-2.4` tracks the execution.
+environment. Open task `ENV-2.4` tracks the execution.
 
 **This section is a staged procedure, not a result.** Nothing below should be cited
 as evidence that B works. The honest statement is: *B's reasoning is sound, B is

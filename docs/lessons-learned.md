@@ -1082,6 +1082,11 @@ nobody asked with a confidence nobody had earned.
   identically on NTFS and ext4. A developer on Windows and a runner on Linux now
   get the same answer to the same question.
 
+  > **Superseded.** `test_architecture_layout.py` was deleted on 2026-10-02 when
+  > the build-phase documents were extracted from the repository; the reasoning
+  > above is left as the record of how it was fixed. See *"A quality gate that
+  > could only fail on a Markdown file"* at the end of this file.
+
   When a path fails the exact check but succeeds a case-insensitive one, the
   failure is reported as a *spelling* problem and names what the file is actually
   called — `"AGENTS.md (declared as a file, but the file on disk is spelled
@@ -1887,3 +1892,91 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   adding it. And an embedded script nobody can run locally is an untested script —
   extracting it from the YAML and executing it against real inputs is cheap, and it
   found two defects on its first run.
+### A quality gate that could only fail on a Markdown file (Post-Milestone 4)
+
+- **What happened:** the build-phase documents were extracted out of the repository
+  into a gitignored `_scaffolding/` directory, and
+  `agent/tests/test_architecture_layout.py` was deleted with them. That file was
+  13 test functions and 15 collected assertions, and it was the **only** thing in
+  the suite whose subject was prose: it parsed a layout tree drawn inside
+  `ARCHITECTURE.md` and compared it to the filesystem in both directions. Moving
+  the document turned it from 14 passed / 1 skipped into 15 failed with
+  `FileNotFoundError`, which is what surfaced the coupling in the first place.
+
+  The decision to delete rather than rewrite was made by reading every function's
+  subject before touching it. Not one assertion read an RBAC verb, a tier
+  decision, a patch or a redaction. Every mention of `internal/`, `deploy/` or
+  `agent/` in the file was a docstring or a path string copied *out of* the tree
+  being checked.
+
+- **Why it is a problem:** a gate that fails only because a document drifted is not
+  a safety gate, but it costs exactly what a safety gate costs — reviewer
+  attention, and a build that cannot go green for a reason unrelated to whether
+  the system works. The generalisable form: **ask what a check reads before
+  defending it.** "It has lots of assertions and a negative control for each" is a
+  description of effort, not of value. The question is whether the thing it
+  inspects is a thing whose correctness anyone depends on. Here, the answer was no,
+  and the check had been silently accruing credibility it had not earned.
+
+- **How we fixed it:** deleted the file, and recorded the removal in three places
+  so it cannot be silently undone. `CONTRIBUTING.md` states the new rule — every
+  remaining gate reads code or a manifest, so the layout of `cmd/`, `internal/`,
+  `agent/`, `deploy/` and `tests/` is free to change without a test failing.
+  `README.md` keeps a rewritten paragraph explaining what the validator was and
+  why it went, because deleting the explanation while deleting the thing is how the
+  next person re-adds it. `.gitignore` records the reasoning next to the entry.
+
+  The capability genuinely lost is named rather than glossed: bidirectional
+  layout-drift detection. It caught a real bug once — a document naming two files
+  that had never existed. But it caught a *documentation* bug, in a document that
+  is no longer shipped, and the invariants in its neighbourhood were already
+  covered against real inputs (`TestSentinelRoleGrantsNoMutatingVerb` parses
+  `deploy/rbac.yaml`; `test_deploy_manifests.py` parses the hardening surface;
+  `models.py` enforces I-B1 at construction).
+
+- **Also worth recording:** the skip count fell 4 → 3 as a side effect, because the
+  deleted file held the case-conditional skip. The CI ratchet permits a falling
+  count and then *asks* for `EXPECTED_SKIPS` to be lowered. Leaving it at 4 would
+  have worked and taught people to ignore the number, so it was lowered.
+
+### An exception with no HTTP status was misread as permanent (Post-Milestone 4)
+
+- **What happened:** the adversarial suite for the new OpenAI-protocol adapter
+  (`agent/tests/test_llm_adversarial.py`) drove the real SDK over an
+  `httpx.MockTransport` and asserted that a read timeout is retryable. It failed.
+  `_is_transient_openai` classified `APITimeoutError` as **permanent** and raised
+  on the first attempt.
+
+  The cause was the branch structure, not a typo. The function read a status code,
+  found none — because a timeout never got far enough to have one — and fell
+  through to `isinstance(exc, (TimeoutError, ConnectionError, OSError))`, which
+  the SDK's exception hierarchy does not satisfy. The only class that did match was
+  a builtin `OSError`, which no HTTP SDK raises.
+
+- **Why it is a problem:** the wrong direction in both senses. The caller lost a
+  narrative a second identical attempt would have supplied, and the error message
+  told an operator their **configuration** was at fault when the endpoint was
+  merely slow. That is the same failure mode as the retired retry-429 bug recorded
+  elsewhere in this file: a diagnosis that points at the wrong system. Both were
+  cases of the adapter *guessing* rather than *observing*.
+
+  The deeper lesson is about test shape. Every pre-existing provider test used a
+  stub that either succeeded or raised an exception carrying a status. A stub that
+  cannot represent "the server never answered" is not a neutral stub — it is a stub
+  that has pre-decided the question. The defect was invisible not because it was
+  subtle but because the harness had no vocabulary for it.
+
+- **How we fixed it:** transport failures are now identified by walking the MRO for
+  a known base class (`TransportError`, `TimeoutException` for httpx;
+  `APIConnectionError`, `APITimeoutError` for the SDK) rather than by
+  `isinstance` against builtins. Name-matching the MRO was necessary because the
+  SDK is imported lazily, so a module-scope `isinstance` would make importing
+  `providers.py` fail on a host without the SDK — exactly what the lazy import
+  exists to prevent — and it also means a base class is listed once instead of
+  every leaf that inherits from it.
+
+  A regression test now pins the full classification matrix: transport errors
+  retry, status-coded 5xx retries, 429 and 4xx do not, and an exception the adapter
+  does not recognise does **not** retry. That last row is deliberate: guessing
+  wrong in the other direction costs a retry storm, and an unrecognised error
+  getting three attempts is worse than one lost narrative.

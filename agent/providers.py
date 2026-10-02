@@ -591,6 +591,41 @@ class OpenAIProvider:
         return f"openai model={self.model_name} endpoint={target}"
 
 
+#: Class names that identify a transport failure, checked against the whole MRO
+#: rather than by ``isinstance``.
+#:
+#: A refused connection, a DNS failure and a read timeout all arrive here with
+#: **no HTTP status at all** — they never got far enough to have one. They are
+#: the one category a second identical attempt can genuinely ride out.
+#:
+#: Name-matching the MRO is used instead of ``isinstance`` because neither SDK is
+#: imported at module scope: ``openai`` is imported lazily inside
+#: :meth:`OpenAIProvider.complete`, and a module-scope reference would make
+#: importing this file depend on the SDK being installed, which is the thing the
+#: lazy import exists to prevent. Walking the MRO also means a base class is
+#: listed once rather than every leaf type that inherits from it.
+#:
+#: Before this, a genuine read timeout was classified as a permanent failure and
+#: raised on the first attempt: the caller lost a narrative a second call would
+#: have supplied, and the error blamed the configuration when the endpoint was
+#: merely slow.
+_TRANSPORT_ERROR_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "APIConnectionError",  # openai
+        "APITimeoutError",  # openai, a subclass of the above
+        "TransportError",  # httpx base for every connection failure
+        "TimeoutException",  # httpx base for every timeout
+    }
+)
+
+
+def _is_transport_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` is a transport fault rather than an application error."""
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    return any(base.__name__ in _TRANSPORT_ERROR_NAMES for base in type(exc).__mro__)
+
+
 def _is_transient_openai(exc: BaseException) -> bool:
     """Whether an OpenAI-protocol failure is worth one more attempt.
 
@@ -607,9 +642,10 @@ def _is_transient_openai(exc: BaseException) -> bool:
         if code == 429:
             return False
         return code in TRANSIENT_STATUS_CODES
-    # A connection error has no status: it is a transport fault, which is the
-    # one category a second identical attempt genuinely can ride out.
-    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+    # No status at all means the request never got far enough to have one. That is a
+    # transport fault, and the first attempt at a story that fails is not the last
+    # one worth making.
+    return _is_transport_failure(exc)
 
 
 def _require_text(response: Any, diagnose: Any) -> str:

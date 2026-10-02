@@ -11,7 +11,8 @@ interpret what it escalates, and review what it proposes.
 | [3](#3-interpreting-a-war-room-dispatch-tier-2) | Read a Tier-2 dispatch | an incident escalated to you |
 | [4](#4-reviewing-a-tier-1-gitops-pr) | Review a Tier-1 PR | a patch was proposed for merge |
 | [5](#5-the-no-autofix-guarantee) | The no-autofix guarantee | you do not yet believe it |
-| [6](#6-when-something-is-wrong) | Symptom → cause | something is broken and you are guessing |
+| [6](#6-choosing-a-model-provider) | Choose a model provider | you want the RCA prose improved, or fully air-gapped |
+| [7](#7-when-something-is-wrong) | Symptom → cause | something is broken and you are guessing |
 
 Two claims are made here that are worth checking rather than taking on trust,
 and both are checked in [§5](#5-the-no-autofix-guarantee): **the Sentinel cannot
@@ -149,7 +150,7 @@ the node's containerd namespace is `docs/offline-install.md`'s subject.
 > tool whose entire output is incidents.
 >
 > Found by static analysis on 2026-10-01 and **not reproduced at runtime** (nothing
-> was deployed when it was found). Recorded as `ENV-2.1` in `ROADMAP.md`; §26 of
+> was deployed when it was found). Recorded as open task `ENV-2.1`; §26 of
 > `docs/lessons-learned.md` carries the mechanism. Why no gate caught it:
 > `TestSentinelRoleGrantsNoMutatingVerb` and
 > `TestSentinelRoleGrantsWhatTheWatcherReads` both pass, and both are scoped to the
@@ -310,7 +311,7 @@ sudo kubectl -n srek3s-system exec deploy/srek3s-agent -- \
 ```
 
 A permitted connection succeeding proves nothing, because it also succeeds with no
-controller at all. That negative assertion is `ROADMAP.md` `ENV-2.6`, and it is
+controller at all. That negative assertion is open task `ENV-2.6`, and it is
 **open** — it has not been run on the `Fedora 44` / k3s v1.36.4 host this runbook's
 environment section describes.
 
@@ -528,16 +529,16 @@ now with evidence that the automated remediation was wrong.
 > implemented — `agent/verify.py`, 741 lines, and it is genuinely good code: the
 > observation window is bounded twice, by a monotonic deadline *and* by a fixed
 > iteration count, so a stepped clock cannot extend it, and `RequeueBudget` is
-> deliberately not a rewindable counter. It is exercised by the sixty tests recorded
-> in `ROADMAP.md` box `4.3.2`, plus a live-k3s leg that applied a real diff and
-> observed both a `VERIFIED` and an `UNRESOLVED` verdict (`ROADMAP.md` box `4.3.4`).
+> deliberately not a rewindable counter. It is covered by
+> `agent/tests/test_verify.py` and `agent/tests/test_verification_e2e.py`, plus a
+> live-k3s leg that applied a real diff and observed both a `VERIFIED` and an
+> `UNRESOLVED` verdict.
 >
 > **But no production module imports it.** `main.py` and `triage.py` do not.
 > `triage.py` emits `verification_policy` on the wire; nothing in the HTTP service
 > reads that field. So today the verification verdict is **yours** to produce — the
 > paragraph above describes the intended contract and the policy object you would
-> evaluate, not a loop that runs while you watch. `ARCHITECTURE.md` §5.5.1,
-> `ROADMAP.md` `ENV-2.7`.
+> evaluate, not a loop that runs while you watch. Open task: `ENV-2.7`.
 >
 > Nothing in §5's No-Autofix guarantee changes: a component nothing imports cannot
 > acquire authority, and the write-incapability of `verify.py` is asserted
@@ -555,8 +556,8 @@ now with evidence that the automated remediation was wrong.
 > change your cluster, it does not exist, and adding one would fail the build.
 
 > **One thing that DOES change behaviour, so it is called out rather than left
-> for you to find:** an optional Gemini API key. With `srek3s-secrets` present, a
-> model writes the *prose* of a Tier-2 explanation. It cannot change the tier,
+> for you to find:** an optional model credential. With `srek3s-secrets` present,
+> a model writes the *prose* of a Tier-2 explanation. It cannot change the tier,
 > the patch, or any validation flag — the response schema it receives has no field
 > for them. Without the key the system is unchanged and still fully operational.
 
@@ -692,7 +693,76 @@ not the same experiment.
 
 ---
 
-## 6. When something is wrong
+## 6. Choosing a model provider
+
+**Optional. The agent is fully functional with no model at all** — tier, patch and
+every validation flag are computed deterministically, and Tier-2 prose is rendered
+without help. A model only improves the *wording* of an escalation.
+
+Two knobs, both on the agent container:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | `gemini` or `openai`. Unset or unrecognised means `gemini`, with a startup warning. |
+| `LLM_BASE_URL` | *(provider's own default)* | Repoints the OpenAI-protocol adapter. This is what makes a local Ollama/vLLM/LM Studio endpoint possible. |
+| `LLM_MODEL` | per provider | `GEMINI_MODEL` is consulted first, so an existing pin keeps working. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | — | One is required for a hosted endpoint. None is required for a local one. |
+
+### Confirming which provider is live
+
+The startup line names the resolved provider, not the configured one:
+
+```
+srek3s agent starting: version=0.1.0 manifest_provider=FileManifestProvider
+target_manifest=... job_budget=configured max_active_jobs=8
+```
+
+If that line disagrees with what you set in the manifest, the manifest is wrong.
+An operator reading this log to decide whether Tier-1 is reachable is exactly the
+use case it was written for.
+
+### Self-hosted, no egress
+
+```yaml
+env:
+  - name: LLM_PROVIDER
+    value: openai
+  - name: LLM_BASE_URL
+    value: http://ollama.srek3s-system.svc:11434/v1
+```
+
+**This will not work until you widen the NetworkPolicy.** `deploy/agent.yaml`
+permits egress on TCP 443 to `0.0.0.0/0` and nothing else, so `11434` and `8000`
+are refused by the network, not by the agent. The symptom is every completion
+failing while `/readyz` still answers 200 — the agent looks healthy and quietly
+degrades to deterministic prose.
+
+Widening egress is a decision with a real blast radius, so it is not done here.
+When you do it, scope it as narrowly as the endpoint allows rather than falling
+back to `0.0.0.0/0` on a second port.
+
+### What a provider cannot do
+
+Changing the provider changes nothing about authority. A model may write the prose
+of a Tier-2 explanation and nothing else, because the schema it is handed has no
+field in which to return a tier, a patch, or a validation flag — and
+`decode_narrative` rejects the document outright if it returns one anyway.
+
+Two limitations worth knowing rather than discovering:
+
+- **Local servers differ in schema support.** `response_format` with a JSON
+  schema is honoured by current Ollama and vLLM and ignored by others. Where it
+  is ignored, the request still carries it and the decoder still validates the
+  result, so the outcome degrades to a *validated* unconstrained answer rather
+  than an unvalidated one.
+- **A model that declines is a valid outcome.** It is never retried. If your logs
+  show a Gemini safety block or an exhausted quota, the fix is not a retry — an
+  exhausted quota is not restored by retrying, and re-asking a model that
+  declined tends to produce prose where you wanted JSON.
+
+---
+
+## 7. When something is wrong
 
 | Symptom | First thing to check |
 |---|---|
