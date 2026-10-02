@@ -32,6 +32,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: srek3s-sentinel
+        # Explicit, and also supplied by deploy/kustomization.yaml's
+        # commonLabels. Written here so the file and the render agree — see the
+        # note on the selector in deploy/service.yaml for why that divergence
+        # produces a Service with no endpoints rather than an obvious error.
+        app.kubernetes.io/part-of: srek3s
       annotations:
         # Roll the pod when the Sentinel's own source changes.
         checksum/sentinel: "replaced-by-pipeline"

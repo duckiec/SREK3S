@@ -26,6 +26,15 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: srek3s-agent
+        # Explicit, and also supplied by deploy/kustomization.yaml's
+        # commonLabels. Writing it here makes this file agree with the render.
+        # The Service in deploy/service.yaml selects on it, so if it were present
+        # only via commonLabels the two apply paths would produce different
+        # selectors — and applying agent.yaml directly, then the overlay, leaves
+        # the Service selecting on a label these pods do not carry. See
+        # deploy/service.yaml for what that costs: no endpoints, Errno 111, and
+        # a healthy agent that looks like a refused connection.
+        app.kubernetes.io/part-of: srek3s
       annotations:
         # Roll the pods when the agent's own source changes.
         checksum/agent: "replaced-by-pipeline"

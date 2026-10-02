@@ -56,8 +56,31 @@ spec:
   # selects nothing and every connection fails with a timeout rather than a
   # refusal - a much harder failure to diagnose. Asserted by
   # test_the_agent_service_routes_the_sentinels_default_endpoint.
+  #
+  # `app.kubernetes.io/part-of` is here EXPLICITLY, and it is also in
+  # deploy/kustomization.yaml's commonLabels. That is not duplication to be
+  # deduplicated — it is what makes this file agree with what the cluster is
+  # given. commonLabels is `labels: [{includeSelectors: true}]`, so kustomize
+  # injects it into `spec.selector` and the rendered selector is
+  #
+  #     {app.kubernetes.io/name: srek3s-agent, app.kubernetes.io/part-of: srek3s}
+  #
+  # while this file said one label. Every test in the repository reads the file,
+  # so every one of them described a selector no cluster is ever given.
+  #
+  # When the two forms disagree the failure is total and mislabelled. Applying
+  # deploy/agent.yaml directly and then the overlay leaves a Service selecting
+  # on two labels and pods carrying one — kustomize cannot widen a Deployment's
+  # spec.selector, being immutable, so it updates only half the pair. Measured on
+  # a real cluster: both agent pods Running and Ready, uvicorn on 0.0.0.0:8000,
+  # `get endpoints` returning `<none>`, and every connection refused with Errno
+  # 111 — kube-proxy's answer for a ClusterIP with no ready endpoints. It looks
+  # like a refused connection and is really a Service selecting nothing.
+  #
+  # Written out so the file and the render are the same selector.
   selector:
     app.kubernetes.io/name: srek3s-agent
+    app.kubernetes.io/part-of: srek3s
   ports:
     - name: http
       protocol: TCP

@@ -1731,6 +1731,31 @@ jobs:
               ;;
             *)
               echo "::error::the probe reported failure"
+              echo "$probe_line"
+              # WHY THE PROBE FAILED, in the order that discriminates.
+              #
+              # ECONNREFUSED from a ClusterIP is not "the agent is down". Measured
+              # on a real cluster: this NetworkPolicy stack DROPs blocked traffic,
+              # so a policy refusal surfaces as a TIMEOUT, not a refusal. Errno
+              # 111 is what kube-proxy returns for a ClusterIP with no ready
+              # endpoints - reproduced by hand, where the agent was Running with
+              # uvicorn on 0.0.0.0:8000 and `get endpoints` returned empty.
+              #
+              # So this dumps the three things that separate those causes: the
+              # live Service selector, the live endpoints, and the agent pods
+              # with their labels. Without them the failure said only "refused",
+              # which is true of at least three different faults.
+              echo "--- the Service as the cluster currently has it ---"
+              kubectl -n srek3s-system get svc srek3s-agent \
+                -o jsonpath='clusterIP={.spec.clusterIP} selector={.spec.selector} targetPort={.spec.ports[0].targetPort}{"\n"}' || true
+              echo "--- endpoints (empty means kube-proxy REJECTs: that IS Errno 111) ---"
+              kubectl -n srek3s-system get endpoints srek3s-agent -o wide || true
+              echo "--- agent pods, with the labels the Service selects on ---"
+              kubectl -n srek3s-system get pods -l app.kubernetes.io/name=srek3s-agent \
+                -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready,PHASE:.status.phase,PODIP:.status.podIP,LABELS:.metadata.labels' || true
+              echo "--- probe pod labels (it must impersonate the Sentinel to be admitted) ---"
+              kubectl -n srek3s-system get pods -l srek3s.io/probe=true \
+                -o custom-columns='NAME:.metadata.name,LABELS:.metadata.labels' || true
               echo "--- agent logs ---"
               kubectl -n srek3s-system logs deployment/srek3s-agent --tail=40 || true
               exit 1

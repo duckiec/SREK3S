@@ -218,6 +218,90 @@ def _is_servable_api_version(value: object) -> bool:
     return value.count("/") == 1 and all(part for part in value.split("/"))
 
 
+def _common_label_keys() -> set[str]:
+    """Keys from the deploy base's `commonLabels`, which kustomize injects.
+
+    `commonLabels` is `labels: [{pairs: ..., includeSelectors: true}]`. It is
+    added to object metadata, to pod template labels, AND — the part that matters
+    — to every `spec.selector`: a Service's and a Deployment's.
+    """
+    base = yaml.safe_load((DEPLOY / "kustomization.yaml").read_text(encoding="utf-8"))
+    return set(base.get("commonLabels") or {})
+
+
+def test_common_labels_are_already_present_where_kustomize_will_inject_them() -> None:
+    """The rendered selector must be the one the raw-file tests can read.
+
+    deploy/kustomization.yaml sets `commonLabels: {app.kubernetes.io/part-of:
+    srek3s}`. Kustomize injects that key into every selector, so the Service the
+    cluster is actually given selects on
+
+        {app.kubernetes.io/name: srek3s-agent, app.kubernetes.io/part-of: srek3s}
+
+    while deploy/service.yaml as a file says
+
+        {app.kubernetes.io/name: srek3s-agent}
+
+    Those are different selectors. Every assertion in this repository reads the
+    raw files, so all of them describe a selector that no cluster is given, and
+    none of them can notice that the effective selector is a second label wider.
+
+    That gap is not theoretical. Applying deploy/agent.yaml directly and then
+    applying the overlay — both perfectly valid things to do — yields a Service
+    selecting on two labels and pods carrying one, because kustomize cannot widen
+    a Deployment's `spec.selector` (it is immutable) and so updates only half the
+    pair. Result on a real cluster: both agent pods Running and Ready, uvicorn on
+    0.0.0.0:8000, `get endpoints` returning `<none>`, and every connection refused
+    with `Errno 111` — which is what kube-proxy returns for a ClusterIP with no
+    ready endpoints, and is *not* what this NetworkPolicy stack produces for a
+    policy denial (that is a timeout, measured).
+
+    The invariant is therefore that the commonLabels keys already exist wherever
+    kustomize is going to put them. When they do, the raw selector and the
+    rendered selector are the same selector, so a test that reads the file is
+    testing the thing that ships.
+    """
+    common = _common_label_keys()
+    assert common, "the deploy base declares no commonLabels; this test is inert"
+
+    missing: list[str] = []
+    for path in sorted(DEPLOY.glob("*.yaml")):
+        if path.name == "kustomization.yaml":
+            continue
+        for document in load(path):
+            kind = document.get("kind")
+            name = document.get("metadata", {}).get("name", "?")
+            where = f"{path.relative_to(REPO_ROOT)} {kind}/{name}"
+
+            if kind == "Service":
+                selector = document.get("spec", {}).get("selector") or {}
+                absent = sorted(common - set(selector))
+                if absent:
+                    missing.append(
+                        f"{where}: selector is missing {absent}; kustomize will "
+                        "add them, so the rendered Service selects on more than "
+                        "this file says and no test reads the real selector"
+                    )
+            if kind in ("Deployment", "StatefulSet", "DaemonSet"):
+                labels = (
+                    document.get("spec", {})
+                    .get("template", {})
+                    .get("metadata", {})
+                    .get("labels", {})
+                )
+                absent = sorted(common - set(labels))
+                if absent:
+                    missing.append(
+                        f"{where}: pod template labels are missing {absent}, so a "
+                        "Service that selects on them matches nothing"
+                    )
+
+    assert not missing, (
+        "kustomize will inject commonLabels into selectors, making the effective "
+        "selector wider than the file every test reads: " + "; ".join(missing)
+    )
+
+
 def _configmaps_mounted_by_the_overlay() -> dict[str, list[str]]:
     """``{configmap name: [objects that mount it]}`` across the whole overlay."""
     mounted: dict[str, list[str]] = {}
