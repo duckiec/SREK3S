@@ -1494,16 +1494,63 @@ jobs:
           # in the wrong namespace" is the cheapest hypothesis and was previously
           # indistinguishable from "the image did not land at all". That ambiguity
           # is why this failed repeatedly before anyone could diagnose it.
-          if ! sudo k3s ctr --namespace k8s.io --timeout 30s images list -q \
-               | grep -qxF "$AGENT_IMAGE"; then
-            echo "::error::$AGENT_IMAGE is not present in the k8s.io namespace"
-            echo "--- k8s.io (where kubelet looks) ---"
-            sudo k3s ctr --namespace k8s.io --timeout 30s images list || true
-            echo "--- default (did it land in the wrong namespace?) ---"
-            sudo k3s ctr --namespace default --timeout 30s images list || true
-            exit 1
-          fi
-          echo "agent image registered in k8s.io as $AGENT_IMAGE"
+          # BOUNDED POLL, not a single-shot query and not a sleep.
+          #
+          # `ctr images import` returns once the content-store blobs are
+          # unpacked. The image RECORD that gives the image its name becomes
+          # queryable a moment later, and the gap is real: on 2026-10-02 a run
+          # unpacked the Sentinel image, ran this assertion 146ms later, and was
+          # told the image was absent — while the dump printed by that very
+          # assertion, 139ms afterwards, listed it:
+          #
+          #     unpacking …done                  15:33:55.668
+          #     is not present in the k8s.io      15:33:55.814   <- 146ms
+          #     registry.internal/srek3s-…  vnd.oci  45.3 MiB    15:33:55.953
+          #
+          # So the failure was never about namespaces, disk space, or a failed
+          # import. The image was there. A single-shot query inside that window
+          # reports a missing image that exists, which is the worst shape a
+          # failure can take: it looks like a definitive answer.
+          #
+          # A poll for a NAMED CONDITION with a DEADLINE. It is not a sleep:
+          #   * it waits for the image specifically, not for elapsed time
+          #   * it fails if the image never appears
+          #   * it prints the same diagnostics on timeout
+          # An unconditional `sleep 30` would convert a real failure into the
+          # same real failure, later, and hide the evidence in between.
+          #
+          # Matched with `case`, never `... | grep -q`: grep exits on first
+          # match, `images list` takes SIGPIPE, and under `pipefail` the pipeline
+          # then reports failure even when the image IS present — the assertion
+          # looping to its own deadline over a matching image. This repository's
+          # workflow auditor flags that pattern as GREP_Q_PIPE, and cites this
+          # project's own history for it.
+          present=""
+          deadline=$((SECONDS + 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            present=$(sudo k3s ctr --namespace k8s.io --timeout 30s \
+                        images list -q 2>/dev/null || true)
+            case "
+          $present
+          " in *"$AGENT_IMAGE"*) break ;; esac
+            sleep 2
+          done
+
+          case "
+          $present
+          " in
+            *"$AGENT_IMAGE"*)
+              echo "agent image registered in k8s.io as $AGENT_IMAGE"
+              ;;
+            *)
+              echo "::error::$AGENT_IMAGE did not appear in k8s.io within 60s of an import that exited 0"
+              echo "--- k8s.io (where kubelet looks) ---"
+              sudo k3s ctr --namespace k8s.io --timeout 30s images list || true
+              echo "--- default (did it land in the wrong namespace?) ---"
+              sudo k3s ctr --namespace default --timeout 30s images list || true
+              exit 1
+              ;;
+          esac
 
       - name: "E2E-IN: create the fixture ConfigMaps"
         timeout-minutes: 5
@@ -1784,19 +1831,61 @@ jobs:
 
           docker save "$SENTINEL_IMAGE" -o /tmp/srek3s-sentinel.tar
 
-          sudo k3s ctr --timeout 120s --namespace k8s.io images import \
-            /tmp/srek3s-sentinel.tar --namespace k8s.io
+          sudo k3s ctr --namespace k8s.io --timeout 120s images import \
+            /tmp/srek3s-sentinel.tar
 
-          # The effect, not the exit status. An import that lands outside k8s.io
-          # exits 0 and presents as ImagePullBackOff with no other symptom, so
-          # the tag is confirmed present where kubelet actually looks.
-          if ! sudo k3s ctr --timeout 30s --namespace k8s.io images list \
-               | grep -qF "$SENTINEL_IMAGE"; then
-            echo "::error::$SENTINEL_IMAGE is not present in the k8s.io namespace"
-            sudo k3s ctr --timeout 30s --namespace k8s.io images list || true
-            exit 1
-          fi
-          echo "sentinel image registered in k8s.io as $SENTINEL_IMAGE"
+          # BOUNDED POLL — identical in shape to the agent image step, and for
+          # the same measured reason.
+          #
+          # This is the step that actually lost the race:
+          #
+          #     unpacking registry.internal/srek3s-sentinel:0.1.0 …done
+          #                                                              15:33:55.668
+          #     ##[error]registry.internal/srek3s-sentinel:0.1.0 is not
+          #              present in the k8s.io namespace                      15:33:55.814
+          #     registry.internal/srek3s-sentinel:0.1.0  application/vnd.oci
+          #       sha256:f957c5aa…  45.3 MiB  linux/amd64  managed          15:33:55.953
+          #
+          # 146ms from unpack to a "not present" verdict; 139ms later the dump
+          # this assertion itself printed listed the image, digest and all. The
+          # import had worked. The assertion was simply too early.
+          #
+          # This step also still carried the pre-a4b10cf forms the agent step
+          # had already been corrected away from: a table grep that column
+          # formatting can defeat, and a duplicated `--namespace` (harmless —
+          # it is a persistent root flag — but confusing). Both are now the same
+          # as the agent step's, so there is one behaviour to reason about rather
+          # than two.
+          #
+          # Matched with `case`, never `| grep -q`: under `pipefail`, grep's
+          # early exit SIGPIPEs `images list` and the pipeline reports failure
+          # even when the image is present. See the agent step for the full note.
+          present=""
+          deadline=$((SECONDS + 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            present=$(sudo k3s ctr --namespace k8s.io --timeout 30s \
+                        images list -q 2>/dev/null || true)
+            case "
+          $present
+          " in *"$SENTINEL_IMAGE"*) break ;; esac
+            sleep 2
+          done
+
+          case "
+          $present
+          " in
+            *"$SENTINEL_IMAGE"*)
+              echo "sentinel image registered in k8s.io as $SENTINEL_IMAGE"
+              ;;
+            *)
+              echo "::error::$SENTINEL_IMAGE did not appear in k8s.io within 60s of an import that exited 0"
+              echo "--- k8s.io (where kubelet looks) ---"
+              sudo k3s ctr --namespace k8s.io --timeout 30s images list || true
+              echo "--- default (did it land in the wrong namespace?) ---"
+              sudo k3s ctr --namespace default --timeout 30s images list || true
+              exit 1
+              ;;
+          esac
 
       - name: "E2E-IN: deploy the Sentinel and assert it is scoped and read-only"
         timeout-minutes: 10
