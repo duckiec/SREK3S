@@ -76,7 +76,14 @@ env:
   PYTHON_VERSION: "3.11"
   # Known-blocked tests. See the skip policy above; do not raise this number to
   # make a build pass — raise it only after establishing what the new skip is.
-  EXPECTED_SKIPS: "4"
+  #
+  # Lowered 4 -> 3 on 2026-10-01 when the scaffolding quarantine removed
+  # agent/tests/test_architecture_layout.py. That file held the case-conditional
+  # skip the host probe step below exists to explain. The probe is retained: it
+  # costs one `python` invocation and it is what makes an unexplained skip
+  # legible. The ratchet permits a falling count and then asks for exactly this
+  # edit, so leaving the number high would teach people to ignore it.
+  EXPECTED_SKIPS: "3"
 
 jobs:
   # -------------------------------------------------------------------------

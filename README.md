@@ -132,12 +132,11 @@ will *change* this system:
 
 | | |
 |---|---|
-| **[`ENGINEERING.md`](ENGINEERING.md)** | **Start here if you intend to contribute.** Why the system is built this way — the fail-closed argument, the model boundary, the scrubber, and the testing methodology. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Single source of truth for schemas, layout, and the trust boundary. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | **Start here if you intend to contribute.** The four non-negotiable invariants, and what `make test` is expected to catch. |
 | [`docs/runbook.md`](docs/runbook.md) | Operational: deploy, watch, interpret, review. |
 | [`docs/lessons-learned.md`](docs/lessons-learned.md) | Every defect found — **including the negative controls that failed for the wrong reason.** The most useful file in the repo. |
-| [`REALWORLD_TESTING.md`](REALWORLD_TESTING.md) · [`TESTING_BASE_RULES.md`](TESTING_BASE_RULES.md) | The live-cluster test protocol, and what may and may not be asserted. |
-| [`PRD.md`](PRD.md) · [`ROADMAP.md`](ROADMAP.md) | Requirements and delivery history. |
+| [`docs/offline-install.md`](docs/offline-install.md) | Installing the images without a registry. |
+| [`docs/ci-triage-protocol.md`](docs/ci-triage-protocol.md) | Reading a red CI run. |
 
 <details>
 <summary><b>Why fail-closed (the long version)</b></summary>
@@ -206,8 +205,7 @@ SREK3S takes the opposite position: **the safe outcome is not "do less", it is
    labelled valid.
 7. After a human merges, the agent watches the workload back and either closes
    the incident or promotes it to `TIER_2`. **Step 7 is specified and unit-tested but not
-   reachable from the running service** — see [§5](#5-the-post-remediation-verification-loop)
-   and `ARCHITECTURE.md` §5.5.1.
+   reachable from the running service** — see [§5](#5-the-post-remediation-verification-loop).
 
 Steps 6 and 7 are the difference between a demo and a system. A patch that was
 never applied looks identical to a patch that fixed nothing, until you check.
@@ -297,8 +295,8 @@ intended shape.
 
 ### 2. The in-memory scrubber
 
-Eleven rules, in a **normative order** fixed by `ARCHITECTURE.md` §6 and
-asserted by `TestManifestMatchesSpecification`:
+Eleven rules, in a **normative order** fixed by the compiled manifest in
+`internal/scrubber/manifest.go`, and asserted by `TestManifestMatchesSpecification`:
 
 | # | Rule ID | Target |
 |---|---|---|
@@ -365,8 +363,8 @@ has returned, so those ceilings land after the child they would bound has alread
 exited. `cgroup_enforced` reports whether the writes succeeded; it does not claim
 they bounded anything. The prose saying "500 ms of CPU" is also wrong against
 `DEFAULT_CPU_SECONDS = 1`, which is one CPU-*second* — `RLIMIT_CPU` counts CPU
-seconds and cannot express a fraction. `ARCHITECTURE.md` §5.5.3, `ROADMAP.md`
-`ENV-2.8`/`ENV-2.9`.
+seconds and cannot express a fraction. See `agent/sandbox.py` and its
+`DEFAULT_CPU_SECONDS`.
 
 Saturation is shed, not queued. An atomic job budget caps concurrent
 investigations; a request arriving at a full sandbox gets HTTP `429` with
@@ -416,14 +414,13 @@ changed — rather than the exit status.
 
 ### 5. The post-remediation verification loop
 
-> **Not wired into the running service.** `agent/verify.py` (741 lines) implements
-> this loop and is covered by the sixty tests recorded in `ROADMAP.md` box `4.3.2`,
-> plus a live-k3s leg that applied a
+> **Not wired into the running service.** `agent/verify.py` implements this loop
+> and is covered by `agent/tests/test_verify.py` and
+> `agent/tests/test_verification_e2e.py`, plus a live-k3s leg that applied a
 > real diff and observed both verdicts. But **no production module imports it**:
 > `main.py` and `triage.py` do not. `triage.py` emits `verification_policy` and
 > nothing in the service consumes it. The code below is the design and the schema
-> contract; it is not a description of a running loop. `ARCHITECTURE.md` §5.5.1,
-> `ROADMAP.md` `ENV-2.7`.
+> contract; it is not a description of a running loop. Open task: `ENV-2.7`.
 
 A patch that applies is not a patch that works. After a human merges, the agent
 re-observes the workload against a bounded policy:
@@ -518,14 +515,14 @@ with a read-only root and no mounted token. It does not detonate anything; that
 chain is the detonation leg's job, and duplicating it would re-prove a layer that
 is not in question to cover one that is.
 
-Four of the 819 Python tests skip and print `BLOCKED DEPENDENCY, not a
+Four of the Python tests skip and print `BLOCKED DEPENDENCY, not a
 pass`. Three need a reachable cluster. The fourth needs a filesystem that folds
 case, which is a Windows property — CI is `ubuntu-latest`, so it skips there too. On the current `Fedora 44` / `linux/aarch64`
 host `go test -race` and the container build are **no longer** blocked — `gcc` is
 installed and Docker is running (behind `sudo`) — so they can be run locally and
 must be *reported as run*, not as blocked. On the earlier `windows/arm64` host
-neither was available, which is why so much of `ROADMAP.md` reads "CI-only";
-those records are left intact.
+neither was available, which is why so much of the delivery history reads
+"CI-only"; those records are left intact.
 
 ---
 
@@ -682,7 +679,6 @@ exactly like a working setup.
 | M3 | Terminal validation | `TestNilPointerSafety`, `TestNoGoroutineLeak`, `TestIncidentPayloadContract` |
 | AC-2 | Corpus replay | 46 cases, 32 maskable |
 | AC-4 | Container build + runtime smoke | Asserts UID 10001, imports `main:app` |
-| Layout | `test_architecture_layout.py` | `ARCHITECTURE.md` ↔ filesystem parity, both directions |
 | Routing | `test_the_agent_service_routes_the_sentinels_default_endpoint` | Service ↔ pod labels ↔ bind port ↔ Sentinel default |
 | Workflow | `scripts/audit_workflow.py --strict` | Audits every workflow's own shell: `bash -n`, unpiped `curl \| sh`, `producer \| grep -q` SIGPIPE races, multi-command `if` conditions, and referenced paths that do not exist. Runs as the first CI job, so a broken `run:` block is caught before it executes rather than by whoever pushes next. |
 | Manifests | `test_deploy_manifests.py` | PSA compliance, RBAC shape, hardening block |
@@ -698,14 +694,21 @@ Service these manifests create, to a port the agent actually binds. v1.0.0
 shipped without it, which is how a deploy set applied cleanly and routed
 nowhere passed every gate it had.
 
-The layout validator deserves a note, because it exists because a document was
-wrong three separate times and no gate noticed. `ARCHITECTURE.md` named
-`tests/fixtures/secrets_corpus.txt` and `internal/k8s/classify.go` — neither had
-ever existed — while the entire `internal/worker/` package and ten production
-modules shipped undocumented. The suite was green throughout, because no test
-read the document. It now asserts in both directions: every path the tree names
-must exist, and every production source under the directories the tree enumerates
-must be named. A one-way check cannot see an omission.
+The layout validator deserved a note, and the note is now historical. It existed
+because a document was wrong three separate times and no gate noticed: the
+architecture document named `tests/fixtures/secrets_corpus.txt` and
+`internal/k8s/classify.go` — neither had ever existed — while the entire
+`internal/worker/` package and ten production modules shipped undocumented. The
+suite was green throughout, because no test read the document. The validator
+asserted the documented tree matched the filesystem in both directions.
+
+It was removed when the build-phase documents were extracted from the
+repository, because it was the only check in the suite whose subject was a
+Markdown file rather than code or a manifest. **No invariant was lost with it:**
+not one of its assertions read an RBAC verb, a tier decision, a patch or a
+redaction. Every property in this project that is worth protecting is asserted
+against `deploy/*.yaml`, the Go sources, or the Python schemas. A gate that can
+only fail because a document drifted is not a safety gate.
 
 </details>
 
@@ -729,13 +732,13 @@ scripts/               audit_workflow.py — audits the CI definition itself;
                        gotest.ps1 — Windows-only G3 workaround, retained
 .github/workflows/     ci.yaml (audit, Go + Python gates, multi-arch dry run),
                        release.yaml (tag-gated GHCR publish), e2e-detonation.yaml
-ENGINEERING.md         the fail-closed argument, for people who will change it
 docs/                  runbook, lessons learned, offline install, CI triage
 ```
 
-`ARCHITECTURE.md` §3 carries the authoritative layout tree, and
-`agent/tests/test_architecture_layout.py` fails the build if it drifts from disk
-in either direction.
+Every gate in this project reads code or manifests. None of them reads a
+document, so the layout of `cmd/`, `internal/`, `agent/`, `deploy/` and `tests/`
+is free to change without a test failing for a reason that has nothing to do with
+whether the system works.
 
 ## Runtime baseline
 
@@ -753,8 +756,7 @@ The development host is **WSL2 on an ARM64 Windows machine, distribution
 `go test -race` is runnable locally (`gcc` is present on `linux/aarch64`), which it was
 not on the earlier `windows/arm64` host. **CI on `ubuntu-latest` remains the platform
 authority** for every published figure; a local pass is extra evidence, never a
-substitution. The full environment of record is in
-[`ROADMAP.md`](ROADMAP.md) § *Local Environment Baseline*.
+substitution. `docs/runbook.md` records the full environment of record.
 
 </details>
 
