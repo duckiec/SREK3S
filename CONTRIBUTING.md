@@ -156,11 +156,19 @@ Changing the provider changes nothing about authority. Both SDKs are imported
 lazily, so a host without either still imports the module, still triages, and
 still answers `/healthz`.
 
-**Adding a provider is a configuration change, not a new adapter class.** NVIDIA
-NIM was added this way: three table entries (`KNOWN_PROVIDERS`, `_API_KEY_ENV`,
-`_DEFAULT_MODEL`) and one branch in the factory. Because one class now serves
-several providers, every per-provider fact must be resolved from the *environment*,
-never from the class:
+**Adding a provider is one table row, not a new adapter class.** Everything that
+varies between providers lives in `ProviderSpec` (`agent/providers.py`): the
+credential variable, the model pin, the default model, the default endpoint, which
+adapter serves it, and whether it may be keyless. `_API_KEY_ENV`, `_DEFAULT_MODEL`,
+`_PROVIDER_SPECIFIC_MODEL_ENV` and `KNOWN_PROVIDERS` are all **derived** from that
+table, so a provider cannot be registered in three of four places.
+
+Nine are registered. Seven share the OpenAI chat-completions protocol and are pure
+configurations of one adapter; `anthropic` needs its own class because the Messages
+API has no `response_format` at all; `gemini` has always had one.
+
+Because one class serves several providers, every per-provider fact must be resolved
+from the *environment*, never from the class:
 
 ```python
 provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
@@ -171,9 +179,34 @@ Getting this wrong is silent and offline-invisible. `model_name` once returned
 endpoint for `gpt-4o-mini`; `complete()` once resolved its credential the same way,
 so an NVIDIA deployment holding only `NVIDIA_API_KEY` reported a missing
 credential while holding a good one. Both produced no error anywhere — a plausible
-value, substituted for another plausible value. `agent/tests/test_nvidia_provider.py`
-asserts what the SDK is **handed** rather than what a property returns, because
-that is the only assertion either bug would have failed.
+value, substituted for another plausible value.
+`agent/tests/test_provider_matrix.py` asserts what the SDK is **handed** — the model
+on the outbound call and the `api_key` the client was constructed with — because a
+property can report the right string while the request sends another.
+
+**A credential must never cross providers.** There is deliberately **no** fallback
+from a provider-specific variable to `OPENAI_API_KEY`, even for OpenAI-protocol
+providers, even though that is how OpenRouter's own documentation tells you to
+configure a key. It was implemented, and two existing tests refused it: with it in
+place, `LLM_PROVIDER=nvidia` alongside a leftover `OPENAI_API_KEY` stopped degrading
+to the deterministic prose and started making authenticated calls to a third party —
+the mirror image of the bug above. Say `LLM_PROVIDER=openai` with `LLM_BASE_URL`
+pointed at the aggregator instead.
+
+**Defaults must be models that work.** `meta/llama-3.1-70b-instruct` returned HTTP
+410 (EOL 2026-08-26) and `claude-sonnet-4-5` raises a deprecation warning (EOL
+2026-11-30) — both chosen because they were real and popular. A default that fails on
+every call is not a default, it is a broken deployment, and neither is findable
+without calling the endpoint. Verify a default against the live service, and pin what
+you ship.
+
+**Whether a missing credential is fatal is a module-level decision**, because it
+depends on the endpoint rather than on the adapter. `_may_proceed_without_credential`
+answers it once and the factory *and* every adapter consult it. Two call sites
+answering "is this deployment configured?" is the same partial-registration trap as
+the parallel tables, one level up — and the disagreement was real: the adapter
+exempted a pinned `LLM_BASE_URL` while the factory tested only for the key, so the
+documented keyless local setup still produced no narrative.
 
 ### 4. Secrets are scrubbed before egress, in memory
 

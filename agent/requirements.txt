@@ -46,6 +46,29 @@ google-genai>=2.0.0
 # never the service.
 openai>=1.40.0
 
+# Model client for the Anthropic adapter (agent/providers.py). This one is pinned
+# EXACTLY, unlike the entries above, and the reason is specific rather than
+# decorative.
+#
+# The adapter is written against surface this repository verified in 1.11.0 by
+# reading the installed package: the Messages API has no `response_format`, so the
+# narrative contract is enforced with a forced tool call; it has no `temperature`,
+# so this adapter does not pin it and does not claim determinism; it is built on
+# **httpx2** and rejects an `httpx.Client` outright; and the reply contract is a
+# field on a class the SDK defines (`ToolUseBlock.input`).
+#
+# A minor bump could change any of those — most plausibly by ADDING `response_format`,
+# which would make the forced-tool path vestigial — and the adapter would then be
+# written against a shape nobody re-checked. Two tests
+# (`test_the_sdk_really_has_no_response_format`,
+# `test_the_adapter_does_not_send_temperature`) will notice and say what to do, but
+# the pin means a bump is a deliberate act rather than a silent one.
+#
+# No weights ship and no GPU runtime is pulled, so the ARCH §2 prohibition is
+# unaffected. Imported LAZILY inside AnthropicProvider.complete(), so a host without
+# it still imports agent/providers.py, still triages, and still answers /healthz.
+anthropic==1.11.0
+
 # --- quality gates (AGENTS.md §4: G4, G5, G6) ---------------------------
 # These are gates, not optional extras. They are pinned here so the local
 # environment and CI install the same tools.

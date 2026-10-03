@@ -1,6 +1,7 @@
 # SREK3S
 
-**A fail-closed, AI-powered Site Reliability Engineer for your Kubernetes cluster.**
+**A fail-closed SRE agent for Kubernetes. It diagnoses incidents and hands you a
+reviewed `git diff`. It cannot change your cluster.**
 
 [![CI](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 [![Release](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg)](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml)
@@ -8,11 +9,16 @@
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-954%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-1082%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
-It reads your crashing containers, works out *why*, and hands you a reviewed
-`git diff`. **It can never change your cluster** — enforced by RBAC, not by
-convention.
+Four properties, each enforced structurally rather than by convention:
+
+| | |
+|---|---|
+| **🔒 No cluster write authority** | The Sentinel's Role enumerates `["get","list","watch"]`. The Agent has **no ServiceAccount token at all**. A CI job `ast`-walks the response schema and fails the build if any field is shaped like a write verb. |
+| **🧼 Secrets masked before egress** | Telemetry is scrubbed **in memory, on the Go node, before any network call** — 11 enumerated rules in `CONTRIBUTING.md §5`, never on disk, never in a queue. Redaction is *selective within the match*, so `postgres://checkout:[REDACTED]@db.internal:5432/prod` loses the password and keeps the diagnosis. |
+| **✅ Two-stage diff verification** | Tier-1 emits a unified diff that survived both a structural **YAML AST** check *and* a real `git apply --check` against the target manifest's own bytes. An unverifiable diff is **discarded**, never emitted with a caveat. |
+| **🧯 Fail-closed by construction** | Unknown classification, unreadable manifest, missing credential, model timeout — each escalates to a human war-room with `git_patch: ""`. **Tier-2 is the designed resting state, not a failure.** |
 
 ---
 
@@ -20,38 +26,65 @@ convention.
 
 ```bash
 git clone https://github.com/duckiec/SREK3S.git && cd SREK3S
-make doctor      # verify the host: OS, arch, docker+buildx, go, python 3.11+
-make bootstrap   # create .venv311, install deps, download Go modules
-make test        # full gate sweep: go vet, gofmt, -race, black, flake8, mypy, pytest
-make deploy      # apply the manifests and wait for both rollouts
+make doctor && make bootstrap && make test && make deploy
 ```
 
-Done. Watch it work with a real crash:
+Four commands: verify the host, build the venv, run every gate, deploy both rollouts.
+
+Now watch it diagnose a real crash:
 
 ```bash
 make deploy-overlay            # scope the sentinel to the chaos namespace
-make chaos                     # deploy a real crashing app with a planted secret
-kubectl -n sentinel-chaos logs deploy/real-crash   # the raw log, credential and all
+make chaos                     # a real crashing app, with a planted credential
+kubectl -n sentinel-chaos logs deploy/real-crash | grep AWS_SECRET
 kubectl -n srek3s-system logs deploy/srek3s-sentinel -f | grep stats
 ```
 
-> `make clean` tears down the chaos namespace. It deliberately **will not** delete
+The first command prints a planted AWS key verbatim. The Sentinel's output does not
+contain it — that is the scrubber, working, on a real workload rather than a fixture.
+
+> `make clean` removes the chaos namespace. It deliberately **will not** delete
 > `srek3s-system` — that is someone's deployment, and "clean" is the word someone
 > types while annoyed.
 
+**Requires:** Linux or WSL2, Go 1.25+, Python 3.11+, Docker with buildx.
+
 ---
 
-## Core Features
+## Also worth knowing
 
 | | |
 |---|---|
-| **🔒 Zero-leakage secret scrubbing** | Telemetry is masked **in memory, on the Go node, before any network egress** — 11 enumerated rules, never on disk, never in a queue. Redaction is *selective within the match*, so `postgres://checkout:[REDACTED]@db.internal:5432/prod` loses the password and keeps the diagnosis. |
-| **🧯 Fail-closed by construction** | An unverifiable patch is **discarded**, never emitted with a caveat. Unknown classification, unreadable manifest, or a diff that fails `git apply --check` — each escalates to a human war-room with `git_patch: ""`. Tier-2 is the designed resting state, not a failure. |
-| **🧫 Prompt-injection defense** | The model's response schema has **no field for a tier or a patch**, so it physically cannot return authority. Rules ride in a native `system_instruction` field, never concatenated with the evidence — anyone who can write to a crashing container's stdout can print text that looks like an instruction. |
-| **📦 GitOps auto-patching** | Tier-1 emits a unified diff that survived both a structural YAML AST check *and* a real `git apply --check` against the target manifest's own bytes. For a human to merge. Never applied. |
-| **🚫 Zero cluster write authority** | The Sentinel's Role enumerates `["get","list","watch"]`. The Agent has no ServiceAccount token at all. A CI job `ast`-walks the schema and fails the build if any field is shaped like a write verb. |
-| **🐳 Multi-arch, one command** | `linux/amd64` and `linux/arm64` via BuildKit cross-compilation. CI proves both compile on **every pull request**; a `v*` tag publishes a real manifest list to GHCR. |
-| **🧪 Tested against a live cluster** | Planted credentials and adversarial stack traces in a real crashing workload, detected naturally through the Kubernetes API. Not a mocked payload. |
+| **🧫 Prompt-injection defense** | The model's response schema has **no field for a tier or a patch**, so it cannot return authority — enforced per protocol, and `extra="forbid"` refuses one anyway. Rules ride in a native system field, never concatenated with the evidence: anyone who can write to a crashing container's stdout can print text that looks like an instruction. |
+| **📦 GitOps, never GitOps-*apply*** | The diff is emitted **for a human to merge**. SREK3S never applies it, and has no verb that could. |
+| **🌐 Bring your own model** | Nine providers across three wire protocols — see below. A new vendor is a base URL, a key variable and a model name, **not a new adapter class**. |
+| **🐳 Multi-arch, one command** | `linux/amd64` and `linux/arm64` via BuildKit cross-compilation. CI proves both on **every pull request**; a `v*` tag publishes a real manifest list to GHCR. |
+| **🧪 Tested against a live cluster** | Planted credentials and adversarial stack traces in a real crashing workload, detected through the Kubernetes API. Not a mocked payload. |
+
+---
+
+## Recent hardening
+
+Concrete, current, and each one enforced by a gate that runs on every push:
+
+- **Go 1.25 baseline.** Raised from 1.23, which is EOL — holding the older line would
+  have kept CVE fixes out of `golang.org/x/net`.
+- **G7 — reachable-CVE gate.** `govulncheck` blocks the build on vulnerabilities
+  *callable from this code*, which is a stronger claim than a version-based alert. It
+  also asserts its own advisory database is reachable before trusting a clean result,
+  because `govulncheck` is fail-open on that and would otherwise pass during an outage.
+- **Scanned, not assumed.** That gate found an infinite-loop DoS in
+  `golang.org/x/text` reachable through `GetLogs().Stream()` — the Sentinel's own
+  log-reading path. `pip-audit` and the remaining Dependabot alerts are **known gaps**,
+  listed in `docs/lessons-learned.md #39`.
+- **Non-root at runtime.** Both images run as **UID 10001** with a read-only root
+  filesystem and every capability dropped. The **Sentinel** image is
+  `gcr.io/distroless/static`; the **Agent** is `python:3.11-slim` — non-root, but not
+  distroless, because it needs a Python runtime.
+- **The scrubber baseline is normative.** The 11 masking rules live in
+  `CONTRIBUTING.md §5` as a table, and a drift-guard test compares that table against
+  `internal/scrubber/manifest.go` — IDs, order and patterns. Editing the table without
+  the code (or the reverse) fails the build.
 
 ---
 
@@ -99,50 +132,80 @@ the patch is thrown away and the incident escalates.
 ## Optional: a model, from any provider
 
 **The system runs fine without one.** Tier, patch, and every validation flag are
-computed deterministically; a model — when present — writes only the prose in a
-Tier-2 explanation a human already has to read. It cannot return a tier or a
-patch, because the schema it is handed has no field to return one in.
+computed deterministically *before* any model is consulted; a model — when present —
+writes only the prose in a Tier-2 explanation a human already has to read. It cannot
+return a tier or a patch, because the schema it is handed has no field to return one
+in, and `extra="forbid"` refuses one that arrives anyway.
+
+Nine providers, three wire protocols:
+
+| `LLM_PROVIDER` | Credential | Endpoint | Protocol |
+|---|---|---|---|
+| `gemini` | `GEMINI_API_KEY` | Google AI Studio | Gemini |
+| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic Messages | Messages (forced tool-use) |
+| `openai` | `OPENAI_API_KEY` | OpenAI | OpenAI chat-completions |
+| `openrouter` | `OPENROUTER_API_KEY` | `openrouter.ai/api/v1` | OpenAI chat-completions |
+| `groq` | `GROQ_API_KEY` | `api.groq.com/openai/v1` | OpenAI chat-completions |
+| `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com/v1` | OpenAI chat-completions |
+| `nvidia` | `NVIDIA_API_KEY` | `integrate.api.nvidia.com/v1` | OpenAI chat-completions |
+| `ollama` | *(none needed)* | `localhost:11434/v1` | OpenAI chat-completions |
+| `vllm` | *(none needed)* | `localhost:8000/v1` | OpenAI chat-completions |
+
+Setting `LLM_PROVIDER` is usually **sufficient** — each carries its own default
+endpoint. Anything else is two variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini`, `openai` or `nvidia`. Anything speaking the OpenAI chat-completions protocol works — NVIDIA NIM included, as a *configuration* of the same adapter rather than a third one. |
-| `LLM_BASE_URL` | *(provider default)* | Repoints the OpenAI-protocol adapter at a local **Ollama, vLLM or LM Studio** endpoint, or at NVIDIA NIM. |
-| `LLM_MODEL` | per provider | Model name. `GEMINI_MODEL` / `NVIDIA_MODEL` / `OPENAI_MODEL` win if set, so an existing pin keeps working. |
-| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `NVIDIA_API_KEY` | — | One credential. Absent means "no model", not "no agent". |
+| `LLM_PROVIDER` | `gemini` | One of the nine above. Unknown values fall back to `gemini` with a startup warning rather than refusing to boot. |
+| `LLM_BASE_URL` | *(provider's own)* | Overrides the endpoint. This is also how you reach an LM Studio server, a corporate gateway, or a private endpoint. |
+| `LLM_MODEL` | per provider | Model name. The provider-specific pin — `ANTHROPIC_MODEL`, `GROQ_MODEL`, `VLLM_MODEL` — wins, so an existing pin keeps working. |
 
 ```bash
 # locally: .env or .env.local, both gitignored
-echo 'GEMINI_API_KEY=your-key' > .env.local
+echo 'ANTHROPIC_API_KEY=your-key' > .env.local
 
 # in-cluster: a Secret the agent reads via valueFrom
 kubectl -n srek3s-system create secret generic srek3s-secrets \
-  --from-literal=GEMINI_API_KEY="$(sed -n 's/^GEMINI_API_KEY=//p' .env.local)"
+  --from-literal=ANTHROPIC_API_KEY="$(sed -n 's/^ANTHROPIC_API_KEY=//p' .env.local)"
 kubectl -n srek3s-system rollout restart deployment/srek3s-agent
 ```
 
-Fully self-hosted, no egress and no key:
+Fully self-hosted — no egress, no key, no third party:
 
 ```yaml
 env:
   - name: LLM_PROVIDER
-    value: openai
-  - name: LLM_BASE_URL
-    value: http://ollama.srek3s-system.svc:11434/v1
+    value: ollama          # or: vllm
 ```
 
 > **A local endpoint is not wired through by default.** The NetworkPolicy in
-> `deploy/agent.yaml` permits egress on **TCP 443** to `0.0.0.0/0` and nothing
-> else, so Ollama's `11434` or vLLM's `8000` is refused by the network rather
-> than by the code. Widening that rule is an egress decision with a real blast
-> radius, so it is yours to make deliberately.
+> `deploy/agent.yaml` permits egress on **TCP 443** to `0.0.0.0/0` and nothing else,
+> so Ollama's `11434` or vLLM's `8000` is refused by the network rather than by the
+> code. Widening that rule is an egress decision with a real blast radius, so it is
+> yours to make deliberately.
 
-`optional: true` on the Secret reference is load-bearing — without it a cluster
-with no Secret produces pods stuck in `CreateContainerConfigError`, and an
-operator who wants no model at all could not run the agent.
+**Three things worth knowing about the matrix:**
+
+- **A credential never crosses providers.** `OPENAI_API_KEY` will not authenticate
+  `anthropic`, and `ANTHROPIC_API_KEY` will not authenticate `groq`. An unrecognised
+  key degrades to the deterministic prose rather than silently reaching a third
+  party. (An earlier revision fell back to `OPENAI_API_KEY` for OpenAI-protocol
+  providers; two tests refused it and it was reverted — see
+  `docs/lessons-learned.md #35`.)
+- **Pin the model.** Providers retire models, and a retired one usually presents as
+  "no model configured" rather than as an error. `ANTHROPIC_MODEL`, `NVIDIA_MODEL`
+  and the rest exist for that.
+- **`vllm` has no default model** — a vLLM server serves whatever the operator
+  launched. Set `VLLM_MODEL`, and an unset one is refused with that instruction in
+  the error rather than a confusing 400.
+
+`optional: true` on the Secret reference is load-bearing — without it a cluster with
+no Secret produces pods stuck in `CreateContainerConfigError`, and an operator who
+wants no model at all could not run the agent.
 
 To send raw log text to the model (which is what makes an RCA worth reading), set
-`SREK3S_LOG_TEXT_EVIDENCE=true`. It defaults to **off** — sending
-container-controlled text to a third party should be deliberate.
+`SREK3S_LOG_TEXT_EVIDENCE=true`. It defaults to **off** — that is the prompt-injection
+defence working, since it keeps container-controlled text out of the model entirely.
 
 > The agent needs egress on **TCP 443**. `deploy/agent.yaml` grants it, and that is
 > the only non-DNS egress the pod has.
@@ -654,8 +717,8 @@ Or individually:
 
 ```bash
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 954 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 954 passed, 3 skipped
+go test -race ./...                 # 1082 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 1082 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/

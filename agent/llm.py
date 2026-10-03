@@ -160,6 +160,19 @@ class CompletionClient(Protocol):
         """Return the raw completion text, verbatim."""
         ...
 
+    @property
+    def model_name(self) -> str:
+        """The model this adapter will actually request.
+
+        Part of the interface rather than an implementation detail because it is
+        load-bearing in two places: ``describe()`` logs it at startup, and the
+        provider matrix asserts that a deployment asks for the model its
+        configuration names. Both of the silent substitutions in lessons-learned #35
+        were in this value, and a caller holding only the Protocol could not have
+        checked either.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # The Gemini boundary (Google AI Studio)
@@ -279,9 +292,8 @@ GEMINI_MAX_ATTEMPTS: Final[int] = 3
 #: that buys nothing at this size.
 GEMINI_RETRY_BACKOFF_SECONDS: Final[float] = 1.5
 
-#: Status codes worth retrying: provider load shedding, rate limiting, and gateway
-#: timeouts. Anything else is a fact about the request or the configuration.
 #: Status codes worth retrying: provider load shedding and gateway timeouts.
+#:
 #: 429 IS DELIBERATELY ABSENT, which was learned the hard way.
 #:
 #: Observed 2026-10-01: a burst of live test calls returned
@@ -292,13 +304,11 @@ GEMINI_RETRY_BACKOFF_SECONDS: Final[float] = 1.5
 #: reporting it as "the provider is load-shedding" - a diagnosis that would have
 #: sent an operator to look at the wrong system entirely.
 #:
-#: If quota exhaustion should be retried at all, the right mechanism is a
-#: backoff measured in minutes, which does not fit a 60-second request budget and
-#: would delay an RCA past the point where anyone is still reading. Not retried.
-# Not retried: a 429 means either a momentary rate limit or an exhausted quota,
-# and only RESOURCE_EXHAUSTED distinguishes them. An exhausted quota cannot be
-# restored by 1.5s-apart retries, and an earlier revision that tried reported it
-# as load-shedding.
+#: If quota exhaustion should be retried at all, the right mechanism is a backoff
+#: measured in minutes, which does not fit a 60-second request budget and would
+#: delay an RCA past the point where anyone is still reading. So: not retried.
+#: The rest of the 4xx range is likewise a fact about the request rather than the
+#: provider's state, and is equally not retried.
 TRANSIENT_STATUS_CODES: Final[frozenset[int]] = frozenset({500, 502, 503, 504})
 
 #: The same decision by NAME, preferred because Google's ``status`` string is

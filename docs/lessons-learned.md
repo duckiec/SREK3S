@@ -2251,3 +2251,78 @@ as what it is.
   The measurement that would justify revisiting it: run a fixed prompt against one
   pinned model N times and record the failure rate. It has not been done, so no
   number is claimed here.
+
+## 40. Nine Providers, One Table, And Three Ways To Register One By Mistake (v1.1.0)
+
+- **What happened:** universal provider support turned four parallel tables
+  (`KNOWN_PROVIDERS`, `_API_KEY_ENV`, `_DEFAULT_MODEL`,
+  `_PROVIDER_SPECIFIC_MODEL_ENV`) into one `ProviderSpec`, with all four derived from
+  it. Four tables is four chances to add a provider to three of them, and the
+  omission is invisible until a deployment picks the one that was missed.
+
+  That restructure is the easy part. Three findings came out of writing the adapters,
+  and all three would have shipped.
+
+- **A documented feature that never worked.** `provider_from_env` returned `None`
+  whenever the provider's credential variable was unset, so the keyless local setup
+  in the README — `LLM_PROVIDER=openai` with `LLM_BASE_URL` pointed at Ollama and no
+  key — produced **no narrative at all**, while looking exactly like a correct
+  deployment. It had been documented as working since the README was written.
+
+  Worse, the first fix made it worse in a different place. Adding per-provider
+  *default* endpoints meant the adapter's guard (`if not key and base_url is None`)
+  almost never fired, so a hosted provider with no credential sailed past it and made
+  a real 401 call, producing a generic transport error where the operator needed to be
+  told which variable to set. The condition had been standing in for "no endpoint is
+  configured" and had quietly become a different question.
+
+  Both halves live in `_may_proceed_without_credential` now, consulted by the factory
+  *and* every adapter. The disagreement between the two call sites was the actual
+  bug: the adapter exempted a pinned `LLM_BASE_URL` while the factory tested only for
+  the key, so the fix worked in one path and not the other.
+
+- **The convenience that was a vulnerability.** An `OPENAI_API_KEY` fallback for
+  OpenAI-protocol providers looked obviously right — it is literally what OpenRouter's
+  documentation tells you to do. **Two pre-existing tests refused it**, because they
+  assert that a credential belonging to one provider must not authenticate another.
+  With the fallback in place, `LLM_PROVIDER=nvidia` alongside a leftover
+  `OPENAI_API_KEY` stopped degrading to deterministic prose and started making
+  authenticated calls to NVIDIA.
+
+  This is the mirror image of the bug in #35, and the symmetry is the lesson: that one
+  read the credential off the class, this one read it off a name coincidence. Both
+  answered "which key belongs to this deployment?" with something plausible.
+  **The existing tests were right and the new convenience was wrong**, which is the
+  outcome one should record explicitly rather than quietly reverse-engineer.
+
+- **Defaults that were dead on arrival, chosen for being popular.**
+  `meta/llama-3.1-70b-instruct` returned HTTP 410 (EOL 2026-08-26, #36), and
+  `claude-sonnet-4-5` raised a deprecation warning (EOL 2026-11-30) — the second
+  found by driving a mock request through the installed SDK and capturing warnings,
+  after ~30 seconds, with no network call. Both were chosen because they were real,
+  well-documented ids. Two of three defaults have now died this way, which makes it a
+  pattern rather than an incident.
+
+- **Why it is a problem:** none of the three produces an error. The keyless bug
+  degrades silently and looks correct; the fallback is invisible until it presents a
+  credential to a host it was never meant to reach; a retired default is
+  indistinguishable from an absent key. Every one of them is found by reading
+  something that already exists — the factory's return value, two tests, the SDK's
+  deprecation table — rather than by writing more code.
+
+- **How we fixed it:** one table with derived views; one credential-satisfaction
+  decision; no cross-provider fallback, with the explicit `LLM_PROVIDER=openai` +
+  `LLM_BASE_URL` route offered instead; and defaults chosen by measuring them. Six
+  plants in `agent/tests/test_provider_matrix.py` and
+  `agent/tests/test_llm_anthropic.py` confirm the guards can fail — including the
+  schema's `NARRATIVE_FIELDS` filter, whose *widening* is the only way an authority
+  field can appear, since an unlisted key is discarded by construction.
+
+- **One probe failure worth keeping.** The first version of the Anthropic suite
+  imported `httpx` and injected it as the `http_client`. `anthropic` 1.11.0 is built
+  on **httpx2** and rejects an `httpx.Client` outright, so the mock was never reached
+  and every "offline" test was a live call to `api.anthropic.com`, failing with a
+  real `401`. In an environment holding a real `ANTHROPIC_API_KEY`, those tests would
+  have **passed while proving nothing**. `test_llm_adversarial.py` still uses `httpx`
+  because `openai` does, and the divergence is now documented at both imports rather
+  than left as a puzzling asymmetry.

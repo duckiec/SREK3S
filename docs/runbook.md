@@ -703,19 +703,42 @@ Two knobs, both on the agent container:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini`, `openai` or `nvidia`. Unset or unrecognised means `gemini`, with a startup warning. |
-| `LLM_BASE_URL` | *(provider's own default)* | Repoints the OpenAI-protocol adapter. This is what makes a local Ollama/vLLM/LM Studio endpoint possible, and what points the same adapter at NVIDIA NIM. |
-| `LLM_MODEL` | per provider | `GEMINI_MODEL` / `NVIDIA_MODEL` / `OPENAI_MODEL` are consulted first, so an existing pin keeps working. |
-| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `NVIDIA_API_KEY` | — | One is required for a hosted endpoint. None is required for a local one. |
+| `LLM_PROVIDER` | `gemini` | One of `gemini`, `anthropic`, `openai`, `openrouter`, `groq`, `deepseek`, `nvidia`, `ollama`, `vllm`. Unset or unrecognised means `gemini`, with a startup warning. |
+| `LLM_BASE_URL` | *(provider's own)* | Overrides the endpoint — an LM Studio server, a corporate gateway, a private endpoint. Setting it also declares that you know whether that endpoint wants a credential. |
+| `LLM_MODEL` | per provider | The provider-specific pin (`ANTHROPIC_MODEL`, `GROQ_MODEL`, `VLLM_MODEL`, …) is consulted first, so an existing pin keeps working. |
+| *per provider* | — | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `NVIDIA_API_KEY`. `ollama` and `vllm` need none. |
 
-**Pin the model, do not rely on the default.** NVIDIA NIM retires models: the
-original `meta/llama-3.1-70b-instruct` default began returning HTTP 410
-`end of life on 2026-08-26` with no other symptom. A retired model is a fail-closed
-degradation — the agent keeps triaging on deterministic prose — but it looks
-identical to "no key configured", so check the startup line for the resolved model
-before concluding the credential is at fault. Note also that most `nvidia/*` models
-answered `404 Function ... not found for account` for one verified credential:
-being able to list the catalogue is not the same as being entitled to a model.
+**A key never crosses providers.** There is no fallback to `OPENAI_API_KEY` for the
+OpenAI-protocol providers, deliberately. If you hold one OpenAI-shaped credential and
+want to use it against an aggregator, say so explicitly:
+
+```yaml
+env:
+  - name: LLM_PROVIDER
+    value: openai
+  - name: LLM_BASE_URL
+    value: https://openrouter.ai/api/v1
+  - name: OPENAI_API_KEY
+    valueFrom: { secretKeyRef: { name: srek3s-secrets, key: OPENAI_API_KEY } }
+```
+
+Otherwise an unrecognised key degrades to the deterministic prose rather than being
+presented to a third party.
+
+**Triage the two symptoms that look identical.** Both "the model was never consulted"
+and "the model was consulted and returned nothing" produce the same symptom: no
+`Model analysis` line, deterministic RCA, `git_patch: ""`. Check the startup line for
+the *resolved* provider and model before concluding a credential is at fault, because
+a retired model id and an absent key look the same from the outside:
+
+- **Absent credential** → `provider_from_env` returns nothing. The error names the
+  variable to set.
+- **Retired model id** → the call is attempted and rejected (HTTP 410, or a
+  deprecation warning in the SDK). **Pin the model.** Two defaults have already died
+  this way: NVIDIA's `meta/llama-3.1-70b-instruct` (410, EOL 2026-08-26) and
+  Anthropic's `claude-sonnet-4-5` (deprecation, EOL 2026-11-30).
+- **vLLM with no `VLLM_MODEL`** → refused before any request, naming `VLLM_MODEL`.
+  A vLLM server serves whatever the operator launched, so there is no safe default.
 
 ### Confirming which provider is live
 
