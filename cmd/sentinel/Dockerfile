@@ -49,12 +49,12 @@
 # image and the manifest could disagree while both looked correct.
 
 # ---------------------------------------------------------------------------
-# Build stage. Pinned to the minor version go.mod requires (1.23) rather than
+# Build stage. Pinned to the minor version go.mod requires (1.25) rather than
 # `latest`: a build that silently changes Go version can change what a build tag
 # means, and a tag like `ignore` or `osusergo` is exactly the kind of thing that
 # differs between releases.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
 
 WORKDIR /src
 

@@ -5,7 +5,7 @@
 [![CI](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 [![Release](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg)](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml)
 [![Multi-arch](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-4655db)](https://github.com/duckiec/SREK3S)
-[![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-924%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
@@ -559,7 +559,7 @@ neither was available, which is why so much of the delivery history reads
 
 | | |
 |---|---|
-| Go | 1.23+ (`go.mod` pins 1.23). |
+| Go | 1.25+ (`go.mod` pins 1.25). |
 | Python | **3.11, strictly.** 3.12+ syntax is not permitted; formatting is pinned to `target-version = ["py311"]` and `setup.cfg` sets `python_version = 3.11`. Use the pinned virtualenv `.venv311`, not the system `python3`. |
 | Cluster | Any conformant cluster. CI uses k3s; locally, k3s v1.36.4+k3s1. |
 | `git` | Required in the agent image — patch validation runs `git apply --check`. |

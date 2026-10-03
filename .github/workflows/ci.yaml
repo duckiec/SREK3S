@@ -72,7 +72,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.23"
+  GO_VERSION: "1.25"
   PYTHON_VERSION: "3.11"
   # Known-blocked tests. See the skip policy above; do not raise this number to
   # make a build pass — raise it only after establishing what the new skip is.

@@ -326,13 +326,24 @@ push-multiarch: ## Build a linux/amd64 + linux/arm64 manifest list (needs a regi
 deploy: ## Apply the base manifests to the current cluster context
 	@echo "==> applying deploy/base to the current context"
 	@$(KUBECTL) config current-context 2>/dev/null | sed 's/^/    context: /' || true
-	$(KUBECTL) apply -k "$(ROOT)/deploy/base"
+# deploy/base is a BASE, not a leaf: it references ../namespace.yaml and friends, and
+# kustomize's default RootOnly load restrictor refuses files above the build root.
+# Its own header documents that rendering it REQUIRES --load-restrictor. This target
+# omitted the flag, so `make deploy` failed on a clean checkout with:
+#     security; file 'deploy/namespace.yaml' is not in or below 'deploy/base'
+# `kubectl apply -k` does not accept --load-restrictor, so the render is piped
+# instead - the same shape deploy-overlay below already used.
+	$(KUBECTL) kustomize --load-restrictor=LoadRestrictionsNone \
+		"$(ROOT)/deploy/base" | $(KUBECTL) apply -f -
 	@$(KUBECTL) -n $(SYSTEM_NAMESPACE) rollout status deployment/srek3s-sentinel --timeout=120s
 	@$(KUBECTL) -n $(SYSTEM_NAMESPACE) rollout status deployment/srek3s-agent --timeout=120s
 
 .PHONY: undeploy
 undeploy: ## Remove the SREK3S workloads, leaving the namespace in place
-	-$(KUBECTL) delete -k "$(ROOT)/deploy/base" --ignore-not-found
+# Pipelined for the same reason as `deploy`: `delete -k` takes no --load-restrictor,
+# and a base kustomization that cannot be rendered cannot be deleted by name either.
+	-$(KUBECTL) kustomize --load-restrictor=LoadRestrictionsNone \
+		"$(ROOT)/deploy/base" | $(KUBECTL) delete -f - --ignore-not-found
 
 # The overlay is a SEPARATE target on purpose. It scopes the Sentinel to
 # sentinel-chaos, which means a developer who applies it has a Sentinel that will

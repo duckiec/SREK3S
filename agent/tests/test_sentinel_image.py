@@ -87,10 +87,10 @@ def _instructions(text: str) -> str:
 #: The flag is matched and DISCARDED rather than captured, and that is the entire
 #: fix. A previous revision used ``(\S+)`` for the image, so a line written as
 #:
-#:     FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+#:     FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
 #:
 #: parsed the image as the literal string ``--platform=$BUILDPLATFORM`` and the
-#: stage name as ``golang:1.23-bookworm``. Every downstream assertion then failed
+#: stage name as ``golang:1.25-bookworm``. Every downstream assertion then failed
 #: for the wrong reason: "no stage is named 'build'", and "the runtime stage is
 #: '--platform=$TARGETPLATFORM'; expected a distroless static image".
 #:

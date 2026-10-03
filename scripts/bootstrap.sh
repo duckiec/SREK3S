@@ -40,7 +40,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # "unbound variable" that named neither the tool nor the value. A readonly that
 # prevents assignment is only useful once the value exists.
 MIN_PYTHON="${MIN_PYTHON:-3.11}"
-REQUIRED_GO="${REQUIRED_GO:-1.23}"
+REQUIRED_GO="${REQUIRED_GO:-1.25}"
 REQUIRED_GO_MINOR="${REQUIRED_GO_MINOR:-23}"
 readonly MIN_PYTHON REQUIRED_GO REQUIRED_GO_MINOR
 
@@ -115,7 +115,7 @@ fi
 pkg_install_hint() {
   case "$1" in
     docker)    echo "https://docs.docker.com/engine/install/" ;;
-    go)        echo "https://go.dev/dl/ (install 1.23 or newer)" ;;
+    go)        echo "https://go.dev/dl/ (install 1.25 or newer)" ;;
     python)    echo "install python3.11+" ;;
     git)       echo "install git" ;;
     make)      echo "install GNU make" ;;
