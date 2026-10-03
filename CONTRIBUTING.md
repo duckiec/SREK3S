@@ -46,9 +46,10 @@ people learn to ignore.
 | — | `pytest agent/tests/ -q` | Every behavioural assertion below |
 
 Skipped tests are a **blocked dependency, not a pass**, and CI enforces that with a
-ratchet: the skip count may *fall*, never *rise*. Four skip today — three need a
-reachable cluster, one needs a filesystem that folds case. If you add a fifth, the
-build goes red until you establish what it is.
+ratchet: the skip count may *fall*, never *rise*. Three skip today — two need a
+reachable apiserver, and one is a Windows-only hazard with nothing to test on a
+Linux runner. If you add a fourth, the build goes red until you establish what
+it is.
 
 ---
 
@@ -156,6 +157,245 @@ Five properties that are easy to get wrong and expensive to get wrong:
 
 The agent re-scans its own outbound strings as a backstop. The Go node is the
 authoritative control; the agent is defence in depth.
+
+---
+
+## 5. Secret Masking Regex Manifest (normative)
+
+This is the **authoritative specification** for invariant 4. It is not a summary.
+The rule table, the ordering constraints, the throughput budget and every ratified
+amendment are reproduced verbatim from the project's design record, and
+`agent/tests/test_scrubber_manifest_spec.py` parses the table below and fails the
+build if it drifts from `internal/scrubber/manifest.go`. The invariant holds only
+if the code and this table agree, so the agreement is asserted rather than assumed.
+
+> **Renumbered, and deliberately the only part of this file a test reads.** This was
+> `ARCHITECTURE.md` §6, which arrived in two non-contiguous blocks because the
+> amendments were appended as they were ratified. §6.6 — the P0 credential leak on
+> rule 7 — sat after unrelated sections and is easy to miss when extracting by
+> heading alone; it is included here. Cross-references were renumbered `§6.x` →
+> `§5.x`; the content is otherwise unmodified, and the amendment identifiers
+> (`D-1`, `D-5`, `M6`) are historical names, not section numbers.
+>
+> This is in tension with the note at the top of this file, which says a gate that
+> reads prose is a gate that fails when the prose drifts. That is true, and it is
+> accepted here for one specific table: the alternative was code-as-spec for the
+> masking rules, and "the manifest has 11 entries" checked against a literal `11` is
+> a weaker guarantee than the table agreeing with the code. Every other section of
+> this file is unasserted on purpose.
+
+Implemented in `internal/scrubber/manifest.go`. All patterns are **RE2-compatible** (Go
+`regexp`): no backreferences, no lookahead/lookbehind. Every rule compiles at package
+`init()`; a compile failure is a hard startup failure, never a silently skipped rule.
+All rules replace matches with the literal sentinel **`[REDACTED]`**.
+
+**Evaluation order is significant.** Rules run top-to-bottom; more specific structural
+patterns (PEM blocks, JWTs) run before generic `key=value` patterns, so that a generic rule
+cannot re-wrap or partially unmask an already-redacted span. This yields idempotence (I-A5).
+
+| # | Rule ID | Regex (RE2) | Target | Replaces with |
+|---|---|---|---|---|
+| 1 | `pem_private_key` | `-----BEGIN (RSA \|EC \|DSA \|OPENSSH \|PGP \|ENCRYPTED )?PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END (RSA \|EC \|DSA \|OPENSSH \|PGP \|ENCRYPTED )?PRIVATE KEY( BLOCK)?-----` | Whole PEM block incl. body | `[REDACTED]` |
+| 2 | `aws_access_key_id` | `\b((A3T[A-Z0-9]\|AKIA\|ASIA\|ABIA\|ACCA\|AIDA\|AROA\|AIPA\|ANPA\|ANVA)[A-Z0-9]{16})\b` | AWS key IDs (`AKIA…`, `ASIA…`) | `[REDACTED]` |
+| 3 | `aws_secret_access_key` | `(?i)aws(.{0,20})?(secret\|private)(.{0,20})?['"][0-9a-zA-Z/+]{40}['"]` | 40-char secret in `aws_secret_access_key = "…"` form | `[REDACTED]` |
+| 4 | `jwt` | `\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b` | JSON Web Tokens (`header.payload.signature`) | `[REDACTED]` |
+| 5 | `bearer_token` | `(?i)\bbearer\s+[A-Za-z0-9\-._~+/]{8,}=*` | `Authorization: Bearer …` | `[REDACTED]` |
+| 6 | `basic_auth_url` | `(?i)([a-z][a-z0-9+.-]*:\/\/[^:\s\/]+:)([^@\s\/]+)(@[^\s\/]+)` | **Amended** — password only. See §5.3. | `$1[REDACTED]$3` |
+| 7 | `generic_secret_kv` | `(?i)(\b[\w-]{0,20}(?:api[_-]?key\|secret(?:[_-]access)?[_-]?key\|secret\|token\|access[_-]?token\|refresh[_-]?token\|password\|passwd\|pwd\|passphrase\|client[_-]?secret\|private[_-]?key\|authorization\|auth)["']?\s*[:=]\s*["']?)(?P<value>[^"',;}\n]{4,})(["']?)` | **Amended** — see §5.4 (D-1) and §5.6 (P0) | `${1}[REDACTED]${3}` |
+| 8 | `uuid` | `\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b` | UUIDs (customer/ticket correlation IDs) | `[REDACTED]` |
+| 9 | `ipv4_address` | `\b((25[0-5]\|2[0-4][0-9]\|1[0-9][0-9]\|[1-9]?[0-9])\.){3}(25[0-5]\|2[0-4][0-9]\|1[0-9][0-9]\|[1-9]?[0-9])\b` | IPv4 addresses | `[REDACTED]` |
+| 10 | `k8s_secret_mount` | `(?i)\b(?:kube-system\|kube-node-lease)\b[^\n]{0,80}(?:token\|secret\|ca\.crt)\|(?i)(?:token\|secret\|ca\.crt)[^\n]{0,80}\b(?:kube-system\|kube-node-lease)\b` | **Amended** — see §5.4 (D-2) | `[REDACTED]` |
+| 11 | `private_key_pem_body` | `(?i)-----BEGIN[A-Z ]*PRIVATE[A-Z ]*-----` | orphaned BEGIN marker w/o matching END | `[REDACTED]` |
+
+### 5.1 Masking Rules
+
+- **M1** Replacement is the literal string `[REDACTED]` — constant, not configurable, so no
+  environment variable can weaken masking.
+- **M2** Processing is **in memory only**. No plaintext scratch buffer, temp file, or
+  re-logging of input exists in the package.
+- **M3** Rules are applied to log **lines**, then the joined result is re-scanned once to catch
+  secrets assembled across line boundaries.
+- **M4** A `RedactionReport` records `{total, rules_triggered[]}` — **counts only**. It must
+  never contain the matched value or a reversible hash of it.
+- **M5** Over-masking (e.g. an ordinary integer mistaken for a UUID) is preferred over
+  under-masking. Diagnostic cost is recoverable; a leaked credential is not.
+- **M6** The agent applies the same rule IDs as a defence-in-depth re-scan before responding
+  (invariant I-B6). Go remains the authoritative control; the agent is a backstop.
+
+### 5.2 Performance Budget
+
+The full 11-rule pipeline must process **≥ 20,000 lines/sec/core** so that masking stays far
+inside the 2s detection budget (AC-1). This is benchmarked in M1; rules are compiled once and
+never recompiled in the hot path.
+
+### 5.3 Amendment — Rule 6 `basic_auth_url` (ratified)
+
+**Problem.** The original rule 6 replaced the *entire* authority span `scheme://user:pass@` with
+`[REDACTED]`. Measured against the reference corpus:
+
+```
+postgres://payments:hunter2@10.4.2.9:5432/payments  ->  [REDACTED][REDACTED]:5432/payments
+mysql://root:s3cr3tP4ss@db.internal:3306/checkout    ->  [REDACTED]db.internal:3306/checkout
+```
+
+Scheme, username **and** the `@` separator were destroyed, so the endpoint topology was lost.
+The secret is masked and this is not a leak, but the host and port are exactly the signal an
+OOM or network RCA reasons over (PRD F1, F3). Masking must not remove the evidence.
+
+**Amendment.** Rule 6 now uses capture groups and replaces only the password:
+
+```
+Pattern:     (?i)([a-z][a-z0-9+.-]*:\/\/[^:\s\/]+:)([^@\s\/]+)(@[^\s\/]+)
+Replacement: $1[REDACTED]$3
+```
+
+| Preserved | Masked |
+|---|---|
+| scheme (`postgres`), username (`payments`), the `@`, host, port, path | the password only |
+
+**Idempotence.** Replacing an already-masked password with the same token is byte-identical, so
+rule 6 satisfies invariant I-A5 without a guard. Confirmed by `TestIdempotence` and by the
+`basic_auth_url` case in `TestRuleByRule`.
+
+**Note on the composed pipeline.** Rule 9 `ipv4_address` runs after rule 6, so an IP-literal host
+is additionally masked by design. Port and topology remain intact. The
+`postgres://payments:hunter2@10.4.2.9:5432/payments` case is therefore asserted twice: on rule 6
+in isolation, where `10.4.2.9:5432` survives verbatim, and on the full pipeline, where the IP is
+masked but `:5432` and the `user:[REDACTED]@host:port` shape survive.
+
+### 5.4 Amendments — Rules 7 and 10 (ratified, defects D-1 and D-2)
+
+Both amendments close confirmed secret leaks. Measured against the ratified patterns
+before the change:
+
+| Input | Before | After |
+|---|---|---|
+| `{"password":"hunter2"}` | **unchanged — leak** | `{"password":"[REDACTED]"}` |
+| `auth_token=abc123xyz789` | **unchanged — leak** | `auth_token=[REDACTED]` |
+| `reading …/serviceaccount/token for kube-system` | **unchanged — leak** | `reading /var/run/[REDACTED]` |
+
+**Rule 7, three changes:**
+
+- `["']?` between the key and the separator. The original required `\s*[:=]` immediately after
+  the key, so a closing quote defeated it and every JSON-form secret was missed.
+- The key is prefixed `[\w-]{0,20}` and the alternation is non-capturing, so multi-word keys
+  match. `\b` alone failed on `auth_token`, because `_` is a word character and therefore no
+  boundary exists between the segments.
+- The key and trailing quote are captured, so **only the value is replaced**. Without this the
+  surrounding JSON was destroyed along with the secret, which would have broken the Contract A
+  payload the agent parses.
+
+Negative controls confirm the fix is not merely broader: `token_count=12345`, `secret_version=v3`,
+`mytokenizer=abcdefgh` and `password_policy=strict-mode-value` all survive untouched.
+
+**Rule 10** accepts both word orders. The original required the namespace *before* the token,
+whereas the canonical log form is the reverse. The gap stays bounded to 80 non-newline characters
+so the rule cannot reach across unrelated lines.
+
+### 5.5 Amendments — Cross-line pass scope and rule priority (ratified, defects D-3 and D-5)
+
+**D-3, multi-line rules run first.** The per-line pass previously ran rule 11
+`private_key_pem_body` before the cross-line pass ran rule 1 `pem_private_key`. Rule 11 redacted
+only the `-----BEGIN` marker, so by the time rule 1 saw the joined batch there was no `BEGIN…END`
+pair left to match and the **base64 key body survived verbatim**. The cross-line pass now runs
+*before* the per-line pass, on the raw lines, so rule 1 sees an intact block. Multi-line rules
+therefore evaluate ahead of the single-line fallbacks, which is the correct precedence: block-level
+removal must not be pre-empted by marker-level removal.
+
+**D-5, the cross-line pass runs only multi-line rules.** Each `Rule` now carries an `IsMultiLine`
+flag. The flag is derived by probing each compiled pattern with newline-bearing inputs, never by
+inspection, and `TestMultiLineFlagMatchesCapability` asserts the flag equals observed capability
+in both directions. Only `pem_private_key` qualifies, so the pass runs **1 of 11** patterns rather
+than eleven.
+
+> The value class of rule 7 is `[^"',;}\n]` — it deliberately **excludes** a newline. When the
+> class admitted `\n`, rule 7 became multi-line-capable, and the cross-line pass then applied it to
+> the entire joined batch first, where a single greedy match swallowed every following line: a
+> 128-line batch collapsed to one line and only one rule fired. Excluding `\n` confines the
+> cross-line pass to `pem_private_key` and restores both correctness and throughput.
+
+**Measured effect** on the shipped corpus, `windows/arm64`:
+
+| State | lines/sec |
+|---|---|
+| Full manifest in the cross-line pass | ~7,900 |
+| D-5 applied (1 of 11 rules) | ~18,700 |
+| `-short` skipped; final figure | **~187,000** |
+
+The remaining 10× is the corpus itself: 43 fixture cases including a multi-line PEM block, which is
+a heavier mix than the original synthetic fixture. The §5.2 budget of 20,000 lines/sec is met
+with large margin, and CI on `ubuntu-latest` remains the authoritative measurement.
+
+> **Platform note, added 2026-10-01, with the figures deliberately unaltered.** The
+> `~187,000` figure was measured on the **old `windows/arm64`** host, which is no longer the
+> development environment; the current host is `Fedora Linux 44` on `linux/aarch64` (§9.1).
+> This is recorded history and is left exactly as measured. It has **not** been re-measured
+> here, and this note makes no throughput claim for `linux/aarch64`. A benchmark re-run on
+> the new host should be recorded as a new figure with its platform named, not substituted
+> for this one; `ubuntu-latest` (`amd64`) remains the authority.
+
+**Narrowed M3 scope, stated explicitly.** Because rule 7 is now single-line, a `key=value` secret
+*split across a newline* is not caught by the cross-line pass. This is a deliberate trade: that
+case is rare in practice, whereas the alternative was collapsing whole batches. A future
+`secret_continuation` rule may address it; it is recorded as deferred rather than silently dropped.
+
+---
+
+
+### 5.6 Amendment — Rule 7 `secret_access_key` (ratified, P0 credential leak)
+
+**Problem.** An **unquoted** AWS secret access key passed the entire 11-rule pipeline unmasked.
+
+```
+aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  ->  masked (rule 3)
+aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY    ->  NOT MASKED
+```
+
+Two rules should have caught it, and both missed:
+
+- **Rule 3** (`aws_secret_access_key`) is anchored on quotes around the 40-character value,
+  which is the shape the AWS CLI emits. That is correct for its own input, and useless for an env
+  dump or a `key=value` log line.
+- **Rule 7** (`generic_secret_kv`) could not cover it either. Its key alternation contained
+  `secret[_-]?key`, and that substring does not occur inside `secret_access_key`, so the `[:=]`
+  never lined up and the alternative never matched.
+
+The result was a live credential in telemetry, which §5 M5 ranks as the one unacceptable outcome:
+over-masking is recoverable, a leaked credential is not.
+
+**Amendment.** Rule 7's key alternation gains an optional access segment:
+
+```
+(?:secret(?:[_-]access)?[_-]?key|secret)
+```
+
+This covers `secret_key`, `secret-key`, `secretkey`, `secret_access_key` and `secret-access-key`, and
+is listed **before** the bare `secret` alternative so the longest match wins without depending on
+backtracking.
+
+**Scope.** P0, minimal, and confined to rule 7's key name. No other rule is touched, no replacement
+changes, and the group structure is untouched — so rule 7's existing behaviour on `password`, `token`,
+`api_key` and the JSON form is bit-for-bit unchanged.
+
+**Parity.** `agent/rescan.py` carries the identical amendment, because §5 M6 requires the agent's
+backstop to apply the same rule IDs as the Go node. A change to one without the other would leave the
+two implementations disagreeing about the same credential.
+
+**Idempotency.** Unaffected. The replacement remains `${1}[REDACTED]${3}`, and re-scrubbing
+`aws_secret_access_key=[REDACTED]` produces the identical bytes, so invariant I-A5 holds.
+
+**Verified by.** `TestSecretAccessKeyVariantsAreMasked` (Go, rule-by-rule and idempotence),
+`TestUnquotedAWSSecretKeyIsScrubbed` (worker, end-to-end through the pool), and
+`TestRule7CoversSecretAccessKeyVariants` (Python, parity against the Go manifest).
+
+> **This row was wrong until 2026-10-02.** It carried the pre-amendment
+> alternation (`secret[_-]?key`) and referenced only §5.4, so the summary table
+> described a pattern with a known P0 credential leak while the code below it had
+> been correct since the amendment was ratified. The narrative in §5.6 was right and
+> the table was not, which is how a summary table drifts from the thing it
+> summarises. It was caught by `agent/tests/test_scrubber_manifest_spec.py` on the
+> day that guard was written — the table and the code had been out of agreement for
+> as long as both existed, with nothing comparing them.
 
 ---
 

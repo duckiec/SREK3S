@@ -11,7 +11,7 @@ import (
 // packageImports parses the package's own **non-test** source files and returns
 // the set of imported package paths.
 //
-// It backs TestNoDiskArtifacts (ROADMAP 1.4.10, ARCH §6.1 M2): the masking
+// It backs TestNoDiskArtifacts (ROADMAP 1.4.10, CONTRIBUTING.md §5.1 M2): the masking
 // engine must be in-memory only, so an `os`, `io` or `net/http` import in the
 // shipped code is a defect even if that code happens not to write anything
 // today.

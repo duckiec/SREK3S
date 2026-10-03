@@ -256,7 +256,7 @@ func TestNoPlaintextSecretSurvives(t *testing.T) {
 }
 
 // TestCorpusPreservesDiagnostics asserts the RCA-critical property from ARCH
-// §6.1 M5 and the §6.3 rationale: masking must not remove the evidence an
+// §5.1 M5 and the §5.3 rationale: masking must not remove the evidence an
 // engineer reasons over.
 func TestCorpusPreservesDiagnostics(t *testing.T) {
 	t.Parallel()
@@ -329,7 +329,7 @@ func input(c corpusCase) string {
 }
 
 // corpusBenchmarkLines loads the corpus and flattens it into a benchmark slice,
-// so the ARCH §6.2 figure is measured against the same data the AC-2
+// so the CONTRIBUTING.md §5.2 figure is measured against the same data the AC-2
 // assertions verify rather than a separate synthetic fixture.
 func corpusBenchmarkLines(tb testing.TB) []string {
 	tb.Helper()

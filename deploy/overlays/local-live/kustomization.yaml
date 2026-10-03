@@ -195,14 +195,23 @@ patches:
       name: srek3s-agent
 
   # -------------------------------------------------------------------------
-  # Sentinel: scope the watch to the namespace its Role is bound into.
+  # Sentinel: OPTIONAL — extend the watch to the chaos namespace.
   #
-  # This is the two-sided fix for the mismatch recorded in
-  # PRD_LIVE_VALIDATION.md §4. `deploy/sentinel.yaml` ships `WATCH_NAMESPACE: ""`,
-  # which asks for a cluster-wide LIST that the namespaced Role does not grant; the
-  # informer then retries a forbidden request forever and the operator sees silence.
-  # The paired half of the fix is ./chaos-rbac.yaml, which grants the read verbs
-  # in that namespace. Neither half works without the other.
+  # NOT a fix. `deploy/sentinel.yaml` ships `WATCH_NAMESPACE: srek3s-system`,
+  # which matches the namespace `deploy/rbac.yaml` grants, so the base set is
+  # self-consistent as committed and deploys and watches correctly.
+  #
+  # This overlay exists to make the Sentinel watch `sentinel-chaos` as well, for
+  # the detonation tests. It therefore needs BOTH halves: this scope patch, and
+  # ./chaos-rbac.yaml, which grants the read verbs in that namespace. Applied
+  # alone, the scope asks for a grant the Role does not confer and the informer
+  # retries a forbidden LIST forever — the symptom is silence, not an error.
+  #
+  # The BASE pairing is asserted both directions by
+  # agent/tests/test_deploy_manifests.py
+  # ::test_the_watch_scope_is_inside_the_granted_namespace, with a negative
+  # control. This overlay's pairing is NOT asserted — apply or remove the two
+  # halves together, because nothing will fail if you do not.
   # -------------------------------------------------------------------------
   - path: ./patch-sentinel-scope.yaml
     target:

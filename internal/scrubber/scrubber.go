@@ -1,5 +1,5 @@
 // Package scrubber is the deterministic, in-memory secret and PII masking
-// engine defined by ARCHITECTURE.md §6.
+// engine defined by CONTRIBUTING.md §5.
 //
 // The package is hermetic by construction. It imports only the standard
 // library, performs no I/O, opens no sockets, and holds no mutable state beyond
@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-// RedactionSentinel is the single masking token, ARCHITECTURE.md §6.1 M1.
+// RedactionSentinel is the single masking token, CONTRIBUTING.md §5.1 M1.
 //
 // It is an unexported-by-contract constant: no flag, environment variable or
 // config path may alter it, so no deployment can weaken masking.
@@ -41,7 +41,7 @@ func ScrubString(ctx context.Context, s string) string {
 }
 
 // ScrubLines masks each line, then performs the cross-line safety pass required
-// by ARCHITECTURE.md §6.1 M3: the masked lines are joined, the full manifest is
+// by CONTRIBUTING.md §5.1 M3: the masked lines are joined, the full manifest is
 // re-scanned once to catch secrets assembled across a line boundary, and the
 // result is redistributed.
 //
@@ -168,7 +168,7 @@ func scrub(s string) scrubResult {
 // FindAllStringIndex and then substituted with ReplaceAllString, doubling the
 // engine work for every rule. With eleven rules that is twenty-two passes over
 // the payload instead of eleven, and it was the largest single contributor to
-// missing the ARCH §6.2 budget.
+// missing the CONTRIBUTING.md §5.2 budget.
 func applyRule(r Rule, s string, acc *redactor) string {
 	// MatchString first: regexp.ReplaceAllString always appends the unmatched
 	// tail to a fresh buffer, so it copies the whole input even when there are

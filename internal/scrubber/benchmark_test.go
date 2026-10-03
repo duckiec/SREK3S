@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// minLinesPerSecond is the ARCHITECTURE.md §6.2 budget: the full eleven-rule
+// minLinesPerSecond is the CONTRIBUTING.md §5.2 budget: the full eleven-rule
 // pipeline must sustain at least 20,000 lines/sec/core so masking stays far
 // inside the 2 s detection budget (AC-1).
 //
@@ -27,7 +27,7 @@ const (
 	minLinesPerSecond              = 20000
 	minLinesPerSecondUnderRace     = 2000
 	minLinesPerSecondNonTarget     = 2000
-	benchLineTarget            int = 10000 // representative slice size, ARCH §6.2
+	benchLineTarget            int = 10000 // representative slice size, CONTRIBUTING.md §5.2
 	_                          int = 0
 )
 
@@ -88,7 +88,7 @@ func linesPerSecondFloor() (floor int, label string) {
 // pipeline so the figure can be quoted in the PR description.
 //
 // The workload is the shipped corpus, repeated to a representative batch size,
-// so the ARCH §6.2 figure is measured against the same data the AC-2
+// so the CONTRIBUTING.md §5.2 figure is measured against the same data the AC-2
 // assertions verify rather than a separate synthetic fixture that could drift
 // away from it.
 func BenchmarkScrubThroughput(b *testing.B) {
@@ -118,7 +118,7 @@ func BenchmarkScrubThroughputSynthetic(b *testing.B) {
 	}
 }
 
-// TestThroughputMeetsBudget turns the ARCH §6.2 budget into an assertion.
+// TestThroughputMeetsBudget turns the CONTRIBUTING.md §5.2 budget into an assertion.
 //
 // A benchmark only reports; it does not fail. A budget that is not asserted is
 // a budget that silently regresses, so the same workload is measured here and

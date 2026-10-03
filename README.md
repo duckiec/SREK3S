@@ -8,7 +8,7 @@
 [![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-906%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-924%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
 It reads your crashing containers, works out *why*, and hands you a reviewed
 `git diff`. **It can never change your cluster** — enforced by RBAC, not by
@@ -654,8 +654,8 @@ Or individually:
 
 ```bash
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 906 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 906 passed, 3 skipped
+go test -race ./...                 # 924 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 924 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/

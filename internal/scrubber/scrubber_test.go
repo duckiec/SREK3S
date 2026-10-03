@@ -14,14 +14,14 @@ import (
 
 const sentinel = RedactionSentinel
 
-// TestManifestMatchesSpecification pins the manifest against ARCHITECTURE.md §6.
+// TestManifestMatchesSpecification pins the manifest against CONTRIBUTING.md §5.
 // ROADMAP 1.1.3 requires the rules verbatim and 1.1.6 requires the order to be
 // unchanged, so both are asserted rather than assumed.
 func TestManifestMatchesSpecification(t *testing.T) {
 	t.Parallel()
 
 	if len(Manifest) != 11 {
-		t.Fatalf("manifest has %d rules, ARCHITECTURE.md §6 defines 11", len(Manifest))
+		t.Fatalf("manifest has %d rules, CONTRIBUTING.md §5 defines 11", len(Manifest))
 	}
 
 	wantOrder := []RuleID{
@@ -31,7 +31,7 @@ func TestManifestMatchesSpecification(t *testing.T) {
 	}
 	for i, want := range wantOrder {
 		if Manifest[i].ID != want {
-			t.Errorf("rule %d is %q, want %q (order is normative, ARCH §6)", i, Manifest[i].ID, want)
+			t.Errorf("rule %d is %q, want %q (order is normative, CONTRIBUTING.md §5)", i, Manifest[i].ID, want)
 		}
 		if Manifest[i].RE == nil {
 			t.Errorf("rule %q has a nil compiled pattern", Manifest[i].ID)
@@ -42,20 +42,20 @@ func TestManifestMatchesSpecification(t *testing.T) {
 		}
 	}
 
-	// Rules 6 and 7 carry capture-group templates per the §6.3/§6.4 amendments.
+	// Rules 6 and 7 carry capture-group templates per the §5.3/§5.4 amendments.
 	r, ok := ruleByID(RuleBasicAuthURL)
 	if !ok {
 		t.Fatal("basic_auth_url missing from manifest")
 	}
 	if got, want := r.templateFor(), "${1}"+sentinel+"${3}"; got != want {
-		t.Errorf("basic_auth_url template = %q, want %q (ARCH §6.3 amendment)", got, want)
+		t.Errorf("basic_auth_url template = %q, want %q (CONTRIBUTING.md §5.3 amendment)", got, want)
 	}
 	g, ok := ruleByID(RuleGenericSecretKV)
 	if !ok {
 		t.Fatal("generic_secret_kv missing from manifest")
 	}
 	if got, want := g.templateFor(), "${1}"+sentinel+"${3}"; got != want {
-		t.Errorf("generic_secret_kv template = %q, want %q (ARCH §6.4 amendment, D-1)", got, want)
+		t.Errorf("generic_secret_kv template = %q, want %q (CONTRIBUTING.md §5.4 amendment, D-1)", got, want)
 	}
 }
 
@@ -151,7 +151,7 @@ func TestRuleByRule(t *testing.T) {
 		// mustNotContain are the literal secrets that must not survive.
 		mustNotContain []string
 		// mustContain is text that must survive for the RCA to remain useful
-		// (ARCH §6.1 M5, and the §6.3 rationale).
+		// (CONTRIBUTING.md §5.1 M5, and the §5.3 rationale).
 		mustContain []string
 		wantRule    RuleID
 	}{
@@ -207,7 +207,7 @@ func TestRuleByRule(t *testing.T) {
 			wantRule:       RuleBearerToken,
 		},
 		{
-			// Rule 6, ARCH §6.3. The password goes; scheme, user, host and port
+			// Rule 6, CONTRIBUTING.md §5.3. The password goes; scheme, user, host and port
 			// stay. Host and port are the topology an RCA reasons over.
 			name:           "basic_auth_url postgres preserves topology",
 			in:             "postgres://payments:hunter2@10.4.2.9:5432/payments",
@@ -302,7 +302,7 @@ func TestRuleByRule(t *testing.T) {
 	}
 }
 
-// TestBasicAuthURLPreservesEndpointTopology is the explicit ARCH §6.3
+// TestBasicAuthURLPreservesEndpointTopology is the explicit CONTRIBUTING.md §5.3
 // assertion requested for the postgres URI.
 //
 // It is checked twice, because the full pipeline additionally applies rule 9
@@ -353,7 +353,7 @@ func TestBasicAuthURLPreservesEndpointTopology(t *testing.T) {
 }
 
 // TestNegativeControls asserts the manifest is not so broad that it destroys
-// ordinary operational log content. Over-masking is acceptable (ARCH §6.1 M5),
+// ordinary operational log content. Over-masking is acceptable (CONTRIBUTING.md §5.1 M5),
 // destroying every diagnostic is not.
 func TestNegativeControls(t *testing.T) {
 	t.Parallel()
@@ -679,7 +679,7 @@ func TestD3_CrossLinePEMBlockIsRemovedAsOneSpan(t *testing.T) {
 	if !strings.Contains(joined, "loading key material") || !strings.Contains(joined, "key material loaded") {
 		t.Errorf("diagnostic text around the block was destroyed\n%s", joined)
 	}
-	// RedactionReport exposes only {Total, RulesTriggered} by design (ARCH §6.1
+	// RedactionReport exposes only {Total, RulesTriggered} by design (CONTRIBUTING.md §5.1
 	// M4: counts only, no per-rule tallies), so the assertion is membership.
 	if !slices.Contains(rep.RulesTriggered, RulePEMPrivateKey) {
 		t.Errorf("expected rule pem_private_key to fire; report was %+v", rep)
@@ -755,7 +755,7 @@ func TestEmptyAndEdgeInputs(t *testing.T) {
 		// Note on the expectation: rule 7's value class is [^"',;}]{4,}, which
 		// includes spaces and multibyte runes, so a trailing token after the
 		// secret on the same line is consumed too. That over-masking is a known
-		// property of the ratified pattern, tolerated by ARCH §6.1 M5
+		// property of the ratified pattern, tolerated by CONTRIBUTING.md §5.1 M5
 		// (over-masking beats under-masking). What matters here is that the
 		// secret is gone and the text is still valid UTF-8.
 		in := "2026-09-28T14:03:11.204Z 日本語のログ password=hunter2"
@@ -800,7 +800,7 @@ func TestNoDiskArtifacts(t *testing.T) {
 	got := packageImports()
 	for _, imp := range forbidden {
 		if got[imp] {
-			t.Errorf("shipped code imports %q; ARCH §6.1 M2 requires in-memory only", imp)
+			t.Errorf("shipped code imports %q; CONTRIBUTING.md §5.1 M2 requires in-memory only", imp)
 		}
 	}
 	t.Logf("shipped imports: %v", keysOf(got))

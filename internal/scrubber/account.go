@@ -3,7 +3,7 @@ package scrubber
 import "sort"
 
 // RedactionReport is the per-call accounting record required by
-// ARCHITECTURE.md §6.1 M4.
+// CONTRIBUTING.md §5.1 M4.
 //
 // It is deliberately counts-only. It records which rules fired and how often,
 // never what they matched: no plaintext, no prefix, no suffix, and no reversible

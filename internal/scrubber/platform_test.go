@@ -6,7 +6,7 @@ import "runtime"
 // supports: linux/amd64 (the k3s deployment target and the CI runner) or
 // linux/arm64.
 //
-// The ARCH §6.2 throughput budget of 20,000 lines/sec/core is stated for that
+// The CONTRIBUTING.md §5.2 throughput budget of 20,000 lines/sec/core is stated for that
 // platform. Go's regexp is pure Go and its cost varies materially by
 // architecture, so the budget is only enforced at full strength here; other
 // build contexts use a reduced floor. See linesPerSecondFloor.

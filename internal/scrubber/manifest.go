@@ -5,14 +5,14 @@ import (
 	"regexp"
 )
 
-// RuleID identifies a masking rule from the ARCHITECTURE.md §6 manifest.
+// RuleID identifies a masking rule from the CONTRIBUTING.md §5 manifest.
 //
 // It is a typed string rather than a bare int so that an accounting entry cannot
 // silently refer to the wrong rule, and so the report is self-describing in logs.
 type RuleID string
 
 // The eleven rule IDs of the normative manifest. The set and the order are
-// fixed by ARCHITECTURE.md §6 and asserted by TestManifestMatchesSpecification.
+// fixed by CONTRIBUTING.md §5 and asserted by TestManifestMatchesSpecification.
 const (
 	RulePEMPrivateKey     RuleID = "pem_private_key"
 	RuleAWSAccessKeyID    RuleID = "aws_access_key_id"
@@ -27,7 +27,7 @@ const (
 	RulePrivateKeyPEMBody RuleID = "private_key_pem_body"
 )
 
-// manifestOrder is the evaluation order required by ARCHITECTURE.md §6.
+// manifestOrder is the evaluation order required by CONTRIBUTING.md §5.
 //
 // Order is normative, not incidental. Structural patterns (PEM blocks, JWTs,
 // URIs) run before the generic key=value pattern so that a broad rule cannot
@@ -49,13 +49,13 @@ var manifestOrder = []RuleID{
 // Rule is one compiled entry of the manifest.
 //
 // Every rule replaces its match with RedactionSentinel, so the package holds a
-// single unconfigurable masking token (ARCHITECTURE.md §6.1 M1).
+// single unconfigurable masking token (CONTRIBUTING.md §5.1 M1).
 type Rule struct {
 	ID RuleID
 	RE *regexp.Regexp
 
 	// MultiLine marks a rule whose match may span a newline. Only these rules
-	// take part in the ARCH §6.1 M3 cross-line re-scan, which is what keeps that
+	// take part in the CONTRIBUTING.md §5.1 M3 cross-line re-scan, which is what keeps that
 	// pass from re-running all eleven patterns over the whole joined batch.
 	//
 	// The flag is not a guess. Each value is asserted by
@@ -75,7 +75,7 @@ type Rule struct {
 var Manifest []Rule
 
 // rulePatterns maps each rule ID to its regex, transcribed verbatim from the
-// ARCHITECTURE.md §6 manifest table.
+// CONTRIBUTING.md §5 manifest table.
 //
 //nolint:gochecknoglobals // Immutable source of truth, consumed once at init.
 var rulePatterns = map[RuleID]string{
@@ -89,12 +89,12 @@ var rulePatterns = map[RuleID]string{
 
 	RuleBearerToken: `(?i)\bbearer\s+[A-Za-z0-9\-._~+/]{8,}=*`,
 
-	// Rule 6, amended per §6.3: only the password is replaced. Group 1 keeps
+	// Rule 6, amended per §5.3: only the password is replaced. Group 1 keeps
 	// scheme://user: and group 3 keeps @host, so the endpoint topology that an
 	// RCA depends on survives.
 	RuleBasicAuthURL: `(?i)([a-z][a-z0-9+.-]*:\/\/[^:\s\/]+:)([^@\s\/]+)(@[^\s\/]+)`,
 
-	// Rule 7, amended per §6.6 to fix the unquoted AWS secret access key.
+	// Rule 7, amended per §5.6 to fix the unquoted AWS secret access key.
 	//
 	// `secret(?:[_-]access)?[_-]?key` is listed *before* the bare `secret`
 	// alternative so the longest match wins without relying on backtracking, and so
@@ -105,7 +105,7 @@ var rulePatterns = map[RuleID]string{
 	// `secret[_-]?key`, which does not occur inside `secret_access_key`. So the
 	// unquoted form - which is how an env dump or a `key=value` log line carries
 	// it - passed the whole 11-rule pipeline unmasked.
-	// Rule 7, amended per §6.4 to fix D-1.
+	// Rule 7, amended per §5.4 to fix D-1.
 	//
 	// Three changes, each fixing a distinct leak:
 	//   - `["']?` between the key and the separator, so the JSON form
@@ -125,14 +125,14 @@ var rulePatterns = map[RuleID]string{
 	// one rule. Excluding \n makes the rule single-line, which confines the M3
 	// pass to pem_private_key and restores both correctness and throughput.
 	// The cost is that a key=value secret split across a newline is not caught
-	// by M3; see the narrow M3 scope note in ARCHITECTURE.md §6.5.
+	// by M3; see the narrow M3 scope note in CONTRIBUTING.md §5.5.
 	RuleGenericSecretKV: `(?i)(\b[\w-]{0,20}(?:api[_-]?key|secret(?:[_-]access)?[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|authorization|auth)["']?\s*[:=]\s*["']?)(?P<value>[^"',;}\n]{4,})(["']?)`,
 
 	RuleUUID: `\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`,
 
 	RuleIPv4Address: `\b((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\b`,
 
-	// Rule 10, amended per §6.4 to fix D-2. The original matched only when the
+	// Rule 10, amended per §5.4 to fix D-2. The original matched only when the
 	// namespace preceded the token, whereas the canonical log form is
 	// "…/serviceaccount/token for kube-system". Both orders are now accepted via
 	// alternation, with the gap bounded to 80 non-newline characters so the rule
@@ -160,10 +160,10 @@ var multiLineRules = map[RuleID]bool{
 //
 //nolint:gochecknoglobals // Immutable, read-only after init.
 var ruleTemplates = map[RuleID]string{
-	// §6.3: keep scheme, username, @, host and port; redact the password.
+	// §5.3: keep scheme, username, @, host and port; redact the password.
 	RuleBasicAuthURL: `${1}` + RedactionSentinel + `${3}`,
 
-	// §6.4: keep the key and the closing quote, replace only the value. This is
+	// §5.4: keep the key and the closing quote, replace only the value. This is
 	// what allows {"password":"hunter2"} to become {"password":"[REDACTED]"}
 	// instead of destroying the surrounding JSON structure.
 	RuleGenericSecretKV: `${1}` + RedactionSentinel + `${3}`,
