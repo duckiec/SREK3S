@@ -63,7 +63,6 @@ from llm import (
     GEMINI_MAX_ATTEMPTS,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_RETRY_BACKOFF_SECONDS,
-    GEMINI_TIMEOUT_SECONDS,
     LLM_BASE_URL_ENV,
     LLM_MODEL_ENV,
     LLM_PROVIDER_ENV,
@@ -77,6 +76,13 @@ from llm import (
     ModelOutputError,
     gemini_response_schema,
 )
+
+# NOT imported: ``GEMINI_TIMEOUT_SECONDS``. Every adapter here takes
+# ``LLM_TIMEOUT_SECONDS``, which is the provider-neutral name for the same 60s
+# ceiling; the Gemini-prefixed one exists for ``llm.GeminiCompletionClient`` alone.
+# Importing both made it possible for one adapter to answer a budget question with a
+# constant named after a different provider, which is a small lie about provenance
+# and happened once here.
 
 __all__ = [
     "KNOWN_PROVIDERS",
@@ -987,8 +993,17 @@ class AnthropicProvider:
     this holds no conversation and no memory of a prior incident, which is what
     makes "no cross-incident leakage" checkable rather than hopeful.
 
-    Two honest limitations, tolerated by design and recorded rather than discovered:
+    Three honest limitations, tolerated by design and recorded rather than discovered:
 
+    * **This adapter has never been verified against the live Anthropic API.** No
+      credential was available, so everything asserted about it is asserted against
+      the **real SDK driven over a mock transport**: the request shape, the tool
+      definition, the ``x-api-key`` header, the retry classification, and the reply
+      parsing. What is *not* established is that ``claude-sonnet-5-5`` is served to
+      this account, and that 2048 tokens clears Anthropic's ``max_tokens`` floor.
+      Both would fail as a *total* loss of narrative — the fail-closed path, correctly,
+      with no indication of which was wrong. Treat the first live call as the real
+      test, and read the startup line before concluding the wiring is at fault.
     * **Determinism is not claimed.** The other two adapters pin ``temperature=0``
       for reproducible prose. This SDK's ``messages.create`` has no ``temperature``
       parameter in its typed surface, so it is not sent — see the note at the call
@@ -1021,9 +1036,12 @@ class AnthropicProvider:
         self._api_key = api_key
         self._base_url = base_url
         self._env = env
-        self._timeout = float(
-            timeout if timeout is not None else GEMINI_TIMEOUT_SECONDS
-        )
+        # The provider-neutral ceiling, matching GeminiProvider and OpenAIProvider
+        # rather than reaching for GEMINI_TIMEOUT_SECONDS. All three constants are
+        # 60, so this is not a behaviour change — it is consistency. An adapter
+        # reading a constant named after a *different* provider is a small lie about
+        # where a value came from, and the sibling adapters had already settled it.
+        self._timeout = float(timeout if timeout is not None else LLM_TIMEOUT_SECONDS)
 
     @property
     def model_name(self) -> str:

@@ -139,17 +139,27 @@ in, and `extra="forbid"` refuses one that arrives anyway.
 
 Nine providers, three wire protocols:
 
-| `LLM_PROVIDER` | Credential | Endpoint | Protocol |
-|---|---|---|---|
-| `gemini` | `GEMINI_API_KEY` | Google AI Studio | Gemini |
-| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic Messages | Messages (forced tool-use) |
-| `openai` | `OPENAI_API_KEY` | OpenAI | OpenAI chat-completions |
-| `openrouter` | `OPENROUTER_API_KEY` | `openrouter.ai/api/v1` | OpenAI chat-completions |
-| `groq` | `GROQ_API_KEY` | `api.groq.com/openai/v1` | OpenAI chat-completions |
-| `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com/v1` | OpenAI chat-completions |
-| `nvidia` | `NVIDIA_API_KEY` | `integrate.api.nvidia.com/v1` | OpenAI chat-completions |
-| `ollama` | *(none needed)* | `localhost:11434/v1` | OpenAI chat-completions |
-| `vllm` | *(none needed)* | `localhost:8000/v1` | OpenAI chat-completions |
+| `LLM_PROVIDER` | Credential | Endpoint | Protocol | Live-verified |
+|---|---|---|---|---|
+| `gemini` | `GEMINI_API_KEY` | Google AI Studio | Gemini | yes |
+| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic Messages | Messages (forced tool-use) | **no** |
+| `openai` | `OPENAI_API_KEY` | OpenAI | OpenAI chat-completions | no |
+| `openrouter` | `OPENROUTER_API_KEY` | `openrouter.ai/api/v1` | OpenAI chat-completions | no |
+| `groq` | `GROQ_API_KEY` | `api.groq.com/openai/v1` | OpenAI chat-completions | no |
+| `deepseek` | `DEEPSEEK_API_KEY` | `api.deepseek.com/v1` | OpenAI chat-completions | no |
+| `nvidia` | `NVIDIA_API_KEY` | `integrate.api.nvidia.com/v1` | OpenAI chat-completions | yes |
+| `ollama` | *(none needed)* | `localhost:11434/v1` | OpenAI chat-completions | no |
+| `vllm` | *(none needed)* | `localhost:8000/v1` | OpenAI chat-completions | no |
+
+**"Live-verified" means a real credential, a real endpoint, and a real response.** All
+nine are covered by an offline suite that drives the **actual SDK** over a mock
+transport — the request shape, the auth header, the retry classification and the reply
+parsing are all asserted against what the SDK itself builds and accepts, not against a
+re-implementation. Only `gemini` and `nvidia` have additionally been run against the
+live service. For the rest, the first real call is the test; if something is wrong
+with the model id or the token budget, the symptom is *no narrative at all*, which is
+the fail-closed path behaving correctly and saying nothing about the cause. Check the
+startup line for the resolved provider and model before suspecting the wiring.
 
 Setting `LLM_PROVIDER` is usually **sufficient** — each carries its own default
 endpoint. Anything else is two variables:

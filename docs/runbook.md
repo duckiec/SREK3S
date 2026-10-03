@@ -708,6 +708,36 @@ Two knobs, both on the agent container:
 | `LLM_MODEL` | per provider | The provider-specific pin (`ANTHROPIC_MODEL`, `GROQ_MODEL`, `VLLM_MODEL`, …) is consulted first, so an existing pin keeps working. |
 | *per provider* | — | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `NVIDIA_API_KEY`. `ollama` and `vllm` need none. |
 
+**Switching provider in-cluster is TWO edits, not one.** `deploy/agent.yaml` ships
+`LLM_PROVIDER` and mounts a credential reference for **only** `GEMINI_API_KEY` and
+`NVIDIA_API_KEY`. Setting `LLM_PROVIDER: anthropic` on its own gets you
+`ANTHROPIC_API_KEY is not set`, which reads like a missing Secret rather than a
+missing manifest entry:
+
+```bash
+# 1. the Secret
+kubectl -n srek3s-system create secret generic srek3s-secrets \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2. deploy/agent.yaml — set LLM_PROVIDER *and* add the reference beside the
+#    GEMINI_API_KEY one, keeping optional: true:
+#      - name: ANTHROPIC_API_KEY
+#        valueFrom:
+#          secretKeyRef:
+#            name: srek3s-secrets
+#            key: ANTHROPIC_API_KEY
+#            optional: true
+```
+
+`optional: true` is what keeps a cluster with no Secret bootable, so copy it verbatim
+rather than omitting it.
+
+**Why only two are mounted.** Least privilege. Every mounted reference is a credential
+readable inside the agent pod, so a deployment should mount the one it uses rather than
+all seven — a cluster switched to `groq` gains nothing from `NVIDIA_API_KEY` being
+readable in its container. `ollama` and `vllm` need no entry at all.
+
 **A key never crosses providers.** There is no fallback to `OPENAI_API_KEY` for the
 OpenAI-protocol providers, deliberately. If you hold one OpenAI-shaped credential and
 want to use it against an aggregator, say so explicitly:

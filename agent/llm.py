@@ -285,6 +285,16 @@ GEMINI_TIMEOUT_SECONDS: Final[int] = 60
 #: purpose: the retry exists to ride out a provider blip, not to paper over a
 #: misconfiguration. At most two extra calls are made, and only for the status
 #: codes in :func:`_is_transient`.
+#:
+#: THE ``GEMINI_`` PREFIX IS HISTORICAL AND THE SCOPE IS EVERY ADAPTER. These four
+#: constants are shared retry/output policy: ``GeminiCompletionClient``,
+#: ``OpenAIProvider`` and ``AnthropicProvider`` all read them, deliberately, so the
+#: three cannot drift into different retry behaviour. They were not renamed because a
+#: mechanical rename across three adapters, two test suites and ``__all__`` is churn
+#: with no behavioural gain — but the name will mislead a reader who meets it at an
+#: Anthropic call site, so it is called out here rather than left to be rediscovered.
+#: The one genuinely provider-neutral budget is ``LLM_TIMEOUT_SECONDS``, and every
+#: adapter uses that name.
 GEMINI_MAX_ATTEMPTS: Final[int] = 3
 
 #: Pause between attempts. Linear rather than exponential because there are at
@@ -346,6 +356,14 @@ def _is_transient(exc: BaseException) -> bool:
 #: on it, which is why thinking is disabled (see ``thinking_config`` in
 #: :meth:`GeminiCompletionClient.complete`). 2048 was measured sufficient for a
 #: real RCA with log evidence included.
+#:
+#: REUSED BY THE OPENAI AND ANTHROPIC ADAPTERS, where it is a per-response ceiling
+#: rather than a reasoning-plus-answer budget. The number is a shared budget, not a
+#: measured Anthropic one — the value was fitted against Gemini and then inherited,
+#: which is worth knowing if an RCA ever comes back truncated: raising this is the
+#: first thing to try, and the provider's own limit is the second. Anthropic has a
+#: floor on ``max_tokens`` that the OpenAI API does not, so a value that is merely
+#: "small" for one protocol can be rejected outright by another.
 GEMINI_MAX_OUTPUT_TOKENS: Final[int] = 2048
 
 #: The behavioural contract, sent as `system_instruction` and NEVER as part of
