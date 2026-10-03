@@ -1980,3 +1980,134 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   does not recognise does **not** retry. That last row is deliberate: guessing
   wrong in the other direction costs a retry storm, and an unrecognised error
   getting three attempts is worse than one lost narrative.
+
+## 35. One Adapter Class Serving Three Providers Is A Silent Substitution Waiting To Happen (v1.0.3)
+
+- **What happened:** NVIDIA NIM was added the way the design intends — as a
+  *configuration* of `OpenAIProvider` rather than a third adapter class, because it
+  speaks the OpenAI chat-completions protocol. Three table entries and one branch in
+  the factory. That is the design working.
+
+  Then two bugs appeared that no offline test could see, both the same mistake:
+
+      model_name  ->  resolve_model(PROVIDER_OPENAI, env)     # asked NIM for gpt-4o-mini
+      complete()  ->  _api_key_for(PROVIDER_OPENAI, env)      # reported a missing key
+
+  An NVIDIA deployment configured with `LLM_PROVIDER=nvidia` and a valid
+  `NVIDIA_API_KEY` was asking NVIDIA's endpoint for an OpenAI model name, and
+  reporting that its credential was missing while holding a working one. Both
+  produced no error anywhere: `gpt-4o-mini` is a plausible string, `OPENAI_API_KEY`
+  is a plausible variable name, and every existing test still passed.
+
+- **Why it is a problem:** The abstraction that removes vendor lock-in is the
+  abstraction that hid this. When one class equals one provider, reading a
+  per-provider fact off `self` is safe by construction and reads cleanly. The moment
+  one class serves several providers, every such read is a silent substitution — and
+  the substitution is between two *valid* values, which is why nothing complains.
+  Neither bug degraded loudly. The credential one degraded into exactly the
+  fail-closed behaviour the system advertises (deterministic prose, no escalation
+  change), which is the best possible outcome and still nearly invisible.
+
+- **How we fixed it:** Both reads now resolve from the environment, never from the
+  class:
+
+      provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
+
+  The `if self._env` guard is load-bearing for a second reason: an *empty*
+  environment has no `LLM_PROVIDER`, so `resolve_provider_name` returns its default
+  (`gemini`) and the OpenAI adapter would name `GEMINI_API_KEY`. That surfaced as a
+  real test failure — `test_providers.py` asserts the error names `OPENAI_API_KEY`
+  for a direct construction — which is the control working.
+
+  `agent/tests/test_nvidia_provider.py` then asserts what the SDK is **handed**: the
+  `model` on the outbound call and the `api_key` the client was constructed with. A
+  property can report the right string while the call sends another, so asserting
+  the property would have missed both bugs. Four of the controls were plant-tested by
+  reverting the fix and confirming they went red; the credential fix takes three
+  down. The file restores itself byte-for-byte, verified by hash — post-mortem 30 is
+  about what happened the last time a plant script cleaned up after itself.
+
+## 36. A Default That Fails On Every Call Is A Deployment, Not A Default (v1.0.3)
+
+- **What happened:** `meta/llama-3.1-70b-instruct` was chosen as the NVIDIA default
+  because it was the model named in the request and it is a real, widely served
+  model. It returns:
+
+      HTTP 410 Gone — "has reached its end of life on 2026-08-26 and is no longer
+      available"
+
+  A default that 410s on every call is not a permissive default. It is a
+  configuration that only appears to work, because the fail-closed degradation is
+  indistinguishable from having no key at all: deterministic prose, no tier change,
+  no error, no log line saying the model was never consulted.
+
+  The neighbouring hazard is worse and is not this repository's to fix: most
+  `nvidia/*` models on NIM answered `404 Function '<uuid>': Not found for account`
+  for the same credential that could list 81 models. **Catalogue access and model
+  entitlement are different things.** So even a model that is not retired may be
+  invisible to the key that can see it listed.
+
+- **Why it is a problem:** A default is only ever exercised when nothing is
+  configured, which is precisely when nobody is watching, and a wrong default
+  presents as a working system. This one was only findable by calling the endpoint.
+  No amount of offline validation could have caught it: the string is well-formed,
+  correctly namespaced, and looks exactly like every other model id in the file.
+
+- **How we fixed it:** The default is now a model verified to return
+  schema-conformant JSON against this deployment, the retired id is named in a test
+  as a specific historical fact rather than left implicit, and the runbook tells
+  operators to **pin** `NVIDIA_MODEL` and — before concluding a credential is broken
+  — to check the startup line for the resolved model. The entitlement hazard is
+  recorded in `providers.py` and the runbook too, because the next operator to hit
+  a 404 will otherwise assume the adapter is at fault.
+
+## 37. The RCA Was Ungrounded Because The Harness Never Sent The Evidence (v1.0.3)
+
+- **What happened:** Asked whether the model grounds its RCA in the real traceback,
+  a harness produced an answer about `OOMKilled` in namespace `payments` when the
+  evidence contained `KeyError: 'cust_8817'`, and reported that as a grounding
+  failure. It was not one. Three separate harness defects stacked:
+
+  1. The log-injection step searched the fixture for a dict with a `"logs"` key.
+     The payload field is `scrubbed_logs`, so the injector wrote **nothing**, in
+     silence, and the model was shown the fixture's original OOM evidence.
+  2. `IncidentPayload` is a Pydantic model, not a dataclass; `dataclasses.fields`
+     raised before reaching the evidence at all.
+  3. `model_copy(update=...)` bypasses validation, so `reason="CrashLoopBackOff"`
+     arrived as a bare `str` and `payload.reason.value` raised inside the agent.
+
+  The OOM answer was *correct for the evidence actually sent*. Reporting it as a
+  grounding failure would have put a false finding into the permanent record.
+
+- **Why it is a problem:** The failure mode is not the bug, it is the bug being
+  **credible**. A grounded-RCA harness that silently fails to send the logs yields
+  confident, specific, wrong conclusions about the model — and the model's answer
+  looks entirely reasonable, so there is nothing to sanity-check it against. The
+  fourth layer, found only after the first three were fixed: `SREK3S_LOG_TEXT_EVIDENCE`
+  defaults to **False**, so log text does not reach a model unless an operator opts
+  in per deployment. The traceback could never have appeared in that RCA regardless
+  of how the harness was written. That default is a *feature* — attacker-influenced
+  container stdout is kept out of the model entirely — but it means the shipped
+  default closes the prompt-injection surface before the model is consulted, and
+  any test of grounding must set the switch explicitly or it is testing nothing.
+
+- **How we fixed it:** Every grounding run now prints the rendered prompt and
+  asserts the traceback is present **before** calling a model, and asserts on
+  `llm.build_prompt` — not on a re-implementation of it. Grounding is only assessed
+  after that proof. With the switch on and the metadata made coherent (crash-loop
+  framing matching an exit-1 traceback), the live RCA names the `KeyError`, the
+  missing `cust_8817`, the `charge()` frame and the exception at startup, and
+  correctly declines to implicate the 128Mi memory limit.
+
+  The same run recorded a genuine defect rather than papering over it: NVIDIA's
+  `openai/gpt-oss-20b` returns the prose as a bare string in `root_cause` where the
+  schema declares `{"summary": ...}`, so `.summary` raised `AttributeError` in the
+  caller **after** tier, patch and every validation flag were written. Total failure,
+  not partial — nothing was compromised — but a total failure in the one code path
+  whose contract is "degrade to the deterministic prose" is the wrong shape for it
+  to have. `_normalise_root_cause` now accepts that one shape. It is a *shape*
+  tolerance, not a scope change: `extra="forbid"` still rejects a tier or a patch
+  arriving through the seam, freeform and fenced output are still fatal, and an
+  ambiguous multi-key object is refused rather than guessed. Both directions were
+  plant-tested — removing the normalisation reds two acceptance controls, making it
+  guess reds the ambiguity control.

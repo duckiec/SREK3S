@@ -80,6 +80,8 @@ __all__ = [
     "KNOWN_PROVIDERS",
     "PROVIDER_GEMINI",
     "PROVIDER_OPENAI",
+    "PROVIDER_NVIDIA",
+    "NVIDIA_BASE_URL",
     "GeminiProvider",
     "OpenAIProvider",
     "openai_response_schema",
@@ -93,9 +95,24 @@ logger = logging.getLogger("srek3s.agent")
 
 PROVIDER_GEMINI: Final[str] = "gemini"
 PROVIDER_OPENAI: Final[str] = "openai"
+#: NVIDIA NIM. Not a third adapter - it speaks the OpenAI chat-completions
+#: protocol, so it is a *configuration* of OpenAIProvider. That is the vendor
+#: lock-in the interface boundary exists to remove: a new endpoint is a base URL,
+#: a key variable and a model name, not a new class.
+PROVIDER_NVIDIA: Final[str] = "nvidia"
+
+#: NVIDIA's OpenAI-compatible endpoint. Referenced by the deployment rather than
+#: defaulted here, so ``resolve_base_url`` remains the single place an endpoint is
+#: chosen; hardcoding it in the adapter as well would mean changing the endpoint
+#: in two files and finding only one of them.
+NVIDIA_BASE_URL: Final[str] = "https://integrate.api.nvidia.com/v1"
 
 #: The adapter names ``resolve_provider_name`` will accept.
-KNOWN_PROVIDERS: Final[tuple[str, ...]] = (PROVIDER_GEMINI, PROVIDER_OPENAI)
+KNOWN_PROVIDERS: Final[tuple[str, ...]] = (
+    PROVIDER_GEMINI,
+    PROVIDER_OPENAI,
+    PROVIDER_NVIDIA,
+)
 
 #: API-key environment variable per provider.
 #:
@@ -106,6 +123,7 @@ KNOWN_PROVIDERS: Final[tuple[str, ...]] = (PROVIDER_GEMINI, PROVIDER_OPENAI)
 _API_KEY_ENV: Final[dict[str, str]] = {
     PROVIDER_GEMINI: "GEMINI_API_KEY",
     PROVIDER_OPENAI: OPENAI_API_KEY_ENV,
+    PROVIDER_NVIDIA: "NVIDIA_API_KEY",
 }
 
 #: Default model per provider. Overridable with ``LLM_MODEL``, or with the
@@ -114,11 +132,25 @@ _API_KEY_ENV: Final[dict[str, str]] = {
 _DEFAULT_MODEL: Final[dict[str, str]] = {
     PROVIDER_GEMINI: "gemini-3.5-flash",
     PROVIDER_OPENAI: "gpt-4o-mini",
+    # `meta/llama-3.1-70b-instruct` was the obvious default and is RETIRED: NIM
+    # returns HTTP 410 for it, "end of life on 2026-08-26". A default that 410s on
+    # every call is not a default, it is a broken deployment, and it was only
+    # visible by calling the endpoint. `openai/gpt-oss-20b` is entitled on the
+    # account this was verified against and returns schema-conformant JSON.
+    #
+    # Note the remaining family-wide hazard, recorded because it is not this
+    # repository's to fix: most `nvidia/*` models on NIM answered 404 "Function
+    # ... not found for account" for that same credential, i.e. catalogue access
+    # and model entitlement are different things. A deployment should therefore PIN
+    # `NVIDIA_MODEL` rather than rely on this default, and should be ready for a
+    # provider to retire it the way this one was.
+    PROVIDER_NVIDIA: "openai/gpt-oss-20b",
 }
 
 _PROVIDER_SPECIFIC_MODEL_ENV: Final[dict[str, str]] = {
     PROVIDER_GEMINI: "GEMINI_MODEL",
     PROVIDER_OPENAI: "OPENAI_MODEL",
+    PROVIDER_NVIDIA: "NVIDIA_MODEL",
 }
 
 
@@ -485,16 +517,38 @@ class OpenAIProvider:
 
     @property
     def model_name(self) -> str:
-        return self._model_name or resolve_model(PROVIDER_OPENAI, self._env)
+        # Resolved by PROVIDER NAME, not by the class. The adapter serves several
+        # providers from one class, and hardcoding PROVIDER_OPENAI here made an
+        # NVIDIA deployment report - and request - `gpt-4o-mini` from NIM's
+        # endpoint. That is the exact shape of bug this module's own docstring
+        # warns about: a plausible value that is simply wrong, substituted for
+        # another plausible value, so nothing raises anywhere.
+        # An empty environment carries no LLM_PROVIDER, so `resolve_provider_name`
+        # returns its default (gemini) - which would name GEMINI_API_KEY for a
+        # request made through the OpenAI adapter. Fall back to PROVIDER_OPENAI
+        # when there is no environment to resolve, so a direct construction names
+        # the variable that actually applies.
+        provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
+        return self._model_name or resolve_model(provider, self._env)
 
     def complete(self, prompt_text: str) -> str:
         base_url = self._base_url or resolve_base_url(self._env)
-        key = self._api_key or _api_key_for(PROVIDER_OPENAI, self._env)
+        # Same reasoning as model_name: the credential must be the one belonging to
+        # the CONFIGURED provider, or an NVIDIA deployment configured as `nvidia`
+        # would present OPENAI_API_KEY (unset) and report a missing credential while
+        # holding a perfectly good NVIDIA_API_KEY.
+        # `provider_from_env` passes the RESOLVED environment, so this branch only
+        # runs in a direct construction like `OpenAIProvider(api_key="", env={})`,
+        # where there is nothing to resolve and the default applies. Falling back to
+        # PROVIDER_OPENAI keeps that path naming the right variable.
+        provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
+        key = self._api_key or _api_key_for(provider, self._env)
         if not key and base_url is None:
             # A hosted endpoint needs a credential and a local one usually does
             # not, so this is only fatal when no endpoint override is in play.
+            variable = _API_KEY_ENV.get(provider, OPENAI_API_KEY_ENV)
             raise ModelOutputError(
-                f"{OPENAI_API_KEY_ENV} is not set and no {LLM_BASE_URL_ENV} is "
+                f"{variable} is not set and no {LLM_BASE_URL_ENV} is "
                 "configured, so no endpoint can be chosen. This is a configuration "
                 "fact, not a model failure: the caller must escalate rather than "
                 "retry."
@@ -585,10 +639,17 @@ class OpenAIProvider:
         return raw
 
     def describe(self) -> str:
-        """A startup-log-safe identity. Never includes the key."""
+        """A startup-log-safe identity. Never includes the key.
+
+        Names the CONFIGURED provider rather than the class. This adapter serves
+        both ``openai`` and ``nvidia``, so a literal ``openai`` here would have
+        logged a misdescription of every NVIDIA deployment - the same category of
+        plausible-but-wrong value that ``model_name`` was fixed for.
+        """
+        provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
         endpoint = self._base_url or resolve_base_url(self._env)
         target = endpoint or "provider default"
-        return f"openai model={self.model_name} endpoint={target}"
+        return f"{provider} model={self.model_name} endpoint={target}"
 
 
 #: Class names that identify a transport failure, checked against the whole MRO
@@ -680,7 +741,11 @@ def provider_from_env(env: Mapping[str, str] | None = None) -> CompletionClient 
     variable = _API_KEY_ENV.get(name, "")
     if not (source.get(variable) or "").strip():
         return None
-    if name == PROVIDER_OPENAI:
+    if name in (PROVIDER_OPENAI, PROVIDER_NVIDIA):
+        # NVIDIA routes through the same adapter. Its base URL is a deployment
+        # fact, so it is read from the environment like any other override rather
+        # than injected here - which is what lets one adapter serve a hosted API,
+        # a local vLLM and NIM without branching.
         return OpenAIProvider(env=source)
     return GeminiProvider(env=source)
 

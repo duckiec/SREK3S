@@ -703,10 +703,19 @@ Two knobs, both on the agent container:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini` or `openai`. Unset or unrecognised means `gemini`, with a startup warning. |
-| `LLM_BASE_URL` | *(provider's own default)* | Repoints the OpenAI-protocol adapter. This is what makes a local Ollama/vLLM/LM Studio endpoint possible. |
-| `LLM_MODEL` | per provider | `GEMINI_MODEL` is consulted first, so an existing pin keeps working. |
-| `GEMINI_API_KEY` / `OPENAI_API_KEY` | — | One is required for a hosted endpoint. None is required for a local one. |
+| `LLM_PROVIDER` | `gemini` | `gemini`, `openai` or `nvidia`. Unset or unrecognised means `gemini`, with a startup warning. |
+| `LLM_BASE_URL` | *(provider's own default)* | Repoints the OpenAI-protocol adapter. This is what makes a local Ollama/vLLM/LM Studio endpoint possible, and what points the same adapter at NVIDIA NIM. |
+| `LLM_MODEL` | per provider | `GEMINI_MODEL` / `NVIDIA_MODEL` / `OPENAI_MODEL` are consulted first, so an existing pin keeps working. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `NVIDIA_API_KEY` | — | One is required for a hosted endpoint. None is required for a local one. |
+
+**Pin the model, do not rely on the default.** NVIDIA NIM retires models: the
+original `meta/llama-3.1-70b-instruct` default began returning HTTP 410
+`end of life on 2026-08-26` with no other symptom. A retired model is a fail-closed
+degradation — the agent keeps triaging on deterministic prose — but it looks
+identical to "no key configured", so check the startup line for the resolved model
+before concluding the credential is at fault. Note also that most `nvidia/*` models
+answered `404 Function ... not found for account` for one verified credential:
+being able to list the catalogue is not the same as being entitled to a model.
 
 ### Confirming which provider is live
 

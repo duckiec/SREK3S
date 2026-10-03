@@ -797,18 +797,52 @@ def decode_narrative(raw: str) -> ModelNarrative:
     fields the schema deliberately withheld; validating less lets unchecked text
     through.
 
-    I-B4 is unchanged and still absolute: no fence stripping, no partial parse,
-    no best-effort scrape. A missing or malformed narrative field is fatal, not
-    defaulted.
+    ONE PROVENANCE NORMALISATION, and it is not a relaxation. Both schemas nest
+    the summary under ``root_cause.summary``; a provider may return the prose as
+    a bare string in ``root_cause`` instead. That is observed, not hypothetical -
+    NVIDIA's ``openai/gpt-oss-20b`` does exactly this, and it produced an
+    AttributeError in the caller *after* the tier, patch and every validation flag
+    had already been written.
+
+    The distinction that matters: I-B4 is about the BOUNDARY, and this is not
+    boundary weakening. The permitted slice is still exactly two fields, unknown
+    fields are still rejected (``extra="forbid"``), and freeform output is still
+    fatal rather than salvaged. What is accepted is one *shape* for a field the
+    model was always entitled to supply. The alternative - rejecting the whole
+    narrative - is strictly worse for the operator and strictly identical for
+    security, because the same prose is available either way.
     """
     document = _parse_strict_object(raw)
+    normalised = _normalise_root_cause(document)
     try:
-        return ModelNarrative.model_validate(document)
+        return ModelNarrative.model_validate(normalised)
     except Exception as exc:  # noqa: BLE001 - any schema failure is fatal
         detail = str(exc).splitlines()[0][:200]
         raise ModelOutputError(
             f"model output failed narrative validation: {detail}"
         ) from None
+
+
+def _normalise_root_cause(document: dict[str, Any]) -> dict[str, Any]:
+    """Accept ``root_cause`` as a bare string, returning the nested form.
+
+    Extracted so the normalisation is visible and testable rather than buried in
+    the decoder. Only that ONE key is touched; every other field is validated
+    exactly as the schema declared it.
+    """
+    value = document.get("root_cause")
+    if isinstance(value, str):
+        return {**document, "root_cause": {"summary": value}}
+    if isinstance(value, dict) and "summary" not in value and len(value) == 1:
+        # A single-key object whose key is not `summary` is the same provenance
+        # question one level down: the prose arrived, under a name the schema did
+        # not ask for. Accept exactly one such shape rather than guessing which key
+        # was meant — guessing which of an arbitrary provider's keys holds the prose
+        # is the kind of leniency that turns a shape tolerance into a field picker.
+        (only_key,) = value
+        if isinstance(value[only_key], str):
+            return {**document, "root_cause": {"summary": value[only_key]}}
+    return document
 
 
 def _parse_strict_object(raw: str) -> dict[str, Any]:

@@ -8,7 +8,7 @@
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-924%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-950%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
 It reads your crashing containers, works out *why*, and hands you a reviewed
 `git diff`. **It can never change your cluster** — enforced by RBAC, not by
@@ -105,10 +105,10 @@ patch, because the schema it is handed has no field to return one in.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini` or `openai`. Any server speaking the OpenAI chat-completions protocol works. |
-| `LLM_BASE_URL` | *(provider default)* | Repoints the OpenAI-protocol adapter at a local **Ollama, vLLM or LM Studio** endpoint. |
-| `LLM_MODEL` | per provider | Model name. `GEMINI_MODEL` wins if set, so an existing pin keeps working. |
-| `GEMINI_API_KEY` / `OPENAI_API_KEY` | — | One credential. Absent means "no model", not "no agent". |
+| `LLM_PROVIDER` | `gemini` | `gemini`, `openai` or `nvidia`. Anything speaking the OpenAI chat-completions protocol works — NVIDIA NIM included, as a *configuration* of the same adapter rather than a third one. |
+| `LLM_BASE_URL` | *(provider default)* | Repoints the OpenAI-protocol adapter at a local **Ollama, vLLM or LM Studio** endpoint, or at NVIDIA NIM. |
+| `LLM_MODEL` | per provider | Model name. `GEMINI_MODEL` / `NVIDIA_MODEL` / `OPENAI_MODEL` win if set, so an existing pin keeps working. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `NVIDIA_API_KEY` | — | One credential. Absent means "no model", not "no agent". |
 
 ```bash
 # locally: .env or .env.local, both gitignored
@@ -654,8 +654,8 @@ Or individually:
 
 ```bash
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 924 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 924 passed, 3 skipped
+go test -race ./...                 # 950 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 950 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/

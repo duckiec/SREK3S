@@ -130,6 +130,25 @@ Changing the provider changes nothing about authority. Both SDKs are imported
 lazily, so a host without either still imports the module, still triages, and
 still answers `/healthz`.
 
+**Adding a provider is a configuration change, not a new adapter class.** NVIDIA
+NIM was added this way: three table entries (`KNOWN_PROVIDERS`, `_API_KEY_ENV`,
+`_DEFAULT_MODEL`) and one branch in the factory. Because one class now serves
+several providers, every per-provider fact must be resolved from the *environment*,
+never from the class:
+
+```python
+provider = resolve_provider_name(self._env) if self._env else PROVIDER_OPENAI
+```
+
+Getting this wrong is silent and offline-invisible. `model_name` once returned
+`resolve_model(PROVIDER_OPENAI, env)`, so an NVIDIA deployment asked NVIDIA's
+endpoint for `gpt-4o-mini`; `complete()` once resolved its credential the same way,
+so an NVIDIA deployment holding only `NVIDIA_API_KEY` reported a missing
+credential while holding a good one. Both produced no error anywhere — a plausible
+value, substituted for another plausible value. `agent/tests/test_nvidia_provider.py`
+asserts what the SDK is **handed** rather than what a property returns, because
+that is the only assertion either bug would have failed.
+
 ### 4. Secrets are scrubbed before egress, in memory
 
 Telemetry is masked on the Go node, in memory, before any network call.

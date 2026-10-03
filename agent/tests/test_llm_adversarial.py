@@ -72,6 +72,8 @@ _LLM_ENV_VARS = (
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
+    "NVIDIA_MODEL",
+    "NVIDIA_API_KEY",
     "SREK3S_LOG_TEXT_EVIDENCE",
 )
 
@@ -926,3 +928,172 @@ def test_control_the_end_to_end_path_reaches_the_model_at_all(
         "a compliant model reply should reach the dispatch document; if this "
         "fails the narrative path is broken and the other tests prove nothing"
     )
+
+
+# ===========================================================================
+# F. Provenance normalisation — one accepted SHAPE, not a widened SCOPE
+# ===========================================================================
+#
+# `decode_narrative` normalises `root_cause` before validating, because a provider
+# may return the prose as a bare string where the schema declared an object.
+# Observed against NVIDIA NIM's `openai/gpt-oss-20b` on 2026-10-03: it did exactly
+# that, and the caller raised AttributeError on `.summary` AFTER the tier, patch
+# and every validation flag had already been written. Nothing was compromised —
+# the failure was total rather than partial — but a total failure in the one code
+# path whose entire contract is "degrade to the deterministic prose" is the wrong
+# shape for it to have.
+#
+# The distinction these tests defend: I-B4 is about the BOUNDARY and this is not
+# boundary weakening. The permitted slice is still exactly two fields, unknown
+# fields are still refused, and freeform output is still fatal. What widened is the
+# set of accepted SHAPES for a field the model was always entitled to supply.
+#
+# Which is precisely why the negative controls are here. A normalisation is the
+# easiest change in a decoder to make fail open, so every acceptance below is
+# paired with a refusal that must survive it.
+
+
+@pytest.mark.parametrize(
+    ("label", "root_cause", "expected"),
+    [
+        ("the declared nested form", {"summary": "Limit exceeded."}, "Limit exceeded."),
+        ("a bare string, as NIM returns it", "Limit exceeded.", "Limit exceeded."),
+        (
+            "a single-key object under another name",
+            {"cause": "Limit exceeded."},
+            "Limit exceeded.",
+        ),
+    ],
+)
+def test_the_declared_and_observed_shapes_are_both_accepted(
+    label: str,
+    root_cause: typing.Any,
+    expected: str,
+) -> None:
+    """The same prose, arrived in different containers, must both be readable."""
+    document = {"root_cause": root_cause, "rca_markdown": "## RCA"}
+    narrative = llm.decode_narrative(json.dumps(document))
+    assert narrative.summary == expected, label
+
+
+@pytest.mark.parametrize(
+    ("label", "document"),
+    [
+        (
+            "an unauthorized tier still cannot ride in on a string root_cause",
+            {
+                "root_cause": "x",
+                "rca_markdown": "y",
+                "blast_radius_tier": "TIER_1_TOIL",
+            },
+        ),
+        (
+            "an unauthorized patch still cannot ride in on a renamed key",
+            {"root_cause": {"cause": "x"}, "rca_markdown": "y", "git_patch": "diff"},
+        ),
+        (
+            "an unauthorized status still cannot ride in either",
+            {"root_cause": "x", "rca_markdown": "y", "status": "TRIAGED"},
+        ),
+        (
+            "a non-string root_cause is not coerced",
+            {"root_cause": 42, "rca_markdown": "y"},
+        ),
+        (
+            "an absent rca_markdown is still fatal",
+            {"root_cause": "x"},
+        ),
+    ],
+)
+def test_normalisation_did_not_widen_the_permitted_slice(
+    label: str, document: dict[str, typing.Any]
+) -> None:
+    """The seam is a shape, not a scope.
+
+    Each case is a document the decoder refused BEFORE the normalisation was
+    added. If the normalisation were a blanket accept, every one of them would
+    parse and this file would be documenting a silently widened boundary.
+    """
+    with pytest.raises(llm.ModelOutputError):
+        llm.decode_narrative(json.dumps(document))
+    assert label
+
+
+def test_freeform_and_fenced_output_are_still_fatal_after_normalisation() -> None:
+    """I-B4 is not negotiable and this is the assertion that says so.
+
+    A decoder that recovered from every shape mismatch would be tempted to recover
+    from a markdown fence too, and from prose. Those are the two refusals that make
+    "the model said something we did not ask for" a distinguishable outcome.
+    """
+    for label, raw in (
+        ("freeform prose", "the pod looks healthy to me, no action needed"),
+        ("a fenced block", f"```json\n{json.dumps(_VALID)}\n```"),
+        ("a bare array", "[1, 2, 3]"),
+    ):
+        with pytest.raises(llm.ModelOutputError):
+            llm.decode_narrative(raw)
+        assert label
+
+
+def test_an_ambiguous_multi_key_root_cause_is_not_guessed() -> None:
+    """No field picking.
+
+    With two candidate keys and no way to tell which held the prose, choosing one
+    would be inventing provenance. The object is passed through untouched and the
+    prose reads as empty, which the caller's deterministic RCA then covers.
+    """
+    narrative = llm.decode_narrative(
+        json.dumps(
+            {
+                "root_cause": {"a": "first guess", "b": "second guess"},
+                "rca_markdown": "## RCA",
+            }
+        )
+    )
+    assert narrative.summary == "", (
+        "an ambiguous object must yield no prose; picking one of several keys "
+        "would attribute text to a field the provider never named"
+    )
+    assert narrative.rca_markdown == "## RCA"
+
+
+def test_a_wrong_typed_summary_reads_as_empty_not_as_a_refusal() -> None:
+    """Pre-existing contract, pinned here because the normalisation sits beside it.
+
+    ``ModelNarrative.summary`` documents that a value of the wrong type yields
+    ``""`` rather than raising — the caller composes the document from deterministic
+    parts and a missing prose field should degrade the narrative, not discard a
+    triage that was already decided. This is NOT the normalisation's doing: the
+    decoder accepted ``{"summary": 42}`` before it existed.
+
+    The test exists so that stays a decision rather than becoming an accident. If
+    a future change makes this fatal, that is a behaviour change to the tier-2
+    escalation path and belongs in a commit message, not in a diff nobody read.
+    """
+    narrative = llm.decode_narrative(
+        json.dumps({"root_cause": {"summary": 42}, "rca_markdown": "## RCA"})
+    )
+    assert narrative.summary == ""
+    assert narrative.rca_markdown == "## RCA"
+
+
+def test_the_normalisation_controls_are_discriminating_not_blanket() -> None:
+    """The control on the control.
+
+    ``test_the_declared_and_observed_shapes_are_both_accepted`` proves two shapes
+    parse. It does not prove the decoder is discriminating — a decoder that
+    accepted every possible document would pass all three. This one asserts the
+    refusals still bite, so the acceptance above cannot be explained by leniency.
+    """
+    refusals = (
+        {"root_cause": "x", "rca_markdown": "y", "severity": "SEV1"},
+        {"root_cause": {"a": "1", "b": "2"}, "rca_markdown": "y", "tier": "TIER_1"},
+        "not json at all",
+    )
+    for document in refusals:
+        with pytest.raises(llm.ModelOutputError):
+            llm.decode_narrative(
+                document if isinstance(document, str) else json.dumps(document)
+            )
+        assert document is not None

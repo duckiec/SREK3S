@@ -126,11 +126,27 @@ spec:
             # No key is required for a local endpoint. One IS required for a
             # hosted one, and `provider_from_env()` returns nothing without it,
             # which degrades the narrative and never the service.
-            # -------------------------------------------------------------------------
+            # -------------------------------------------------------------------
+            # MODEL TRANSPORT SELECTION
+            #
+            # `nvidia` is NVIDIA NIM, which speaks the OpenAI chat-completions
+            # protocol, so it is a CONFIGURATION of the existing adapter rather than
+            # a third one. That is what the provider boundary buys: a new endpoint
+            # is a provider name, a base URL and a credential variable.
+            #
+            # Both are deployment facts and live here rather than as code defaults,
+            # for the reason resolve_provider_name exists: a mis-set provider costs a
+            # narrative and nothing else, because tier, patch and every validation
+            # flag are computed deterministically before any model is consulted.
+            #
+            # The `/v1` suffix is required. NIM serves the OpenAI protocol under that
+            # path and a bare host 404s on every request - which the adapter reports
+            # as a failed call and degrades from, rather than as a startup refusal.
+            # -------------------------------------------------------------------
             - name: LLM_PROVIDER
-              value: gemini
+              value: nvidia
             - name: LLM_BASE_URL
-              value: ""
+              value: https://integrate.api.nvidia.com/v1
 
             # -------------------------------------------------------------------------
             # GEMINI_API_KEY — THE MODEL CREDENTIAL
@@ -178,6 +194,26 @@ spec:
                 secretKeyRef:
                   name: srek3s-secrets
                   key: GEMINI_API_KEY
+                  optional: true
+
+            # NVIDIA_API_KEY - the NIM credential. Same Secret, same rules.
+            #
+            # A separate variable rather than a shared one, so a deployment can hold
+            # either key, both, or neither. `optional: true` on both is what makes
+            # 'neither' a supported state: the narrative degrades to the
+            # deterministic prose and the agent keeps answering incident traffic.
+            #
+            # `key:` is REQUIRED, not optional, and omitting it is rejected at
+            # admission with "secretKeyRef.key: Required value" — a puzzling error
+            # because the field looks inferable from the env var's name. It is not:
+            # a secretKeyRef selects a KEY inside the Secret, and the env var name
+            # is a separate thing. Gemini's reference above carries it for the same
+            # reason.
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: NVIDIA_API_KEY
                   optional: true
 
           # ARCH §8: read-only root, no privilege escalation, every capability
