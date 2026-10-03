@@ -2174,6 +2174,38 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   global rather than per-language, and reusing G4 for a Go check would have put two
   unrelated things under one label in two documents.
 
+- **And it failed on its first execution, which is the other half of the story.**
+  Run #91 was the first time G7 ever ran, and the `go-gates` job went red — not on
+  the scan, but on the *install*:
+
+      golang.org/x/vuln/cmd/govulncheck@v1.8.0: golang.org/x/vuln@v1.8.0 requires
+      go >= 1.26.0 (running go 1.25.14; GOTOOLCHAIN=local)
+
+  The pin was `v1.8.0`, because that is what `@latest` resolved to on the machine
+  the gate was developed on — and that machine runs Go 1.26.8. CI pins `GO_VERSION`
+  to 1.25. **The tool was verified on a different toolchain than the one that would
+  have to install it.** Every local check passed, because locally it genuinely
+  built; the incompatibility only exists on CI's version, so nothing short of
+  running CI could have surfaced it.
+
+  Fixed by pinning `v1.7.0`, the newest release declaring `go 1.25.0`. Raising the
+  project's baseline to 1.26 was the alternative and was rejected as
+  disproportionate — the scanner is a tool, not the project.
+
+  The replacement was verified to still be a control rather than merely something
+  that compiles: it still resolves GO-2026-5970 and exits 3 on a vulnerable tree,
+  exits 0 on a clean one, and is still fail-open on its advisory database — so the
+  precheck is required for this pin exactly as it was for v1.8.0. "It installs" and
+  "it is still a gate" are different claims and both were checked.
+
+  What is **not** guarded: no test asserts the pin is compatible with
+  `GO_VERSION`, because that needs the network to read the module's `go` directive
+  and this suite is deliberately offline. A grep for a comment would not help —
+  post-mortem 34 and 25 are both about checks that read their own documentation.
+  The honest position is that this class of bug fails loudly in about five seconds
+  with a precise message, rather than silently, and that is acceptable for a
+  compatibility constraint. It will recur when Go 1.25 is EOL.
+
 ## 39. Deferred To v0.1.1 — What Is Not Covered Yet (v1.1.0)
 
 Recorded so that "not covered" is a decision with an owner and a cycle attached,

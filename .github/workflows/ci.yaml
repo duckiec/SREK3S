@@ -157,14 +157,32 @@ jobs:
       - name: Resolve module dependencies
         run: go mod download
 
-      # PINNED, not @latest. An unpinned install of the tool that decides whether the
-      # build passes hands that decision to whoever can publish a vuln-tool release.
-      # For a security gate that is the wrong default; Dependabot already watches
-      # this repo, so the bump can be reviewed rather than arriving silently.
+      # PINNED, not @latest, and not the newest release. An unpinned install of the tool
+      # that decides whether the build passes hands that decision to whoever can
+      # publish a vuln-tool release; for a security gate that is the wrong default.
+      # Dependabot already watches this repo, so the bump can be reviewed.
+      #
+      # v1.7.0 specifically, not v1.8.0. v1.8.0 declares `go 1.26.0` and CI pins
+      # GO_VERSION 1.25 with GOTOOLCHAIN=local, so installing it fails with
+      # "requires go >= 1.26.0" and takes G1-G3 down with it. That is not a
+      # hypothetical: it broke CI run #91 on this gate's first execution. v1.7.0 is
+      # the newest release declaring `go 1.25.0`.
+      #
+      # Raising the project's baseline to 1.26 instead was the alternative, and was
+      # rejected as disproportionate — the scanner is a tool, not the project, and
+      # would have meant touching every gate, the Dockerfile and bootstrap for
+      # something that builds fine a version earlier. The trade is that this pin
+      # needs revisiting when Go 1.25 is eventually EOL, and that is now recorded
+      # rather than waiting to be rediscovered as a red build.
+      #
+      # The pin was verified to still BE a control on all three axes, not merely to
+      # compile: it still resolves GO-2026-5970 and exits 3 on a vulnerable tree, it
+      # exits 0 on a clean one, and it is still fail-open on its advisory database —
+      # so the precheck below is required for this pin exactly as it was for v1.8.0.
       - name: Install govulncheck (pinned)
         run: |
           set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           "$(go env GOPATH)/bin/govulncheck" -version
 
       # G7 — reachable-CVE scan.
