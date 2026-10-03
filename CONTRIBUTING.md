@@ -43,7 +43,33 @@ people learn to ignore.
 | G4 | `black --check agent/ tests/` | Python formatting |
 | G5 | `flake8 agent/ tests/` | Style, and unused imports |
 | G6 | `mypy --strict agent/ tests/` | Type errors, under the strictest settings |
+| G7 | `govulncheck ./...` | **Reachable** CVEs. See below |
 | — | `pytest agent/tests/ -q` | Every behavioural assertion below |
+
+G7 is numbered after the Python gates rather than beside the other Go ones because
+the sequence is global: Go is G1–G3, Python is G4–G6. Naming a Go gate "G4" would
+put two unrelated checks under one label, and the first person to look up G4 would
+find formatting.
+
+**G7 gates on reachability, which is the point.** govulncheck exits non-zero only
+when a vulnerable symbol is actually *called* from this code; a CVE sitting in a
+required module that nothing reaches is reported and does not block. So it answers
+"can this binary be affected", which is a different and much more actionable
+question than the one Dependabot alerts answer ("is this version in the graph").
+It is also stricter than a high/critical filter: a reachable *moderate* blocks too,
+and a DoS on the log-reading path is precisely what severity ratings understate.
+
+**Two ways this gate can silently stop gating, both guarded by tests.** The first is
+`govulncheck ./... | tee out.txt` without `pipefail`, where the step reports `tee`'s
+exit status — always 0. The second is worse: govulncheck is **fail-open on its
+advisory database**. With `vuln.go.dev` unreachable it exits 0 and prints
+"No vulnerabilities found.", byte-identical to a genuinely clean scan, and
+`-version` is no help because it reports a cached timestamp either way. On a fresh
+CI runner there is no cache, so an outage would turn G7 green while it knew of no
+advisories at all. The step therefore asserts the advisory service answers *before*
+trusting a clean result, and `TestReachableCveGate` in `agent/tests/test_workflows.py`
+fails if any of that is removed. All four failure modes were plant-tested by
+reintroducing the defect and confirming a control goes red.
 
 Skipped tests are a **blocked dependency, not a pass**, and CI enforces that with a
 ratchet: the skip count may *fall*, never *rise*. Three skip today — two need a

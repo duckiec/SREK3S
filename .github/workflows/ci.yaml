@@ -131,9 +131,12 @@ jobs:
         run: python scripts/audit_workflow.py --strict
 
   go-gates:
-    name: Go quality gates (G1, G2, G3)
+    name: Go quality gates (G1, G2, G3, G7)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised from 10 for G7: govulncheck fetches the advisory database before it can
+    # analyse anything, and that download is not accounted for by any local step.
+    # A timeout that fires mid-download would look exactly like a clean scan.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -153,6 +156,90 @@ jobs:
 
       - name: Resolve module dependencies
         run: go mod download
+
+      # PINNED, not @latest. An unpinned install of the tool that decides whether the
+      # build passes hands that decision to whoever can publish a vuln-tool release.
+      # For a security gate that is the wrong default; Dependabot already watches
+      # this repo, so the bump can be reviewed rather than arriving silently.
+      - name: Install govulncheck (pinned)
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          "$(go env GOPATH)/bin/govulncheck" -version
+
+      # G7 — reachable-CVE scan.
+      #
+      # NUMBERED G7, NOT G4, because G4 is already `black --check` and always has
+      # been: the gate sequence is global, not per-language (Go is G1–G3, Python is
+      # G4–G6). Reusing G4 for a Go gate would have put two different checks under
+      # one name in CONTRIBUTING.md and the README, and the first reader to look up
+      # "G4" would find formatting instead of a vulnerability scan.
+      #
+      # Added because govulncheck was run BY HAND on 2026-10-03 and found
+      # GO-2026-5970 — an infinite loop on invalid input in golang.org/x/text
+      # v0.37.0 — reachable through internal/k8s/telemetry.go -> GetLogs().Stream().
+      # That is the sentinel's own log-reading path, so container output an
+      # attacker already controls could drive it. It was fixed in the same sitting
+      # and would have stayed fixed only until the next careless bump. A check
+      # nobody runs is not a check.
+      #
+      # STRICTLY STRONGER THAN "BLOCK ON HIGH/CRITICAL", deliberately. govulncheck's
+      # exit status is non-zero only when a vulnerability is REACHABLE from this
+      # code, so a reachable *moderate* blocks too — and a DoS on the log path is
+      # what severity ratings understate. Measured, not assumed: a planted revert
+      # of the x/text bump exits 3, the patched tree exits 0. It is 3, not 1;
+      # assuming 1 would have been wrong.
+      #
+      # The distinction govulncheck draws is what makes this worth having: a CVE
+      # present in a required module but never CALLED is reported and does NOT
+      # affect the exit code. So this asserts something about what this binary can
+      # actually reach, rather than about the module graph — which is what
+      # Dependabot alerts tell you, and why those are triage and this is a gate.
+      #
+      # THE REACHABILITY PRECHECK IS LOAD-BEARING, and it is here because the scan
+      # alone is a control that passes for the wrong reason. govulncheck is
+      # FAIL-OPEN on its advisory database: with vuln.go.dev unreachable it exits
+      # 0 and prints "No vulnerabilities found." — byte-identical to a genuinely
+      # clean scan. Verified by running it against an unreachable endpoint, twice,
+      # because the first attempt silently fell back to the local cache and proved
+      # nothing. On a fresh CI runner there is no cache, so a vuln.go.dev outage
+      # would turn this gate green while it knew of no advisories at all.
+      # `govulncheck -version` is NOT a usable probe for this — it also exits 0 and
+      # reports a cached timestamp — so the service is asserted directly.
+      - name: G7 — govulncheck (reachable CVEs)
+        # The auditor requires this because the step blocks on `curl`, and its
+        # reasoning applies directly: a job-level budget is a backstop, not a
+        # control. `--max-time 30` already bounds the fetch, and this is the belt to
+        # that braces — generous, because the first run also downloads advisories.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # curl prints "000" through -w AND exits non-zero on a connection failure,
+          # so an `|| echo 000` fallback concatenates into "000000" — cosmetic, but a
+          # failed build reading `HTTP 000000` looks like a bug in this step rather
+          # than an outage. Testing the assignment in an `if` also keeps `set -e`
+          # from aborting before the explanation below can print, since errexit does
+          # not apply to a command in an `if` condition.
+          if code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+            https://vuln.go.dev/index/db.json); then
+            :
+          else
+            code="unreachable"
+          fi
+
+          if [ "$code" != "200" ]; then
+            echo "::error::govulncheck's advisory database is unreachable (HTTP ${code})."
+            echo "govulncheck exits 0 and reports no vulnerabilities when it cannot"
+            echo "fetch advisories, so a scan now would assert nothing. Failing here"
+            echo "instead of reporting a clean result this run did not earn."
+            exit 1
+          fi
+          echo "advisory database reachable (HTTP ${code})"
+
+          govulncheck ./... | tee govulncheck.txt
+      # `pipefail` is what makes the scan a gate: without it the step's status is
+      # tee's, which is always 0, and G7 would pass on every scan.
 
       - name: G1 — go vet
         run: go vet ./...

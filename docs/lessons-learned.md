@@ -2111,3 +2111,111 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   ambiguous multi-key object is refused rather than guessed. Both directions were
   plant-tested — removing the normalisation reds two acceptance controls, making it
   guess reds the ambiguity control.
+
+## 38. The Security Gate Was Fail-Open On Its Own Data Source (v1.1.0)
+
+- **What happened:** govulncheck found GO-2026-5970 (an infinite loop in
+  `golang.org/x/text`, reachable through `GetLogs().Stream()`) and was promoted to
+  a Go quality gate. The obvious implementation is one line:
+
+      - run: govulncheck ./... | tee govulncheck.txt
+
+  and it is a *report*, not a gate: the step's exit status is `tee`'s, always 0.
+  That much was caught by inspection and fixed with `set -euo pipefail`.
+
+  The second failure was not caught by inspection. **govulncheck is fail-open on
+  its advisory database.** With `vuln.go.dev` unreachable it exits 0 and prints:
+
+      === Symbol Results ===
+      No vulnerabilities found.
+      Your code is affected by 0 vulnerabilities.
+
+  which is **byte-identical** to a genuinely clean scan. `govulncheck -version` is
+  no help — it also exits 0 and reports a cached timestamp. GitHub runners are
+  fresh machines with no advisory cache, so during a `vuln.go.dev` outage G7 would
+  have reported "no vulnerabilities" on every push while knowing of none.
+
+- **Why it is a problem:** the output is the *lie*. Not "govulncheck could not
+  check" — "no vulnerabilities found." A reader, and any future rule that greps
+  that phrase, has no way to distinguish a clean tree from an unchecked one. This is
+  the same shape as post-mortem 25 (a gate that reported 68 false failures and was
+  believed), pointed the other way: there, a control cried wolf; here, one stays
+  quiet, and quiet looks like success.
+
+  It is also the case where *assuming* the tool's exit code is a gate would have
+  shipped a security control that does not work. The check that the exit code is
+  non-zero on a real vulnerability is a one-line experiment, and it returned **3**,
+  not the 1 that a reasonable person would have predicted.
+
+- **Two false starts worth recording.** The first probe pointed `GOVULNDB` at a
+  nonexistent path and appeared to confirm fail-open — but it had silently fallen
+  back to the local advisory cache and proved nothing about a cold cache, which is
+  what CI actually has. The second attempt set `HOME`, which redirected Go's entire
+  module cache and re-downloaded ~100 MB into a temp directory, producing thousands
+  of lines of `Permission denied` from an `rm -rf` on read-only module files. The
+  isolation needed was the advisory cache alone. Two of my three probes measured the
+  wrong thing, and the one that worked was the narrowest.
+
+- **How we fixed it:** the step asserts `https://vuln.go.dev/index/db.json` answers
+  HTTP 200 *before* trusting a clean scan, and fails the job otherwise rather than
+  reporting a result it did not earn. Both branches were executed, not just
+  written: reachable → exit 0; unreachable → exit 1 with an explanation. The
+  scanner is pinned at `v1.8.0`, because an unpinned `@latest` hands the gate's
+  verdict to whoever publishes a vuln-tool release next, and Dependabot already
+  watches this repo so the bump can arrive through review.
+
+  `TestReachableCveGate` in `agent/tests/test_workflows.py` then guards all four
+  ways this gate can stop being one: removed, unpiped, missing the reachability
+  assertion, unpinned. Each was plant-tested by reintroducing the defect and
+  confirming a control red — 2, 1, 1 and 1 respectively. Removing the gate is caught
+  by two controls because two assertions call the same accessor.
+
+  The gate is **G7, not G4**. G4 has always been `black --check`; the numbering is
+  global rather than per-language, and reusing G4 for a Go check would have put two
+  unrelated things under one label in two documents.
+
+## 39. Deferred To v0.1.1 — What Is Not Covered Yet (v1.1.0)
+
+Recorded so that "not covered" is a decision with an owner and a cycle attached,
+rather than a gap nobody has written down. Each item is a real limitation, stated
+as what it is.
+
+- **The Python dependency tree is unscanned.** G7 covers the Go module graph. There
+  is no `pip-audit` or equivalent in CI, and `pip-audit` is not even installed in
+  the working environment. Nine direct dependencies ship in `agent/requirements.txt`
+  — including `fastapi`, `httpx`, `openai` and `google-genai` — and none of them
+  has been checked against an advisory database by any automated gate. Everything in
+  this repository's threat model is about the *model boundary*; nothing has been
+  about the *transport* those packages provide. Deferred to v0.1.1.
+
+- **Three of GitHub's four Dependabot alerts are unexamined.** They are visible in
+  the repository's security tab and have not been triaged. No Dependabot alert API
+  was reachable from the tooling used to investigate, so they were reported as
+  blocked rather than guessed at. G7 is not a substitute: it reports *reachable*
+  vulnerabilities in the Go graph, which is a different set from Dependabot's
+  version-based alerts, and the two will not agree. Deferred to v0.1.1.
+
+- **Two tests still require a reachable cluster.** `test_verification_e2e.py`'s
+  live round-trip creates a `srek3s-verify-chaos` namespace and skips without an
+  apiserver. The skip ratchet (`EXPECTED_SKIPS`) keeps this from growing silently,
+  which is the important part, but the underlying assertion has never executed in
+  CI. Deferred to v0.1.1.
+
+- **An intermittent blank LLM narrative.** Across nine live calls against NVIDIA
+  NIM, one returned no narrative at all (the adapter attempted the call and it
+  failed; `_narrative_overlay` degraded to the deterministic prose, as designed).
+  Cause never identified — not reproduced in the eight calls that followed, and the
+  failure is swallowed by design, which is correct for an operator at 3am and
+  useless for diagnosis.
+
+  This is accepted rather than fixed, and the acceptance is on the strength of the
+  architecture rather than the rate: the failure cost *prose*, and nothing else.
+  Tier, patch, every validation flag, the fail-closed telemetry path and the
+  escalation decision were all computed before the model was consulted, so a
+  provider that returns nothing degrades the narrative and cannot influence
+  authority. A blank RCA is an annoyance; a model-influenced tier would be a
+  compromise. That trade is the reason this item is a note rather than a bug.
+
+  The measurement that would justify revisiting it: run a fixed prompt against one
+  pinned model N times and record the failure rate. It has not been done, so no
+  number is claimed here.

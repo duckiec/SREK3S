@@ -8,7 +8,7 @@
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-950%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-954%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
 It reads your crashing containers, works out *why*, and hands you a reviewed
 `git diff`. **It can never change your cluster** — enforced by RBAC, not by
@@ -654,8 +654,8 @@ Or individually:
 
 ```bash
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 950 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 950 passed, 3 skipped
+go test -race ./...                 # 954 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 954 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/
@@ -700,6 +700,7 @@ exactly like a working setup.
 | `G4` | `black --check agent/ tests/` | Python formatting |
 | `G5` | `flake8 agent/ tests/` | Python style |
 | `G6` | `mypy --strict agent/ tests/` | Strict typing |
+| `G7` | `govulncheck ./...` | **Reachable** CVEs — exits non-zero only when a vulnerable symbol is actually called from this code, so it answers "can this binary be affected" rather than "is this version in the graph". Stricter than a high/critical filter: a reachable moderate blocks too. Asserts advisory reachability first, because govulncheck is fail-open on its own database and would otherwise pass during a `vuln.go.dev` outage. |
 | M3 | Terminal validation | `TestNilPointerSafety`, `TestNoGoroutineLeak`, `TestIncidentPayloadContract` |
 | AC-2 | Corpus replay | 46 cases, 32 maskable |
 | AC-4 | Container build + runtime smoke | Asserts UID 10001, imports `main:app` |

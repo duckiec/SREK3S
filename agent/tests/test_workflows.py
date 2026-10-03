@@ -25,6 +25,11 @@ workflow's only occurrences of the string are inside comments explaining why
 `--push` is *not* used for a dry run. **A grep cannot tell a comment from
 behaviour**, and a check that reads its own documentation as a finding is worse
 than no check.
+
+5. **The reachable-CVE gate is present and cannot be neutered.** See
+   :class:`TestReachableCveGate`. This is the only assertion here that guards the
+   *absence* of a failure, which is the hardest kind of absence to notice: a CI gate
+   that quietly stops gating produces no red X and no log line.
 """
 
 from __future__ import annotations
@@ -315,3 +320,100 @@ class TestMultiArchCoverage:
             assert any(
                 "agent" in f for f in files
             ), f"{name}: no agent build; files seen: {sorted(files)}"
+
+
+class TestReachableCveGate:
+    """G7 must exist, and must fail the job rather than merely report.
+
+    Why this needs guarding at all, given that CI *looks* green either way:
+
+    govulncheck was added as a Go quality gate on 2026-10-03 after it found
+    GO-2026-5970 by hand — an infinite loop in ``golang.org/x/text`` reachable
+    through ``GetLogs().Stream()``, the sentinel's own log-reading path. Three
+    separate ways this gate could have been decorative, each of which a reader
+    would have taken at face value:
+
+    1. **Removed.** The step is gone, and no test fails. Nothing else in the suite
+       mentions vulnerability scanning, so its absence is silent.
+    2. **Reporting rather than gating.** ``govulncheck ./... | tee out.txt``
+       without ``pipefail`` has the exit status of ``tee``, which is always 0.
+       The scan runs, prints a report, and the job passes on a vulnerable tree.
+    3. **Fail-open on its own data source.** Verified by running it against an
+       unreachable advisory endpoint, twice — the first attempt silently fell back
+       to the local cache and proved nothing. With vuln.go.dev unreachable it exits
+       0 and prints "No vulnerabilities found.", byte-identical to a clean scan. On
+       a fresh CI runner there is no cache, so an outage turns this gate green
+       while it knows of no advisories at all.
+
+    Case 3 is the one worth reading twice. It is not a theoretical concern about
+    the tool; it is the observed behaviour of the tool, and it means the scan
+    output alone cannot be trusted to mean anything. Hence the explicit
+    reachability precheck, and hence an assertion that the precheck exists.
+    """
+
+    def _g7_step(self) -> dict[str, Any]:
+        document = load("ci.yaml")
+        jobs = document.get("jobs") or {}
+        go_gates = jobs.get("go-gates") or {}
+        matches = [
+            step
+            for step in (go_gates.get("steps") or [])
+            if "govulncheck" in str(step.get("run", ""))
+            and "install" not in str(step.get("name", "")).lower()
+        ]
+        assert (
+            matches
+        ), "no govulncheck scan step in the go-gates job; G7 has been removed"
+        # cast, because the steps list is untyped and mypy will not narrow a
+        # list comprehension over `Any` by way of the assert above.
+        return cast(dict[str, Any], matches[0])
+
+    def test_the_scan_runs_in_the_go_gates_job(self) -> None:
+        assert "govulncheck ./..." in str(self._g7_step()["run"])
+
+    def test_the_scan_can_fail_the_job(self) -> None:
+        """``pipefail`` is the whole difference between a gate and a report."""
+        run = str(self._g7_step()["run"])
+        assert "set -euo pipefail" in run, (
+            "the scan step lacks `set -euo pipefail`. Without `pipefail`, a "
+            "`govulncheck ... | tee` pipeline reports tee's exit status (always 0) "
+            "and the gate passes on every scan, including a vulnerable tree."
+        )
+
+    def test_an_unreachable_advisory_database_fails_the_job(self) -> None:
+        """The fail-open case, asserted rather than assumed fixed.
+
+        govulncheck reporting "No vulnerabilities found" while unable to fetch any
+        advisories is indistinguishable from a genuinely clean scan — so the step
+        must establish reachability BEFORE trusting a clean result.
+        """
+        run = str(self._g7_step()["run"])
+        assert "vuln.go.dev" in run, (
+            "the step never asserts advisory reachability; govulncheck exits 0 and "
+            "reports no vulnerabilities when vuln.go.dev is unreachable, so a "
+            "network blip turns this gate green while it knows of nothing"
+        )
+        assert (
+            "exit 1" in run
+        ), "the reachability check must be able to fail the step, not just report"
+
+    def test_the_scanner_is_pinned(self) -> None:
+        """An unpinned ``@latest`` hands the gate's verdict to whoever publishes next.
+
+        For a security gate that is the wrong default. Dependabot already watches
+        this repository, so the bump can arrive through review rather than silently
+        changing what "the build passed" means.
+        """
+        document = load("ci.yaml")
+        installs = [
+            step
+            for job in (document.get("jobs") or {}).values()
+            for step in (job.get("steps") or [])
+            if "govulncheck@" in str(step.get("run", ""))
+        ]
+        assert installs, "govulncheck is installed nowhere in any workflow"
+        for step in installs:
+            assert "@latest" not in str(step["run"]), (
+                "govulncheck is installed at @latest; the tool that decides whether "
+                "the build passes should change through review"
+            )
