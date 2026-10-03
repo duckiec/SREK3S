@@ -1,7 +1,6 @@
 # SREK3S
 
-**A Kubernetes incident agent that returns a verified unified diff and holds no write
-authority over the cluster it observes.**
+A deterministic, fail-closed Kubernetes SRE agent. It intercepts pod crashes, scrubs telemetry in-memory, and generates structurally verified GitOps patches with strictly zero cluster write authority.
 
 [![CI](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 [![Release](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg)](https://github.com/duckiec/SREK3S/actions/workflows/release.yaml)
@@ -305,15 +304,15 @@ so an unset `VLLM_MODEL` is refused before any request, naming the variable to s
 | Gate | Command | Scope |
 |---|---|---|
 | `G1` | `go vet ./...` | Go static analysis |
-| `G2` | `gofmt -l .` empty | Go formatting |
+| `G2` | `gofmt -l .` | Ensures no unformatted files |
 | `G3` | `go test -race -timeout 30s ./...` | Go units and data races |
 | `G4` | `black --check agent/ tests/` | Python formatting |
 | `G5` | `flake8 agent/ tests/` | Python style |
 | `G6` | `mypy --strict agent/ tests/` | Strict typing |
 | `G7` | `govulncheck ./...` | Reachable CVEs |
-| M3 | terminal validation | `TestNilPointerSafety`, `TestNoGoroutineLeak`, `TestIncidentPayloadContract` |
-| AC-2 | corpus replay | 46 cases across 8 groups, 32 maskable, 6 negative controls |
-| AC-4 | container build and runtime smoke | Asserts UID 10001, imports `main:app` |
+| M3 | Terminal validation | `TestNilPointerSafety`, `TestNoGoroutineLeak`, `TestIncidentPayloadContract` |
+| AC-2 | Corpus replay | 46 cases across 8 groups, 32 maskable, 6 negative controls |
+| AC-4 | Container build and runtime smoke | Asserts UID 10001, imports `main:app` |
 | Routing | `test_the_agent_service_routes_the_sentinels_default_endpoint` | Service selector, pod labels, target port and the Sentinel's built-in default resolve to one endpoint |
 | Workflow | `scripts/audit_workflow.py --strict` | Every workflow's own shell: `bash -n`, unpiped `curl \| sh`, `producer \| grep -q` SIGPIPE races, multi-command `if` conditions, referenced paths that do not exist |
 | Manifests | `test_deploy_manifests.py` | PSA compliance, RBAC shape, hardening block |
