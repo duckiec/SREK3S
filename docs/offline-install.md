@@ -152,7 +152,7 @@ sudo k3s ctr images import /tmp/srek3s-sentinel.tar --all-namespaces
 > **Corrected 2026-10-01, and the correction is the point.** This block previously
 > read `docker build -f Dockerfile -t registry.internal/srek3s-sentinel:0.1.0 .`
 > — a path that has never existed. There is no `Dockerfile` at the repository root;
-> the Sentinel's is at `cmd/sentinel/Dockerfile`, and `README.md` and
+> the Sentinel's is at `cmd/sentinel/Dockerfile`, and `docs/development.md` and
 > `docs/runbook.md` both say so. It sat in the *unverified* section, where a wrong
 > command is exactly as invisible as a right one, which is a fair argument for
 > expecting it to rot and a poor reason to leave it. A command in a runbook that

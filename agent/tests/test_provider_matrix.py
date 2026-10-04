@@ -355,7 +355,8 @@ def test_a_local_provider_needs_no_credential(provider: str) -> None:
     ``provider_from_env`` used to return ``None`` whenever the provider's credential
     variable was unset, which made the documented keyless local setup silently
     produce no narrative while looking like a correctly configured deployment. The
-    README had been wrong about this since it was written.
+    README had been wrong about this since it was written. The provider table now
+    lives in ``docs/models.md``.
     """
     client = providers.provider_from_env({"LLM_PROVIDER": provider})
     assert (
@@ -384,7 +385,8 @@ def test_another_providers_credential_never_satisfies_this_one(provider: str) ->
 def test_a_pinned_endpoint_makes_a_key_optional_for_the_openai_provider() -> None:
     """The other supported spelling of "my local server has no key".
 
-    Documented in the README and asserted here, because it is the one path where a
+    Documented in ``docs/models.md`` and asserted here, because it is the one path
+    where a
     non-keyless provider proceeds without a credential: the operator named the
     endpoint, so they know whether it wants one.
     """
