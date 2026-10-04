@@ -13,6 +13,12 @@ A deterministic, fail-closed Kubernetes SRE agent. It intercepts pod crashes, sc
 Prerequisites: Linux or WSL2, Go 1.25+, Python 3.11 (`.venv311`), Docker with
 buildx, `git`, `gcc`, and a cluster. CI uses k3s.
 
+## Demo
+
+![SREK3S In-Memory Redaction & Fail-Closed Triage](docs/assets/demo.gif)
+
+*Live execution: A pod leaking an AWS Secret Access Key to container logs is intercepted and scrubbed in-memory by the Go Sentinel before network egress. The Python Agent applies POSIX sandboxing and YAML AST validation, rejecting hallucinated remedies and failing closed to Tier-2 architectural review.*
+
 ## Quick Start
 
 ```bash
