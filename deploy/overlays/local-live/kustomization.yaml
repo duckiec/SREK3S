@@ -195,6 +195,38 @@ patches:
       name: srek3s-agent
 
   # -------------------------------------------------------------------------
+  # Agent: replicas 1 — for DETERMINISTIC log queries, not for cost.
+  #
+  # `deploy/agent.yaml` ships `replicas: 2`, which is correct for a service: two
+  # pods, no single point of loss. It is wrong for a local detonation, where an
+  # operator reads the Agent's triage records with:
+  #
+  #     kubectl -n srek3s-system logs deploy/srek3s-agent
+  #
+  # and `kubectl logs deploy/...` resolves that to ONE arbitrary pod. With two
+  # replicas the records for a single incident can land on either, so the log
+  # shows half the picture and presents as a missing record rather than as a
+  # two-replica deployment.
+  #
+  # The Sentinel is already `replicas: 1`, so this leaves the overlay with a
+  # single pod per component and every log query is total.
+  #
+  # Scoped to this overlay deliberately: the base keeps 2, and a validation
+  # overlay that quietly reduced the shipped replica count would stop testing
+  # the thing that ships.
+  # -------------------------------------------------------------------------
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: srek3s-agent
+      spec:
+        replicas: 1
+    target:
+      kind: Deployment
+      name: srek3s-agent
+
+  # -------------------------------------------------------------------------
   # Sentinel: OPTIONAL — extend the watch to the chaos namespace.
   #
   # NOT a fix. `deploy/sentinel.yaml` ships `WATCH_NAMESPACE: srek3s-system`,

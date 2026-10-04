@@ -370,7 +370,12 @@ def create_app(
                 [str(err["loc"]) for err in exc.errors()],
             )
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                # `HTTP_422_UNPROCESSABLE_ENTITY` is deprecated in Starlette 1.7 and
+                # raises StarletteDeprecationWarning at import. The replacement
+                # resolves to the same 422 -- verified against the installed package
+                # rather than assumed -- so this silences the warning with no change to
+                # the wire contract.
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={
                     "error": "validation_error",
                     "request_id": request_id,
