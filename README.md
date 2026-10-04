@@ -6,18 +6,20 @@
 [![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
 [![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1082%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
+[![Tests](https://img.shields.io/badge/tests-1087%20passed%20%7C%20179%20go-success)](https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml)
 
-Most autonomous infrastructure agents are a security breach waiting to happen. SREK3S is a deterministic, fail-closed Kubernetes AI agent that triages pod crashes and generates GitOps patches with strictly zero cluster write authority. It scrubs secrets in-memory before network egress and sandboxes LLM generations to eliminate hallucinated blast radiuses.
+**Zero-trust, read-only AI incident response for Kubernetes.**
 
-## ✨ Features
+Most autonomous cluster agents demand broad write privileges and stream raw stdout to external APIs. SREK3S draws a hard boundary: it triages pod crashes and generates verified GitOps patches with strictly zero cluster write authority. By enforcing in-memory secret scrubbing before egress and sandboxing LLM validations in a POSIX worker, it eliminates the blast radius of hallucinated remediations.
 
-- 🔒 **Zero cluster write authority** — the Sentinel's Role grants only `get`, `list` and `watch`. There is no `ClusterRole`, no `ClusterRoleBinding`, and no field on either wire contract capable of expressing a write verb. The Agent mounts no ServiceAccount token at all.
-- 🧹 **In-memory secret scrubbing before egress** — 11 ordered rules mask credentials on the Go node before any network call, so nothing unmasked reaches a queue, a disk, or a socket. Masking is idempotent, and the Agent re-scrubs every string it returns.
-- 📦 **POSIX & YAML AST sandboxing** — generated code runs in a disposable process under `RLIMIT_AS`, `RLIMIT_CPU` and `RLIMIT_CORE`; a proposed patch must survive a YAML AST parse before anything downstream is entitled to believe it.
-- 🛑 **Deterministic fail-closed escalation** — tier, patch and every validation flag are computed before a model is consulted. The unverifiable case is Tier-2, and a Tier-2 response carrying a patch is unrepresentable rather than merely discouraged.
-- ✅ **Two-layer patch verification** — a YAML AST parse, then `git apply --check` against the target manifest's own bytes in a throwaway repository. The second layer asserts the file actually changed rather than trusting an exit status.
-- 🔌 **Nine providers, three protocols** — Gemini, Anthropic Messages with forced tool-use, and the OpenAI chat-completions shape, including local Ollama and vLLM. With no credential the service degrades to deterministic prose and keeps triaging.
+## Features
+
+- **Zero cluster mutations** — the Sentinel's Role grants only `get`, `list` and `watch`. There is no `ClusterRole`, no `ClusterRoleBinding`, and no field on either wire contract capable of expressing a write verb. The Agent mounts no ServiceAccount token at all.
+- **In-memory regex secret scrubbing** — 11 ordered `regexp` rules mask credentials on the Go node before any network call, so nothing unmasked reaches a queue, a disk, or a socket. Masking is idempotent, and the Agent re-scrubs every string it returns.
+- **AST YAML validation** — a proposed patch must survive a YAML AST parse before anything downstream is entitled to believe it, and then `git apply --check` against the target manifest's own bytes in a throwaway repository.
+- **Deterministic Tier-2 escalation** — tier, patch and every validation flag are computed before any model is consulted. The unverifiable case is Tier-2, and a Tier-2 response carrying a patch is unrepresentable rather than merely discouraged.
+- **POSIX worker containment** — generated code runs in a disposable process under `RLIMIT_AS`, `RLIMIT_CPU` and `RLIMIT_CORE`, installed before `exec` and unraisable from inside.
+- **Nine providers, three protocols** — Gemini, Anthropic Messages with forced tool-use, and the OpenAI chat-completions shape, including local Ollama and vLLM. With no credential the service degrades to deterministic prose and keeps triaging.
 
 Prerequisites: Linux or WSL2, Go 1.25+, Python 3.11 (`.venv311`), Docker with
 buildx, `git`, `gcc`, and a cluster. CI uses k3s.
@@ -80,6 +82,7 @@ docs/                  architecture, security invariants, models, development,
 | [`docs/security-invariants.md`](docs/security-invariants.md) | The invariants and their enforcing tests, both wire contracts, and the 11 scrubber rules |
 | [`docs/models.md`](docs/models.md) | Nine providers across three protocols, credential mounting, and adapter behaviour |
 | [`docs/development.md`](docs/development.md) | Gates, build, deploy, publishing, silent-failure modes, and verification without a cluster |
+| [`docs/hardening-and-ci.md`](docs/hardening-and-ci.md) | Test matrices, static analysis, repository rulesets, and where the enforcement is weaker than it looks |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Invariants, gates, and the normative masking specification |
 | [`docs/runbook.md`](docs/runbook.md) | Deploy, observe, interpret, review |
 | [`docs/lessons-learned.md`](docs/lessons-learned.md) | Defects found, including negative controls that failed for the wrong reason |

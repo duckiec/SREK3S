@@ -25,8 +25,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 #: Every document a reader follows links inside. ARCHITECTURE.md, ROADMAP.md and
 #: the PRD are excluded: they are the canonical records, they are not navigated by
 #: anchors, and a layout validator already covers ARCHITECTURE.md against disk.
+#:
+#: The four files relocated out of README.md on 2026-10-03 are in this tuple. Leaving
+#: them out was a real gap: CI could not have caught a broken anchor inside them, and
+#: a document nothing checks is a document nothing keeps correct.
 DOCS = (
     "README.md",
+    "docs/architecture.md",
+    "docs/security-invariants.md",
+    "docs/models.md",
+    "docs/development.md",
+    "docs/hardening-and-ci.md",
     "docs/runbook.md",
     "docs/offline-install.md",
     "docs/ci-triage-protocol.md",
