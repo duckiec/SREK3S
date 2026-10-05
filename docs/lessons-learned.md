@@ -2326,3 +2326,112 @@ as what it is.
   have **passed while proving nothing**. `test_llm_adversarial.py` still uses `httpx`
   because `openai` does, and the divergence is now documented at both imports rather
   than left as a puzzling asymmetry.
+
+## 41. Five Defects In The Documentation Change Itself (v1.1.0)
+
+Recorded because every one of these was introduced by a change that was *about*
+documentation quality, and four of the five were caught only by checking something
+outside the file being edited. None is a code defect. All five are the reason the
+document set is now verified by a gate rather than by reading it.
+
+- **Markdown badges inside a `<div>` render as literal text on GitHub.** A README
+  restructure specified a centered hero built from `<div align="center">` with the
+  seven badges written as Markdown on one line. CommonMark treats `<div>` as a raw
+  HTML block, so nothing inside is parsed as Markdown. The badges would have shipped
+  as visible `[![CI](https://...` source on the repository front page.
+
+  Two repairs were tried before the one that worked, and the second is the
+  instructive one. Adding blank lines around the badge line **does** make the badges
+  render, and it silently moves them: the parser closes `</p>` and `</div>` before
+  the badges, so they render as a left-aligned paragraph *below* the centered block.
+  A reviewer glancing at the source sees valid Markdown inside a `<p>` and has no
+  way to notice it left the container. The shipped form is HTML `<a><img>`, which
+  cannot be re-parsed as Markdown and therefore cannot escape.
+
+  The generalisable failure is not "badges". It is that **the renderer is part of the
+  artifact under test, and it is the one component that is never exercised locally.**
+  `markdown-it-py` and GitHub disagree about this exact construct. The only thing
+  that settles it is asking GitHub.
+
+- **A negative control that read the summary line instead of the assertion.** The
+  link checker was extended to cover five newly relocated documents, and then
+  controlled by planting a dangling anchor in one of them and confirming the checker
+  failed. The control reported `INVALID` — the opposite of the truth. The
+  runbook test *had* failed; the control grepped the last four lines of pytest
+  output, which are the `short test summary info` block, not the assertion text.
+
+  This is §29's failure mode at a level §29 did not cover. §29 was a control that
+  duplicated the assertion; this was a control that never read it. The reason it
+  survived review is that it produced confident output in both states — `VALID` and
+  `INVALID` — which is precisely the property that makes a broken control dangerous
+  rather than merely broken. Fixed by grepping the full captured output and matching
+  the planted string, so the control now fails only on evidence.
+
+  **The lesson generalises past link checking:** any control whose verdict is a
+  `grep` over test output must match a string the test emits *on failure*, not a
+  substring that appears in either case. Asserting over the whole artifact is the
+  minimum.
+
+- **A specification referenced a file that does not exist.** The same restructure
+  specified a hero banner at `docs/assets/social-preview.png`. `docs/assets/`
+  contained one file, `demo.gif`. Shipping the specified `src` puts a broken image
+  at the top of the repository.
+
+  Nothing in the build, the test suite, or the link checker looks for an `<img>`
+  whose `src` is absent — the link checker parses Markdown links, and this was
+  neither Markdown nor a checked target. The failure is only visible by listing the
+  directory. This is §28 and §33's family (an asserted path that was never checked),
+  reached from a different direction: there, the path was invented; here it was
+  supplied in good faith by the person asking for the change. **A requirement that
+  names a file is a claim about the repository, and it deserves the same treatment as
+  a requirement that names a function.**
+
+- **Relocating content silently broke two pointers into it.** Moving the
+  engineering specifications out of `README.md` left `docs/offline-install.md`
+  asserting that "`README.md` and `docs/runbook.md` both say so" about the Sentinel
+  `Dockerfile` path — which the move had just relocated to `docs/development.md`. Two
+  docstrings in `agent/tests/test_provider_matrix.py` pointed at a provider table
+  that no longer lived in the README. All three read as correct English and all
+  three were false.
+
+  No gate in this repository validates a claim *about where content lives*. The link
+  checker validates that a link resolves; it cannot validate that a sentence about a
+  neighbouring document is still true. These were found by grepping the repository
+  for the section names being removed — a manual step, and therefore a step that
+  nobody performs on a large enough diff often enough.
+
+  **Prose that cites prose needs its own ratchet.** The cheap version is a grep for
+  every relocated heading across every tracked document, run before the move rather
+  than after it.
+
+- **Adding five test cases invalidated three counts written minutes earlier.** The
+  link-checker expansion added five parametrized cases, taking the suite from 1,085
+  collected to 1,090 and from 1,082 passing to 1,087. The README badge, a new
+  hardening document, and an existing development document all quoted the old
+  figures. Every one was correct when written and wrong when shipped, within the same
+  change.
+
+  A count in a document is a claim with a shelf life, and the shelf closed inside the
+  commit that produced it. Writing the counts was not the error; **not re-reading
+  them after the change that moved them** was. The number of places quoting a
+  measurement grows with the project, so the cost of staleness grows too.
+
+  Two of the five findings above are about verification that was performed and
+  misread, one is about a check that does not exist, and two are about assertions
+  that were true when made. Only the first would have been caught by testing the
+  change. That ratio is the argument for this file: most of what goes wrong in a
+  documentation change is not visible from inside the change.
+
+- **How we fixed it:** the hero uses HTML `<a><img>` badges, confirmed against
+  GitHub's own renderer, which reported 9 `<img>` elements, zero leaked Markdown, one
+  surviving `align="center"`, and the banner inside the centering `div`. The banner
+  points at the asset that exists, with alt text describing what it shows. The
+  relocated pointers name their new homes. Every count was re-measured after the
+  change that moved it, not before. The negative control now reads the assertion.
+
+  None of this is automated yet, and that is the open part. The checks that would
+  catch each class are known: render the README through GitHub's API in a gate; grep
+  for relocated headings before a move; re-measure quoted counts in CI; and make the
+  link checker's control assert over captured output. Written down as a list rather
+  than done, because a lesson recorded and not enforced is the same category of
+  claim as the three false sentences above.
