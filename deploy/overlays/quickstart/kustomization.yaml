@@ -1,0 +1,94 @@
+# SREK3S quickstart overlay — deploy the shipped images, build nothing.
+#
+# WHAT THIS OVERLAY IS FOR
+# -----------------------
+# The base manifests reference `registry.internal/srek3s-{agent,sentinel}:0.1.0`,
+# which are placeholder coordinates for images a developer builds on their own
+# machine. That is the right default for the committed manifests — see the note at
+# the bottom of `deploy/kustomization.yaml` for why no `images:` block sits there —
+# but it makes the FIRST five minutes of onboarding a build exercise. A user who
+# arrives from the README wants to see the system triage a crash, not to discover
+# whether their host can cross-compile for their architecture.
+#
+# So this overlay exists to close that gap with one field and no new resources: it
+# consumes the base set unchanged and rewrites the two image references to the
+# published multi-arch images on GHCR. Nothing else is overridden, which means the
+# RBAC, the NetworkPolicies, the securityContext, the resource limits and the
+# read-only role are byte-identical to what ships.
+#
+# WHAT IT DOES NOT DO
+# -------------------
+# It does not relax anything. In particular it does not add a ClusterRole, does not
+# mount a ServiceAccount token into the agent, and does not change the Sentinel's
+# watch scope. Those are the properties the project is about; an onboarding overlay
+# is the worst possible place to start trading them away for convenience.
+#
+# `kubectl apply -k deploy/overlays/quickstart` — no `--load-restrictor` needed,
+# because `../../base` is a DIRECTORY reference and directories carry their own
+# kustomization root. See the "WHY THE BASE IS A DIRECTORY" note below.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# THE BASE IS A DIRECTORY, NOT A FILE LIST
+# ---------------------------------------------------------------------------
+# `resources: - ../../namespace.yaml` does NOT build. Kustomize's default load
+# restrictor ("RootOnly") refuses any file outside the directory being built:
+#
+#     error: accumulating resources: file 'deploy/namespace.yaml' is not in or below
+#            'deploy/overlays/quickstart'
+#
+# The usual suggestion is `loadRestrictions: LoadRestrictionsNone`, which silences
+# that error by disabling a containment boundary for EVERY resource the overlay
+# builds. That is the wrong trade, and `deploy/overlays/local-live/kustomization.yaml`
+# rejects it at length. The load restrictor is what stops an overlay from quietly
+# reaching into a sibling tree and pulling something in unannounced.
+#
+# `../../base` sidesteps it correctly: it is a reference to a DIRECTORY that carries
+# its own `kustomization.yaml`, so the resolver follows that directory's root rather
+# than demanding the file sit below the overlay's. This is exactly why
+# `deploy/base/` exists at all — it is a packaging decision, not a cosmetic one, and
+# it is the reason this overlay needs no CLI flags to render.
+#
+# PATH ARITHMETIC: this file is at deploy/overlays/quickstart/, so the base is TWO
+# levels up. A first attempt wrote `./base` and a second wrote `../base` (which
+# resolves to deploy/overlays/base, a directory that does not exist). Both failed
+# with `evalsymlink failure ... no such file or directory` — a message that reads
+# like the restrictor is still refusing a legitimate reference when the reference
+# was simply wrong.
+resources:
+  - ../../base
+
+# ---------------------------------------------------------------------------
+# IMAGE REWRITE
+# ---------------------------------------------------------------------------
+# `name` matches on the REPOSITORY, with the tag stripped, so one entry per image
+# covers `registry.internal/srek3s-sentinel:0.1.0` and any other tag someone points
+# at it. `newName` plus `newTag` together produce the final reference.
+#
+# `ghcr.io/duckiec/...` rather than the bare `duckiec/...`: kustomize's name matcher
+# is exact on the string it is given, so a bare `duckiec/srek3s-agent` would not match
+# `registry.internal/srek3s-agent` and this block would render a no-op that looks
+# correct in the file. The fully qualified form is also what `docker pull` and the
+# GHCR package URL both expect, so there is one spelling to get wrong rather than two.
+#
+# WHY THE BASE KEEPS `registry.internal` RATHER THAN BEING FIXED HERE
+# -----------------------------------------------------------------
+# `deploy/kustomization.yaml` and `deploy/overlays/local-live/kustomization.yaml`
+# both deliberately carry NO `images:` block, and the reasoning is worth preserving:
+# the committed manifests are the artefacts the hardening tests parse
+# (`agent/tests/test_deploy_manifests.py` asserts on the raw YAML), so an `images:`
+# override on the base would hide the tag that actually ships from the file that
+# tests check. The offline-install flow (`docs/offline-install.md`) additionally
+# imports locally built images into the containerd namespace under their exact
+# qualified names, which only works if the manifests still say what they say.
+#
+# An override belongs in the overlay that wants the override. That is what this
+# file is.
+images:
+  - name: registry.internal/srek3s-sentinel
+    newName: ghcr.io/duckiec/srek3s-sentinel
+    newTag: latest
+  - name: registry.internal/srek3s-agent
+    newName: ghcr.io/duckiec/srek3s-agent
+    newTag: latest

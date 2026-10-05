@@ -160,6 +160,7 @@ help: ## Show this help
 	@echo "Common overrides:"
 	@echo "  PLATFORM=linux/amd64     cross-build the images for another architecture"
 	@echo "  KUBECTL='kubectl --context=...'    deploy somewhere other than the current context"
+	@echo "  OVERLAY=deploy/overlays/quickstart-live   chaos patches against the published images"
 	@echo ""
 	@echo "Resolved interpreter: $(if $(PYTHON),$(PYTHON),<none found — run 'make bootstrap'>)"
 	@echo ""
@@ -351,10 +352,44 @@ undeploy: ## Remove the SREK3S workloads, leaving the namespace in place
 # cluster to be watched, they get a healthy watcher watching nothing. Making that
 # an explicit verb rather than a flag is the difference between a documented
 # choice and a confusing one.
+# The overlay applied by `deploy-overlay`. Defaults to local-live, which renders
+# `registry.internal/...` and therefore pairs with `make build`.
+#
+# It is a variable rather than a hardcoded path because the README's zero-build flow
+# needs the SAME chaos patches against the PUBLISHED images, and hardcoding either
+# choice would break the other:
+#
+#   make deploy-overlay OVERLAY=deploy/overlays/quickstart-live
+#
+# deploy/overlays/quickstart-live consumes local-live unchanged and adds only the
+# `images:` rewrite, so the local-image flow above keeps working and the two cannot
+# drift into disagreeing about anything except the image reference. This target used
+# to name local-live directly, which meant the detonation step of the README's
+# zero-build flow pushed both Deployments back to `registry.internal/...` and
+# ImagePullBackOff'd them about thirty seconds after a successful quickstart.
+OVERLAY ?= $(ROOT)/deploy/overlays/local-live
+
 .PHONY: deploy-overlay
-deploy-overlay: ## Apply the local-live overlay (scopes the Sentinel to sentinel-chaos)
+deploy-overlay: ## Apply the chaos overlay (OVERLAY=... to choose; default local-live)
 	$(KUBECTL) kustomize --load-restrictor=LoadRestrictionsNone \
-		"$(ROOT)/deploy/overlays/local-live" | $(KUBECTL) apply -f -
+		"$(OVERLAY)" | $(KUBECTL) apply -f -
+
+# The zero-build path: the published multi-arch images, no build, no registry login.
+#
+# Renders to a pipe rather than `apply -k` because `kubectl apply -k` cannot pass
+# `--load-restrictor`, and `deploy/base` is not self-contained under the default
+# restrictor — it references `../namespace.yaml`, above its own root. The same reason
+# `deploy` above pipes, and the same reason it is a flag on the invocation rather
+# than `loadRestrictions: LoadRestrictionsNone` in a committed file: the relaxation
+# belongs to ONE invocation, not to every future `apply -k` that touches the overlay.
+.PHONY: deploy-quickstart
+deploy-quickstart: ## Apply the quickstart overlay (prebuilt ghcr.io images, no build)
+	@echo "==> applying deploy/overlays/quickstart to the current context"
+	@$(KUBECTL) config current-context 2>/dev/null | sed 's/^/    context: /' || true
+	$(KUBECTL) kustomize --load-restrictor=LoadRestrictionsNone \
+		"$(ROOT)/deploy/overlays/quickstart" | $(KUBECTL) apply -f -
+	@$(KUBECTL) -n $(SYSTEM_NAMESPACE) rollout status deployment/srek3s-sentinel --timeout=180s
+	@$(KUBECTL) -n $(SYSTEM_NAMESPACE) rollout status deployment/srek3s-agent --timeout=180s
 
 .PHONY: chaos
 chaos: ## Deploy the real-crash chaos workload into the chaos namespace

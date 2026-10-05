@@ -1,0 +1,70 @@
+# SREK3S quickstart detonation overlay.
+#
+# WHAT THIS OVERLAY IS, AND WHY IT IS NOT JUST local-live WITH AN EDIT
+# --------------------------------------------------------------------
+# The README's zero-build flow is: deploy the published images, then prove the
+# redaction works against a real crashing workload. The second half needs
+# `deploy/overlays/local-live`, because that overlay is what scopes the Sentinel to
+# `sentinel-chaos`, creates that namespace, grants the read verbs inside it, and
+# projects a target manifest to the agent.
+#
+# It cannot simply be pointed at the published images, and the reason is worth
+# stating because the tempting fix is wrong. `deploy/overlays/local-live/kustomization.yaml`
+# carries NO `images:` block, deliberately — its whole purpose is validating LOCALLY
+# BUILT images against a live cluster, and `docs/offline-install.md` depends on those
+# manifests still saying `registry.internal/...`. Hardcoding a public registry there
+# would make `make deploy` (local images) and `make deploy-overlay` (published images)
+# disagree about what is deployed, and would quietly remove the ability to test your
+# own build.
+#
+# So the two concerns stay in two files. This overlay CONSUMES local-live unchanged
+# and layers the image rewrite on top, which is what kustomize overlays are for: a
+# composition, not a fork. Nothing under `deploy/overlays/local-live/` is edited, so
+# the local-image flow keeps working and the two paths cannot drift into disagreeing
+# about anything except the image reference.
+#
+# USED BY: `make deploy-overlay OVERLAY=deploy/overlays/quickstart-live`
+# REQUIRES `--load-restrictor LoadRestrictionsNone`, inherited from local-live's
+# reference to `../../base`. `make deploy-overlay` already passes it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# PATH ARITHMETIC
+# ---------------------------------------------------------------------------
+# This file is at deploy/overlays/quickstart-live/, so local-live is ONE level up:
+# `../local-live`. Writing `../../local-live` resolves to deploy/local-live, which
+# does not exist, and the error names the doubled path rather than the intent.
+#
+# WHY A SIBLING DIRECTORY REFERENCE IS PERMITTED WHERE `../../base` NEEDS A FLAG
+# -----------------------------------------------------------------------------
+# Kustomize's default load restrictor ("RootOnly") refuses a FILE above the build
+# root. It permits a sibling DIRECTORY that carries its own kustomization.yaml,
+# because the resolver follows that directory's root instead. `../local-live`
+# qualifies; it is not inside `deploy/overlays/local-live`, so there is no cycle.
+#
+# The flag is still needed one level down, because local-live references `../../base`
+# and `deploy/base/kustomization.yaml` reaches up to `../namespace.yaml`. That is a
+# pre-existing property of the base and is documented in deploy/base; this overlay
+# neither causes it nor works around it.
+resources:
+  - ../local-live
+
+# ---------------------------------------------------------------------------
+# IMAGE REWRITE — identical to deploy/overlays/quickstart/kustomization.yaml
+# ---------------------------------------------------------------------------
+# Deliberately duplicated rather than shared. Kustomize has no include mechanism for
+# an `images:` block, and a base that both overlays referenced would put a public
+# registry tag into the local-image path this file exists to keep separate.
+#
+# There is a test worth naming: the pairing of an `images:` entry with a manifest
+# that actually references that name is what a stale entry looks like when it
+# silently stops matching. These two entries are the ones `deploy/agent.yaml` and
+# `deploy/sentinel.yaml` actually use, in that order.
+images:
+  - name: registry.internal/srek3s-sentinel
+    newName: ghcr.io/duckiec/srek3s-sentinel
+    newTag: latest
+  - name: registry.internal/srek3s-agent
+    newName: ghcr.io/duckiec/srek3s-agent
+    newTag: latest
