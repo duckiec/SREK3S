@@ -315,6 +315,29 @@ controller at all. That negative assertion is open task `ENV-2.6`, and it is
 **open** — it has not been run on the `Fedora 44` / k3s v1.36.4 host this runbook's
 environment section describes.
 
+### If the Sentinel watches nothing
+
+Two settings have to agree, and a fresh install agrees on them by shipping both
+halves narrow.
+
+**`WATCH_NAMESPACE`** ships as `srek3s-system`, which is the namespace
+`deploy/rbac.yaml` grants, so the shipped watch scope and the shipped read
+authority match and the Sentinel sees nothing outside its own namespace. To watch
+another namespace, set `WATCH_NAMESPACE` and grant the read verbs there.
+`deploy/overlays/local-live` does exactly this for `sentinel-chaos`. Applying only
+one half produces a forbidden `LIST` retried forever, which is silence rather than
+an error.
+
+**The apiserver's address** has to sit inside the Sentinel's egress `ipBlock`,
+which permits TCP 443 to `10.43.0.0/16` (k3s) and `10.96.0.0/12` (kubeadm, kind,
+minikube, EKS, GKE). An external apiserver needs that `ipBlock` patched in your
+own overlay. The rationale is in `deploy/sentinel.yaml`.
+
+The symptom when the address does not match is a Sentinel logging
+`failed to list *v1.Pod` every 30 seconds with `watcher_emitted: 0` and **zero
+403s** — a silently blind watcher, not an error. The two settings above fail the
+same way, so read the stats line before concluding which one is wrong.
+
 ---
 
 ## 2. Observing the logs

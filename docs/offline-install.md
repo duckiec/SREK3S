@@ -216,8 +216,8 @@ prevent.
 | Prerequisite for B | State |
 |---|---|
 | A Docker daemon that can produce a tarball | **Yes** — 29.8.2, `overlayfs`, root `/var/lib/docker`. Requires `sudo docker`; see `docs/runbook.md` §1 |
-| A live k3s with a reachable containerd | **Yes** — v1.36.4+k3s1, node `dwindle2`, containerd `2.3.4-k3s1.36` |
-| Root access to the containerd socket | **Yes** — `sudo` is passwordless for `duckie` |
+| A live k3s with a reachable containerd | **Yes** — v1.36.4+k3s1, single-node, containerd `2.3.4-k3s1.36` |
+| Root access to the containerd socket | **Yes** — `sudo` is passwordless for the operator account |
 | A built SREK3S image | **No** — nothing has been built; `registry.internal/srek3s-*` exists nowhere |
 | `busybox:1.36.1` registered in `k8s.io` | **No** — the namespace currently holds only k3s's own images |
 | **B itself executed** | **No** |
