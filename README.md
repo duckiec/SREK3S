@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/demo.gif" alt="SREK3S Sentinel scrubbing a crashing pod before egress" width="100%" />
+  <img src="docs/assets/banner.svg" alt="SREK3S banner: the project mark and wordmark" width="100%" />
   <br />
   <h1>SREK3S</h1>
   <p>
