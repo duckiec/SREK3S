@@ -48,6 +48,7 @@ import triage
 from budget import JobBudget, budget_from_env
 import classifier
 from classifier import ManifestProvider, manifest_provider_from_env
+from notify import dispatcher_from_env
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner
 from models import IncidentPayload, TriageResponse
 
@@ -181,6 +182,7 @@ def _busy(request_id: str, budget: JobBudget) -> JSONResponse:
 def create_app(
     job_budget: JobBudget | None = None,
     manifest_provider: ManifestProvider | None = None,
+    notify_dispatcher: Any = None,
 ) -> FastAPI:
     """Application factory.
 
@@ -235,6 +237,9 @@ def create_app(
     # inspect counters, and so it is replaced wholesale per instance rather than
     # shared between tests through a module global.
     application.state.job_budget = job_budget or budget_from_env()
+    application.state.notify_dispatcher = (
+        notify_dispatcher if notify_dispatcher is not None else dispatcher_from_env()
+    )
 
     # Resolved once, at construction, and held on app.state. Resolving per
     # request would re-stat the checkout on the hot path and, worse, would make
@@ -501,6 +506,17 @@ def create_app(
                 request_id,
                 "; ".join(outcome.reasons) or "(no reason recorded)",
             )
+            dispatcher = getattr(request.app.state, "notify_dispatcher", None)
+            if (
+                outcome.tier.value == "TIER_2_ARCHITECTURAL"
+                and outcome.dispatch is not None
+                and dispatcher is not None
+            ):
+                dispatcher.dispatch(
+                    payload.incident_id,
+                    response.severity.value,
+                    response.rca_markdown,
+                )
         return response
 
     # -- Error handlers ----------------------------------------------------
