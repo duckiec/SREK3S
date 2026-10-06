@@ -216,6 +216,16 @@ spec:
                   key: NVIDIA_API_KEY
                   optional: true
 
+            # TELEGRAM_API_KEY - the Tier-2 dispatcher bot token. Optional:
+            # when unset the dispatcher is a no-op and every other path is
+            # unchanged.
+            - name: TELEGRAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: TELEGRAM_API_KEY
+                  optional: true
+
           # ARCH §8: read-only root, no privilege escalation, every capability
           # dropped. The agent needs none of them, so all are dropped rather than
           # selected - an allow-list here would be a list to forget an entry on.
