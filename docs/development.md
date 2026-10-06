@@ -103,13 +103,30 @@ block.
 make test
 
 PY=~/SREK3S/.venv311/bin/python
-go test -race ./...                 # 1082 Python tests + 179 Go test functions
-$PY -m pytest agent/tests/ -q       # 1082 passed, 3 skipped
+go test -race ./...                 # 1090 Python tests + 179 Go test functions
+$PY -m pytest agent/tests/ -q       # 1087 passed, 3 skipped
 $PY -m black --check agent/ tests/
 $PY -m flake8 agent/ tests/
 $PY -m mypy --strict agent/ tests/
 $PY scripts/audit_workflow.py --strict
 ```
+
+## Make targets
+
+The four in the README's Quick Start cover a normal working session. The rest:
+
+| Target | What it does |
+|---|---|
+| `make help` | Every target, with the resolved interpreter and the common overrides |
+| `make deploy-quickstart` | The Quick Start, as a target |
+| `make verify-images` | Build, then **execute** each entrypoint — a layer list can be right while the binary cannot run |
+| `make push-multiarch` | Build and push a `linux/amd64` + `linux/arm64` manifest list |
+| `make clean-images` | Remove the two local images |
+
+`make deploy` applies your locally built `registry.internal/...` images, so follow it
+with the plain `make deploy-overlay` — no `OVERLAY=` — to detonate against your own
+build. Without a registry, [offline-install.md](offline-install.md) has the
+`docker save` / `ctr images tag` path.
 
 ## Verification without a cluster
 
