@@ -64,9 +64,9 @@ resources:
 images:
   - name: registry.internal/srek3s-sentinel
     newName: ghcr.io/duckiec/srek3s-sentinel
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    digest: sha256:078bf0e01293acaf9bf3c9e4f17640e21e2a84d8d60015dbd84a5f647466ebb9
   - name: registry.internal/srek3s-agent
     newName: ghcr.io/duckiec/srek3s-agent
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    digest: sha256:3be22a81e017321c1088154d6051bced5541df3e241f4eb5219fc7c355b098ee
 
 # Same pinning policy as ../quickstart: sha256 digests, no Always patch.
