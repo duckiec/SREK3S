@@ -8,6 +8,10 @@
 *.out
 /pprof/
 
+# Development-only AI assistant context. Internal guidance for coding sessions;
+# deliberately kept out of the public commit history.
+.ai/
+
 # ---------------------------------------------------------------------------
 # _scaffolding/ — build-phase records, quarantined 2026-10-01
 # ---------------------------------------------------------------------------
