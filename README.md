@@ -1,7 +1,6 @@
 <div align="center">
   <img src="docs/assets/banner.svg" alt="SREK3S banner: the project mark and wordmark" width="100%" />
   <br />
-  <h1>SREK3S</h1>
   <p>
     <a href="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main" alt="CI" /></a> <a href="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg" alt="Release" /></a> <a href="https://github.com/duckiec/SREK3S"><img src="https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-4655db" alt="Multi-arch" /></a> <a href="https://go.dev"><img src="https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go" alt="Go" /></a> <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11-3776AB?logo=python" alt="Python" /></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a> <a href="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml"><img src="https://img.shields.io/badge/tests-1087%20passed%20%7C%20179%20go-success" alt="Tests" /></a>
   </p>
