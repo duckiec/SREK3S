@@ -152,6 +152,7 @@ jobs:
       # name is a support ticket. `:latest` is documented in the README as
       # unsuitable for production, because it moves.
       - name: Build and push the Sentinel (multi-arch)
+        id: build-sentinel
         uses: docker/build-push-action@v7
         timeout-minutes: 20
         with:
@@ -175,6 +176,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Build and push the Agent (multi-arch)
+        id: build-agent
         uses: docker/build-push-action@v7
         timeout-minutes: 20
         with:
@@ -261,6 +263,28 @@ jobs:
 
           echo
           echo "both images published as amd64+arm64 manifest lists"
+
+      # Pin these digests into deploy/overlays/*/kustomization.yaml when you cut
+      # the next deploy. The digest identifies the manifest list exactly; a tag
+      # only identifies it approximately.
+      - name: Print the deployment digests
+        run: |
+          {
+            echo "## Deployment digests"
+            echo
+            echo "Pin these in \`deploy/overlays/*/kustomization.yaml\`:"
+            echo
+            echo "Sentinel: \`${{ steps.refs.outputs.sentinel }}@${{ steps.build-sentinel.outputs.digest }}\`"
+            echo "Agent:    \`${{ steps.refs.outputs.agent }}@${{ steps.build-agent.outputs.digest }}\`"
+          } | tee /tmp/digests.txt
+          {
+            echo
+            echo "### Deployment digests"
+            echo
+            echo "\`${{ steps.refs.outputs.sentinel }}@${{ steps.build-sentinel.outputs.digest }}\`"
+            echo
+            echo "\`${{ steps.refs.outputs.agent }}@${{ steps.build-agent.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarise the release
         run: |

@@ -88,83 +88,12 @@ resources:
 images:
   - name: registry.internal/srek3s-sentinel
     newName: ghcr.io/duckiec/srek3s-sentinel
-    newTag: latest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   - name: registry.internal/srek3s-agent
     newName: ghcr.io/duckiec/srek3s-agent
-    newTag: latest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 
-# ---------------------------------------------------------------------------
-# FORCE imagePullPolicy: Always
-# ---------------------------------------------------------------------------
-# `:latest` plus `IfNotPresent` is a trap, and it is a trap on a MUTABLE TAG.
-#
-# Kubernetes only defaults `imagePullPolicy` to `Always` when the field is ABSENT.
-# Both shipped manifests set it explicitly:
-#
-#     deploy/sentinel.yaml   imagePullPolicy: IfNotPresent
-#     deploy/agent.yaml      imagePullPolicy: IfNotPresent
-#
-# so the default never applies and the published `:latest` is resolved ONCE per node
-# and then reused forever. A node that pulled the tag before a release keeps running
-# the old image with no warning, no rollout, and no event — and the symptom is an
-# onboarding user reporting that a fix "did not work", against code they are already
-# running. For a mutable tag that is the whole failure mode of `IfNotPresent`, and
-# the only cure is to not use it with one.
-#
-# WHY THIS IS AN OVERLAY PATCH AND NOT A FIX TO deploy/*.yaml
-# ----------------------------------------------------------
-# Because `IfNotPresent` is LOAD-BEARING in the base. `docs/offline-install.md`
-# imports `registry.internal/srek3s-*:0.1.0` straight into containerd's image store:
-#
-#     sudo k3s ctr images tag registry.internal/srek3s-agent:0.1.0 docker.io/library/...
-#
-# There is no registry behind that tag. Setting `Always` on the shipped manifests
-# would make `make deploy` and the default `make deploy-overlay` attempt a pull from
-# a registry that does not exist and fail on a cluster where they work today.
-#
-# So the divergence is deliberate and scoped to the two overlays that actually
-# publish `:latest`. Do not consolidate it upward.
-#
-# There is a test that takes the opposite position on purpose:
-# `agent/tests/test_e2e_incluster_manifests.py` asserts the E2E fixture overlay must
-# NOT restate `imagePullPolicy` with a value differing from the shipped manifest,
-# because that leg applies a real diff and "must observe the shipped value". That is
-# correct there — reproducibility of the leg outranks freshness — and it is not a
-# contradiction of this block. Different overlay, different requirement: a
-# reproducible test leg must not drift, an onboarding path must not serve a stale
-# `:latest`.
-patches:
-  - target:
-      kind: Deployment
-      name: srek3s-agent
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: srek3s-agent
-      spec:
-        template:
-          spec:
-            containers:
-              # The `name` is load-bearing. Containers merge on `name`, so a patch
-              # omitting it does not patch the shipped container — it APPENDS a second
-              # one. See agent/tests/test_e2e_incluster_manifests.py, which asserts
-              # exactly this. deploy/agent.yaml's only container is named `agent`.
-              - name: agent
-                imagePullPolicy: Always
-  - target:
-      kind: Deployment
-      name: srek3s-sentinel
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: srek3s-sentinel
-      spec:
-        template:
-          spec:
-            containers:
-              # deploy/sentinel.yaml's only container is named `sentinel`. Same
-              # merge-key requirement as the agent above.
-              - name: sentinel
-                imagePullPolicy: Always
+# Digests rather than tags: Kubernetes resolves a sha256 digest to exactly one
+# manifest list, so IfNotPresent in deploy/*.yaml is safe here and the
+# imagePullPolicy: Always patches are removed. The patch lives on in git
+# history if a mutable tag ever comes back.
