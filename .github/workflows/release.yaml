@@ -107,7 +107,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
       packages: write
 
     steps:
@@ -285,6 +286,58 @@ jobs:
             echo
             echo "\`${{ steps.refs.outputs.agent }}@${{ steps.build-agent.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pin the real image digests into the Kustomize overlays and open a PR
+      # with them. Pushing to main directly is blocked by branch protection,
+      # so this pushes a branch and lets reviewers merge the pin.
+      - name: Auto-pin Kustomize digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SENTINEL_DIGEST="${{ steps.build-sentinel.outputs.digest }}"
+          AGENT_DIGEST="${{ steps.build-agent.outputs.digest }}"
+
+          python3 - "$SENTINEL_DIGEST" "$AGENT_DIGEST" <<'PY'
+          import re, sys
+
+          sentinel_digest, agent_digest = sys.argv[1], sys.argv[2]
+          placeholder = re.compile(r"sha256:0{64}")
+
+          for path in (
+              "deploy/overlays/quickstart/kustomization.yaml",
+              "deploy/overlays/quickstart-live/kustomization.yaml",
+          ):
+              text = open(path, encoding="utf-8").read()
+              lines = text.splitlines(keepends=True)
+              out = []
+              current = None
+              for line in lines:
+                  if "name: registry.internal/srek3s-sentinel" in line:
+                      current = "sentinel"
+                  elif "name: registry.internal/srek3s-agent" in line:
+                      current = "agent"
+                  elif current and placeholder.search(line):
+                      line = placeholder.sub({"sentinel": sentinel_digest, "agent": agent_digest}[current], line)
+                      current = None
+                  out.append(line)
+              open(path, "w", encoding="utf-8").write("".join(out))
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH_NAME="release/pin-digests-${{ github.ref_name }}"
+          git checkout -b "$BRANCH_NAME"
+
+          git add deploy/overlays/
+          git diff-index --quiet HEAD || git commit -m "chore(release): pin image digests for ${{ github.ref_name }}"
+          git push origin "$BRANCH_NAME"
+
+          gh pr create \
+            --title "chore: pin image digests for ${{ github.ref_name }}" \
+            --body "Automated Kustomize image digest pinning for release ${{ github.ref_name }}." \
+            --base main
 
       - name: Summarise the release
         run: |
