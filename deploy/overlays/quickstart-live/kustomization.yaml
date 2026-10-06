@@ -64,58 +64,9 @@ resources:
 images:
   - name: registry.internal/srek3s-sentinel
     newName: ghcr.io/duckiec/srek3s-sentinel
-    newTag: latest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   - name: registry.internal/srek3s-agent
     newName: ghcr.io/duckiec/srek3s-agent
-    newTag: latest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 
-# ---------------------------------------------------------------------------
-# FORCE imagePullPolicy: Always — identical to deploy/overlays/quickstart
-# ---------------------------------------------------------------------------
-# The long-form rationale lives in ../quickstart/kustomization.yaml and is not
-# duplicated here. In one line: the `images:` block above publishes a MUTABLE `:latest`
-# tag, and Kubernetes only defaults `imagePullPolicy` to `Always` when the field is
-# ABSENT — so the shipped `IfNotPresent` would resolve `:latest` once per node and
-# reuse it forever, serving a stale image with no rollout and no warning.
-#
-# `IfNotPresent` stays in deploy/*.yaml because it is load-bearing there:
-# `docs/offline-install.md` imports `registry.internal/...:0.1.0` into containerd's
-# store, and there is no registry behind that tag for `Always` to pull from.
-#
-# PATCH ORDERING, since this overlay composes another that already patches:
-# kustomize applies a child's patches first and the parent's second, so this block
-# runs AFTER ../local-live's three. There is no conflict because the field sets are
-# disjoint — those touch volumeMounts, replicas and env; these touch imagePullPolicy.
-# Overlapping fields between a composed overlay and its parent would be an ordering
-# hazard worth a test; these are not.
-patches:
-  - target:
-      kind: Deployment
-      name: srek3s-agent
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: srek3s-agent
-      spec:
-        template:
-          spec:
-            containers:
-              # Containers merge on `name`; omitting it appends a second container
-              # rather than patching the shipped one.
-              - name: agent
-                imagePullPolicy: Always
-  - target:
-      kind: Deployment
-      name: srek3s-sentinel
-    patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: srek3s-sentinel
-      spec:
-        template:
-          spec:
-            containers:
-              - name: sentinel
-                imagePullPolicy: Always
+# Same pinning policy as ../quickstart: sha256 digests, no Always patch.
