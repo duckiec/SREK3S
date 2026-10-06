@@ -122,6 +122,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         level=os.environ.get("SREK3S_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # httpx logs every request at INFO, which puts the full Telegram URL -
+    # including the bot token - into the pod logs. Elevate it to WARNING so
+    # only genuine failures are emitted.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     budget = getattr(app.state, "job_budget", None)
     provider = getattr(app.state, "manifest_provider", None)
     # The logged provider name is derived from the object, not hard-coded. The

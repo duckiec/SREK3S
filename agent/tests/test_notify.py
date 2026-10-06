@@ -198,6 +198,47 @@ def test_telegram_getupdates_401_is_quiet() -> None:
     assert d.deliver(_INCIDENT, "SEV2", _MD)["telegram"] == "http_401"
 
 
+def test_telegram_chat_id_bypasses_getupdates() -> None:
+    import notify as n
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    d = _dispatcher_with_transport(
+        handler, telegram=n.TelegramTarget("TOK", chat_id="8642246079")
+    )
+    assert d.deliver(_INCIDENT, "SEV2", _MD)["telegram"] == "ok"
+    assert calls == ["/botTOK/sendMessage"]
+
+
+def test_telegram_discovery_logs_insecure_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging as _logging
+
+    import notify as n
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getUpdates"):
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": [{"message": {"chat": {"id": 42}}}]},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    d = _dispatcher_with_transport(handler, telegram=n.TelegramTarget("TOK"))
+    with caplog.at_level(_logging.WARNING, logger="srek3s.agent.notify"):
+        d.deliver(_INCIDENT, "SEV2", _MD)
+    warning = next(r for r in caplog.records if r.levelname == "WARNING")
+    assert (
+        "TELEGRAM_CHAT_ID is unset. Dynamically resolved to 42." in warning.getMessage()
+    )
+    assert "TELEGRAM_CHAT_ID=42" in warning.getMessage()
+
+
 def test_telegram_message_escapes_and_truncates() -> None:
     import notify as n
 

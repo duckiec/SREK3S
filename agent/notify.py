@@ -26,6 +26,7 @@ SLACK_WEBHOOK_URL_ENV: Final[str] = "SLACK_WEBHOOK_URL"
 DISCORD_WEBHOOK_URL_ENV: Final[str] = "DISCORD_WEBHOOK_URL"
 PAGERDUTY_ROUTING_KEY_ENV: Final[str] = "PAGERDUTY_ROUTING_KEY"
 TELEGRAM_API_KEY_ENV: Final[str] = "TELEGRAM_API_KEY"
+TELEGRAM_CHAT_ID_ENV: Final[str] = "TELEGRAM_CHAT_ID"
 
 #: Absolute cap on one webhook call, seconds. The main triage loop must never
 #: wait on egress longer than this, so it is a ceiling, not a tuning knob.
@@ -99,6 +100,7 @@ class PagerDutyTarget:
 @dataclass(frozen=True)
 class TelegramTarget:
     bot_token: str
+    chat_id: str = ""
 
 
 def _truncate_for_discord(markdown: str) -> str:
@@ -200,23 +202,33 @@ class Dispatcher:
         base = f"https://api.telegram.org/bot{token}"
         try:
             with self._client_factory(timeout=self.timeout_seconds) as client:
-                updates = client.get(f"{base}/getUpdates")
-                if updates.status_code != 200:
-                    logger.error(
-                        "notify failed target=telegram incident_id=%s "
-                        "step=getUpdates status=%d",
-                        incident_id,
-                        updates.status_code,
+                if self.telegram.chat_id:
+                    chat_id: int | str = self.telegram.chat_id
+                else:
+                    updates = client.get(f"{base}/getUpdates")
+                    if updates.status_code != 200:
+                        logger.error(
+                            "notify failed target=telegram incident_id=%s "
+                            "step=getUpdates status=%d",
+                            incident_id,
+                            updates.status_code,
+                        )
+                        return f"http_{updates.status_code}"
+                    chat_id = _latest_chat_id(updates.json()) or ""
+                    if not chat_id:
+                        logger.error(
+                            "notify failed target=telegram incident_id=%s "
+                            "error=no_chat_id_in_updates",
+                            incident_id,
+                        )
+                        return "no_chat_id"
+                    logger.warning(
+                        "TELEGRAM_CHAT_ID is unset. Dynamically resolved to %s. "
+                        "This is insecure for production. Lock this routing by "
+                        "setting TELEGRAM_CHAT_ID=%s in your environment.",
+                        chat_id,
+                        chat_id,
                     )
-                    return f"http_{updates.status_code}"
-                chat_id = _latest_chat_id(updates.json())
-                if chat_id is None:
-                    logger.error(
-                        "notify failed target=telegram incident_id=%s "
-                        "error=no_chat_id_in_updates",
-                        incident_id,
-                    )
-                    return "no_chat_id"
                 response = client.post(
                     f"{base}/sendMessage",
                     json={
@@ -322,6 +334,7 @@ def dispatcher_from_env(env: dict[str, str] | None = None) -> Dispatcher:
     discord_raw = (source.get(DISCORD_WEBHOOK_URL_ENV) or "").strip()
     pagerduty_raw = (source.get(PAGERDUTY_ROUTING_KEY_ENV) or "").strip()
     telegram_raw = (source.get(TELEGRAM_API_KEY_ENV) or "").strip()
+    telegram_chat_id = (source.get(TELEGRAM_CHAT_ID_ENV) or "").strip()
 
     slack = (
         SlackTarget(_require_https_url(slack_raw, env_name=SLACK_WEBHOOK_URL_ENV))
@@ -334,7 +347,9 @@ def dispatcher_from_env(env: dict[str, str] | None = None) -> Dispatcher:
         else None
     )
     pagerduty = PagerDutyTarget(pagerduty_raw) if pagerduty_raw else None
-    telegram = TelegramTarget(telegram_raw) if telegram_raw else None
+    telegram = (
+        TelegramTarget(telegram_raw, chat_id=telegram_chat_id) if telegram_raw else None
+    )
 
     return Dispatcher(
         slack=slack, discord=discord, pagerduty=pagerduty, telegram=telegram
