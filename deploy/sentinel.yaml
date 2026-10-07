@@ -103,6 +103,12 @@ spec:
             # payload is already scrubbed in memory on the way out.
             - name: SREK3S_AGENT_URL
               value: http://srek3s-agent:8000
+            # Dynamic scrubber manifest. The ConfigMap is mounted at
+            # /etc/srek3s; if the file is missing, malformed, or contains an
+            # invalid regex the Sentinel panics at boot - a degraded scrubber
+            # must never reach a running pod.
+            - name: SREK3S_SCRUBBER_MANIFEST
+              value: /etc/srek3s/scrubber.json
             # Defaults to THIS namespace, which is the namespace deploy/rbac.yaml
             # actually grants. Secure-by-default: the shipped manifest's watch scope
             # and its read authority now AGREE, so a straight `kubectl apply -k
@@ -167,6 +173,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: scrubber-manifest
+              mountPath: /etc/srek3s
+              readOnly: true
 
           resources:
             requests:
@@ -219,6 +228,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+        - name: scrubber-manifest
+          configMap:
+            name: srek3s-scrubber
 
 ---
 # NetworkPolicy for the Sentinel.

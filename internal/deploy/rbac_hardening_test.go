@@ -217,9 +217,11 @@ func TestTmpIsTheOnlyWritablePath(t *testing.T) {
 		t.Fatal("no volumes; the /tmp mount would have nothing to mount")
 	}
 	volumeKinds := map[string]bool{}
+	volumeConfigMap := map[string]bool{}
 	for _, raw := range volumes {
 		volume := raw.(map[string]any)
 		volumeKinds[volume["name"].(string)] = volume["emptyDir"] != nil
+		volumeConfigMap[volume["name"].(string)] = volume["configMap"] != nil
 	}
 
 	containers, _ := digSlice(podSpec, "containers")
@@ -232,10 +234,18 @@ func TestTmpIsTheOnlyWritablePath(t *testing.T) {
 		for _, rawMount := range mounts {
 			mount := rawMount.(map[string]any)
 			if mount["mountPath"] != "/tmp" {
-				t.Errorf("container %v mounts %v; ARCH §8 allows /tmp only",
-					container["name"], mount["mountPath"])
+				// A read-only projected ConfigMap is the one allowed exception:
+				// it is not writable state and cannot outlive the pod. Every
+				// other path must remain on the read-only root filesystem.
+				if !volumeConfigMap[mount["name"].(string)] || mount["readOnly"] != true {
+					t.Errorf("container %v mounts %v; ARCH §8 allows /tmp only unless read-only config",
+						container["name"], mount["mountPath"])
+				}
 			}
 			if isEmptyDir, known := volumeKinds[mount["name"].(string)]; !known || !isEmptyDir {
+				if volumeConfigMap[mount["name"].(string)] && mount["readOnly"] == true {
+					continue
+				}
 				t.Errorf("container %v mounts volume %v, which is not an emptyDir; "+
 					"a hostPath or PVC is writable state that outlives the pod",
 					container["name"], mount["name"])

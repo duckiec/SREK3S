@@ -395,6 +395,10 @@ def test_tmp_is_the_only_writable_volume(manifest: str) -> None:
                     "other mount must declare readOnly: true explicitly"
                 )
             volume = volumes[mount["name"]]
+            if "configMap" in volume and mount.get("readOnly") is True:
+                # Read-only projected config is not writable state; it cannot
+                # outlive the pod and does not weaken the /tmp-only rule.
+                continue
             assert "emptyDir" in volume, (
                 f"{manifest}: volume {mount['name']} is {list(volume)}, not an "
                 f"emptyDir; a hostPath or PVC would be writable state that "
