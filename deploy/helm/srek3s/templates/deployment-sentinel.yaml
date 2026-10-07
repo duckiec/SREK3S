@@ -21,6 +21,9 @@ spec:
         {{- include "srek3s.partOf" . | nindent 8 }}
       annotations:
         checksum/sentinel: "replaced-by-pipeline"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: srek3s-sentinel
       automountServiceAccountToken: true
@@ -35,6 +38,9 @@ spec:
         - name: sentinel
           image: {{ .Values.images.sentinel.repository }}:{{ .Values.images.sentinel.tag }}
           imagePullPolicy: {{ .Values.images.sentinel.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9090
           args:
             - -log-level=$(LOG_LEVEL)
           env:

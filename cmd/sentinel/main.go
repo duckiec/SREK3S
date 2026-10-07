@@ -39,6 +39,7 @@ import (
 
 	"github.com/srek3s/sentinel/internal/emitter"
 	"github.com/srek3s/sentinel/internal/k8s"
+	"github.com/srek3s/sentinel/internal/metrics"
 	"github.com/srek3s/sentinel/internal/scrubber"
 	"github.com/srek3s/sentinel/internal/worker"
 )
@@ -231,6 +232,8 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 
 	telemetry := k8s.NewTelemetry(client)
 
+	metricsRegistry := metrics.New()
+
 	sink, err := emitter.New(emitter.Config{
 		BaseURL:         *agentURL,
 		SentinelVersion: version,
@@ -249,7 +252,17 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 		sink,
 		*workers,
 		worker.WithLogger(log),
+		worker.WithMetrics(metricsRegistry),
 	)
+
+	// The metrics listener lives in its own goroutine on :9090, off the
+	// emitter path. A bind failure is logged, not fatal: losing telemetry
+	// must never stop incident delivery.
+	go func() {
+		if err := metricsRegistry.Serve(ctx, log); err != nil {
+			log.Error("metrics listener failed", "error", err)
+		}
+	}()
 
 	// The informer runs in the background against a stop channel, because
 	// SharedInformerFactory's API predates context. The bridging goroutine is the

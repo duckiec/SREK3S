@@ -18,6 +18,11 @@ sentinel:
   # referring back to the ServiceAccount. Never use a ClusterRole.
   watchNamespace: srek3s-system
 
+monitoring:
+  # Namespace Prometheus scrapes from. Empty means deny: no ingress rule is
+  # rendered and :9090 is unreachable until the operator names a namespace.
+  namespace: ""
+
 networkPolicy:
   # Service CIDRs the Sentinel may reach on 443. Defaults cover k3s and
   # kubeadm. If your control plane sits elsewhere, replace this list.
