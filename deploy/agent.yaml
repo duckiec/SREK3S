@@ -237,6 +237,22 @@ spec:
                   key: TELEGRAM_CHAT_ID
                   optional: true
 
+            # SREK3S_GITOPS_REPO_URL - the GitOps repository to clone at
+            # startup for Tier-1 patch verification (I-B2). Unset means the
+            # existing behaviour: SREK3S_MANIFEST_ROOT if mounted, otherwise
+            # every incident escalates. A failed clone degrades the same way;
+            # it never crashes the agent.
+            - name: SREK3S_GITOPS_REPO_URL
+              value: ""
+            - name: SREK3S_GITOPS_REF
+              value: main
+            - name: SREK3S_GITOPS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: GITOPS_TOKEN
+                  optional: true
+
           # ARCH §8: read-only root, no privilege escalation, every capability
           # dropped. The agent needs none of them, so all are dropped rather than
           # selected - an allow-list here would be a list to forget an entry on.

@@ -18,6 +18,15 @@ sentinel:
   # referring back to the ServiceAccount. Never use a ClusterRole.
   watchNamespace: srek3s-system
 
+agent:
+  gitops:
+    # Repository to clone at startup for Tier-1 verification. Empty means
+    # the existing behaviour: SREK3S_MANIFEST_ROOT if mounted, otherwise
+    # every incident escalates. The token always comes from the
+    # srek3s-secrets Secret, never from values.
+    repoUrl: ""
+    ref: main
+
 monitoring:
   # Namespace Prometheus scrapes from. Empty means deny: no ingress rule is
   # rendered and :9090 is unreachable until the operator names a namespace.
