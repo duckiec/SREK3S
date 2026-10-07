@@ -39,6 +39,16 @@ helm install srek3s deploy/helm/srek3s -n srek3s-system \
   --set images.sentinel.tag=sha-abc123
 ```
 
+## Monitoring
+
+The Sentinel serves Prometheus metrics on `:9090/metrics`. Ingress stays
+deny-by-default; open it from your monitoring namespace:
+
+```bash
+helm install srek3s deploy/helm/srek3s -n srek3s-system \
+  --set monitoring.namespace=monitoring
+```
+
 ## Operator-created resources (not in this chart)
 
 - `srek3s-secrets` Secret with `GEMINI_API_KEY`, `NVIDIA_API_KEY`,

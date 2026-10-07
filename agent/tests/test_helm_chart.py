@@ -87,6 +87,21 @@ def test_watch_namespace_override_reaches_the_container() -> None:
 
 
 @needs_helm
+def test_monitoring_namespace_opens_9090_ingress() -> None:
+    docs = render(["--set", "monitoring.namespace=monitoring"])
+    policy = one(docs, "NetworkPolicy", "srek3s-sentinel")
+    ingress = policy["spec"]["ingress"]
+    assert len(ingress) == 1
+    assert ingress[0]["ports"] == [{"protocol": "TCP", "port": 9090}]
+
+
+@needs_helm
+def test_default_render_denies_9090_ingress() -> None:
+    policy = one(render(), "NetworkPolicy", "srek3s-sentinel")
+    assert policy["spec"]["ingress"] == []
+
+
+@needs_helm
 def test_api_server_cidr_override_reaches_the_policy() -> None:
     docs = render(["--set", "networkPolicy.apiServerCidrs[0]=10.100.0.0/16"])
     policy = one(docs, "NetworkPolicy", "srek3s-sentinel")

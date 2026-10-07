@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/srek3s/sentinel/internal/k8s"
+	"github.com/srek3s/sentinel/internal/metrics"
 	"github.com/srek3s/sentinel/internal/scrubber"
 )
 
@@ -113,6 +114,7 @@ type Pool struct {
 	telemetry TelemetryFetcher
 	sink      Sink
 	log       *slog.Logger
+	metrics   *metrics.Registry
 
 	// perIncidentTimeout bounds the whole telemetry phase for one incident, so one
 	// slow apiserver cannot consume the pool indefinitely. Individual calls are
@@ -137,6 +139,12 @@ func WithLogger(log *slog.Logger) Option {
 // WithPerIncidentTimeout bounds the telemetry phase of one incident.
 func WithPerIncidentTimeout(d time.Duration) Option {
 	return func(p *Pool) { p.perIncidentTimeout = d }
+}
+
+// WithMetrics attaches the Prometheus registry. A nil registry is a no-op,
+// so tests and embeddings that do not care about metrics pass nothing.
+func WithMetrics(m *metrics.Registry) Option {
+	return func(p *Pool) { p.metrics = m }
 }
 
 // New builds a pool over the given channel.
@@ -251,8 +259,10 @@ func (p *Pool) handle(parent context.Context, record *k8s.IncidentRecord) {
 	p.collectTelemetry(ctx, incident)
 	p.scrubTelemetry(ctx, incident)
 
+	p.metrics.IncIntercepted()
 	if err := p.sink.Dispatch(ctx, incident); err != nil {
 		p.failed.Add(1)
+		p.metrics.IncEmitterFailure()
 		p.log.Error("dispatch failed",
 			"incident", record.Namespace+"/"+record.PodName+":"+record.ContainerName,
 			"kind", string(record.Kind),
@@ -331,6 +341,9 @@ func (p *Pool) scrubTelemetry(ctx context.Context, incident *Incident) {
 	incident.ScrubbedEventMessages = messages
 
 	incident.Redaction = mergeReports(report, messageReport)
+	for _, id := range incident.Redaction.RulesTriggered {
+		p.metrics.IncMasked(string(id))
+	}
 }
 
 // mergeReports combines two scrubber reports without double-counting.

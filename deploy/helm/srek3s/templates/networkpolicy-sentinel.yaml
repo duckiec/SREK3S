@@ -13,7 +13,18 @@ spec:
   policyTypes:
     - Egress
     - Ingress
+  {{- if .Values.monitoring.namespace }}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+      ports:
+        - protocol: TCP
+          port: 9090
+  {{- else }}
   ingress: []
+  {{- end }}
   egress:
     - to:
         {{- range .Values.networkPolicy.apiServerCidrs }}
