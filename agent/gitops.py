@@ -62,23 +62,29 @@ def _resolve_timeout(raw: str) -> float:
 def _clone(url: str, token: str, ref: str, dest: str, timeout: float) -> str | None:
     """Clone url into dest. Returns None on success, a reason on failure.
 
-    The token never appears in argv. It is written to a temporary gitconfig
-    file carrying an Authorization header, and git reads it via GIT_CONFIG_GLOBAL.
+    The token never appears in argv. When set, it is written to a temporary
+    gitconfig file carrying an Authorization header, and git reads it via
+    GIT_CONFIG_GLOBAL. When unset, the clone runs anonymously, which is the
+    correct behaviour for a public repository: sending a bogus bearer token
+    makes GitHub reject even public reads with "invalid credentials".
     """
     git = shutil.which("git")
     if git is None:
         return "git is not available"
-    fd, config_path = tempfile.mkstemp(prefix="srek3s-gitops-cred-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                "[http]\n\textraHeader = Authorization: Bearer " + token + "\n"
-            )
-        os.chmod(config_path, 0o600)
-    except OSError as exc:
-        return f"could not stage git credential: {exc}"
+    config_path: str | None = None
+    if token:
+        fd, config_path = tempfile.mkstemp(prefix="srek3s-gitops-cred-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[http]\n\textraHeader = Authorization: Bearer " + token + "\n"
+                )
+            os.chmod(config_path, 0o600)
+        except OSError as exc:
+            return f"could not stage git credential: {exc}"
     env = dict(os.environ)
-    env["GIT_CONFIG_GLOBAL"] = config_path
+    if config_path is not None:
+        env["GIT_CONFIG_GLOBAL"] = config_path
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
@@ -108,10 +114,11 @@ def _clone(url: str, token: str, ref: str, dest: str, timeout: float) -> str | N
     except OSError as exc:
         return f"git clone could not be executed: {exc}"
     finally:
-        try:
-            os.unlink(config_path)
-        except OSError:
-            pass
+        if config_path is not None:
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
     if completed.returncode != 0:
         diagnostic = (
             completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
@@ -149,13 +156,11 @@ def materialise_manifest_root(env: Mapping[str, str] | None = None) -> ManifestP
         return unreadable_manifest_provider()
 
     token = (source.get(GITOPS_TOKEN_ENV) or "").strip()
-    if not token:
-        logger.warning(
-            "%s is set but %s is not; every incident escalates",
-            GITOPS_REPO_URL_ENV,
+    if token:
+        logger.info(
+            "%s is set; the clone will authenticate",
             GITOPS_TOKEN_ENV,
         )
-        return unreadable_manifest_provider()
 
     ref = (source.get(GITOPS_REF_ENV) or "").strip() or DEFAULT_REF
     if ref.startswith("-"):

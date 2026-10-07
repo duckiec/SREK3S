@@ -148,11 +148,22 @@ def test_non_https_url_is_refused() -> None:
     assert provider.read_manifest("deploy/x.yaml") is None
 
 
-def test_missing_token_degrades_to_unreadable() -> None:
-    with mock.patch.object(subprocess, "run") as run:
+def test_missing_token_clones_anonymously() -> None:
+    seen_env: list[dict[str, str]] = []
+
+    def fake_run(cmd: Any, **kwargs: Any) -> Any:
+        seen_env.append(dict(kwargs.get("env", {})))
+        return _ok_run()
+
+    with (
+        mock.patch.object(shutil, "which", return_value="/usr/bin/git"),
+        mock.patch.object(subprocess, "run", side_effect=fake_run),
+    ):
         provider = materialise_manifest_root({GITOPS_REPO_URL_ENV: URL})
-    run.assert_not_called()
     assert provider.read_manifest("deploy/x.yaml") is None
+    assert seen_env, "expected git to be invoked"
+    for env in seen_env:
+        assert "GIT_CONFIG_GLOBAL" not in env
 
 
 def test_dash_ref_is_refused() -> None:
