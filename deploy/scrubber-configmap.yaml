@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srek3s-scrubber
+  namespace: srek3s-system
+  labels:
+    app.kubernetes.io/part-of: srek3s
+data:
+  scrubber.json: |
+    {
+    "version": "1",
+      "rules": [
+        {
+          "id": "pem_private_key",
+          "pattern": "-----BEGIN (RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY( BLOCK)?-----[\\s\\S]*?-----END (RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY( BLOCK)?-----",
+          "multiLine": true
+        },
+        {
+          "id": "aws_access_key_id",
+          "pattern": "\\b((A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16})\\b",
+          "multiLine": false
+        },
+        {
+          "id": "aws_secret_access_key",
+          "pattern": "(?i)aws(.{0,20})?(secret|private)(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]",
+          "multiLine": false
+        },
+        {
+          "id": "jwt",
+          "pattern": "\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b",
+          "multiLine": false
+        },
+        {
+          "id": "bearer_token",
+          "pattern": "(?i)\\bbearer\\s+[A-Za-z0-9\\-._~+/]{8,}=*",
+          "multiLine": false
+        },
+        {
+          "id": "basic_auth_url",
+          "pattern": "(?i)([a-z][a-z0-9+.-]*:\\/\\/[^:\\s\\/]+:)([^@\\s\\/]+)(@[^\\s\\/]+)",
+          "multiLine": false,
+          "template": "${1}[REDACTED]${3}"
+        },
+        {
+          "id": "generic_secret_kv",
+          "pattern": "(?i)(\\b[\\w-]{0,20}(?:api[_-]?key|secret(?:[_-]access)?[_-]?key|secret|token|access[_-]?token|refresh[_-]?token|password|passwd|pwd|passphrase|client[_-]?secret|private[_-]?key|authorization|auth)[\"']?\\s*[:=]\\s*[\"']?)(?P<value>[^\"',;}\\n]{4,})([\"']?)",
+          "multiLine": false,
+          "template": "${1}[REDACTED]${3}"
+        },
+        {
+          "id": "uuid",
+          "pattern": "\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b",
+          "multiLine": false
+        },
+        {
+          "id": "ipv4_address",
+          "pattern": "\\b((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\b",
+          "multiLine": false
+        },
+        {
+          "id": "k8s_secret_mount",
+          "pattern": "(?i)\\b(?:kube-system|kube-node-lease)\\b[^\\n]{0,80}(?:token|secret|ca\\.crt)|(?i)(?:token|secret|ca\\.crt)[^\\n]{0,80}\\b(?:kube-system|kube-node-lease)\\b",
+          "multiLine": false
+        },
+        {
+          "id": "private_key_pem_body",
+          "pattern": "(?i)-----BEGIN[A-Z ]*PRIVATE[A-Z ]*-----",
+          "multiLine": false
+        }
+      ]
+    }

@@ -73,6 +73,7 @@ resources:
   - sentinel.yaml
   - agent.yaml
   - service.yaml
+  - scrubber-configmap.yaml
 
 # No `images:` block on purpose. The image tags in the manifests are the
 # placeholders `registry.internal/...:0.1.0`, and a kustomize `images:` override

@@ -39,6 +39,7 @@ import (
 
 	"github.com/srek3s/sentinel/internal/emitter"
 	"github.com/srek3s/sentinel/internal/k8s"
+	"github.com/srek3s/sentinel/internal/scrubber"
 	"github.com/srek3s/sentinel/internal/worker"
 )
 
@@ -135,6 +136,17 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 
 	log := newLogger(*logLevel)
 	slog.SetDefault(log)
+
+	if manifest := os.Getenv("SREK3S_SCRUBBER_MANIFEST"); manifest != "" {
+		raw, err := os.ReadFile(manifest)
+		if err != nil {
+			return fmt.Errorf("read scrubber manifest %q: %w", manifest, err)
+		}
+		if err := scrubber.LoadManifestBytes(raw); err != nil {
+			return fmt.Errorf("load scrubber manifest %q: %w", manifest, err)
+		}
+		slog.Info("scrubber manifest loaded from file", "path", manifest, "rules", len(scrubber.Manifest))
+	}
 
 	if ctx == nil {
 		ctx = context.Background()

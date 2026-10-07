@@ -91,6 +91,7 @@ resources:
   - ../rbac.yaml
   - ../sentinel.yaml
   - ../agent.yaml
+  - ../scrubber-configmap.yaml
   - ../service.yaml
 
 # ---------------------------------------------------------------------------
