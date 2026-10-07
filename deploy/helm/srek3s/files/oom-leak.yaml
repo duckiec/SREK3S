@@ -1,0 +1,263 @@
+# SREK3S chaos fixture — deterministic OOMKilled (ROADMAP 4.1.2 / 4.1.4)
+#
+# INPUT ONLY. This file is never applied by the Sentinel and never applied by CI
+# without an explicit human GO. The Sentinel's RBAC in deploy/rbac.yaml is
+# get/list/watch only, so it structurally cannot apply this; the agent emits git
+# diffs, never kubectl. Applying it is the e2e runner's job, by hand.
+#
+# Blast radius: the target namespace is `sentinel-chaos`, a disposable namespace
+# owned by ROADMAP 4.1.1. It is NOT `srek3s-system` and NOT `default`. That
+# reference is the guardrail ROADMAP 4.1.5 asserts against — the namespace is
+# deliberately NOT created here, so this file cannot be the thing that brings a
+# namespace into existence in a cluster that was not expecting one.
+#
+# WHAT IT MUST PRODUCE, precisely (internal/k8s/watcher.go classify()):
+#   containers[].status.state.terminated.exitCode = 137   (128 + SIGKILL)
+#   containers[].status.state.terminated.reason    = "OOMKilled"
+# It must NOT produce:
+#   - `Evicted`            (node-pressure eviction; no OOMKilled reason)
+#   - `Error` / exit 1     (a fixture that exits cleanly is a false negative)
+#   - a disk or ephemeral-storage failure
+#
+# ---------------------------------------------------------------------------
+# IMAGE: busybox:1.36.1
+# ---------------------------------------------------------------------------
+# Chosen over the alternatives, on measured-ish grounds:
+#
+#   busybox:1.36.1   ~1.9 MB compressed. /bin/sh is busybox ash, dynamically
+#                    linked against musl. Shell-only RSS is ~1-2 MB, which is
+#                    what makes 64Mi a *tight but workable* budget. Chosen.
+#   alpine:3.20      ~7 MB. Same shell (busybox ash) underneath, so the RSS
+#                    story is identical and the only gain is 5 MB of download
+#                    during `k3s ctr images import` (ROADMAP 4.2.2). Not worth
+#                    the extra pull on a Windows host.
+#   registry.k8s.io/pause
+#                    REJECTED. No shell at all, and its only behaviour is to
+#                    sleep forever — it can never OOM, so it is useless here
+#                    without a second image carrying the payload. Documented
+#                    explicitly because the prompt listed it: if a shell-less
+#                    image is ever required, the alternative is to exec a
+#                    purpose-built static binary (e.g. `memoryhog:static`) as
+#                    the container command, not to try to loop inside `pause`.
+#
+# Tag is pinned, not `latest`: a chaos fixture whose behaviour depends on a
+# floating tag is not a fixture, it is a coin toss.
+#
+# `imagePullPolicy: Never` is deliberate. ROADMAP 4.2.2 imports images into
+# containerd out-of-band, so a pull attempt is not a fallback — it is a network
+# call that fails, slowly, and obscures the real failure. `Never` also makes the
+# fixture's behaviour independent of registry state, which is what determinism
+# requires.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-chaos-oom
+  namespace: sentinel-chaos
+  labels:
+    app.kubernetes.io/name: srek3s-chaos-oom
+    app.kubernetes.io/part-of: srek3s
+    app.kubernetes.io/component: chaos
+    srek3s.io/chaos: oom
+spec:
+  # One replica. More would produce N independent incidents and make
+  # `detections == injected_events` (ROADMAP 4.2.3) ambiguous about what was
+  # injected.
+  replicas: 1
+  # Fails fast rather than sitting in Progressing for the 600s default, so a
+  # runner using `kubectl rollout status` gets a prompt, unambiguous error.
+  progressDeadlineSeconds: 120
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-chaos-oom
+      srek3s.io/chaos: oom
+  template:
+    metadata:
+      labels:
+        # Selector labels are a subset of these, as the API requires. The
+        # `srek3s.io/chaos: oom` label is the one a NetworkPolicy guard or the
+        # e2e runner targets; `app.kubernetes.io/part-of: srek3s` is what makes
+        # this pod show up in any `part-of=srek3s` sweep alongside the Sentinel
+        # and the agent.
+        app.kubernetes.io/name: srek3s-chaos-oom
+        app.kubernetes.io/part-of: srek3s
+        app.kubernetes.io/component: chaos
+        srek3s.io/chaos: oom
+    spec:
+      # No API access is needed to leak memory, and a mounted token would be a
+      # second planted credential in the pod for no reason.
+      automountServiceAccountToken: false
+      # Stops the kubelet injecting every Service in the namespace as env vars.
+      # Cheap, and it keeps the environment free of high-entropy strings that
+      # would confuse a masking assertion on the log.
+      enableServiceLinks: false
+
+      # Pod Security Admission `restricted`, because the `sentinel-chaos`
+      # namespace (ROADMAP 4.1.1) enforces it at admission. A fixture that is
+      # rejected at the gate is worse than no fixture: it fails closed and looks
+      # like "the cluster is quiet".
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: oom-canary
+          # Container name is a DNS-1123 label, which is exactly what the agent's
+          # `container_name` pattern enforces (internal/emitter/validate.go).
+          image: busybox:1.36.1
+          imagePullPolicy: Never
+
+          # Inline. No ConfigMap, no PVC, no build step — the whole point is that
+          # a reviewer can read the failure mode without following three files.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # ------------------------------------------------------------------
+              # PHASE 1 — plant credentials (ROADMAP 4.1.4)
+              # ------------------------------------------------------------------
+              # Twenty iterations, four lines each = 80 lines, plus ~6 from the
+              # allocation phase. internal/k8s/telemetry.go reads
+              # LogTailLines=100 and LogLimitBytes=51200, so 86 lines of ~620
+              # bytes (~9 KB) keeps every planted secret inside the tail window
+              # the Sentinel actually fetches. The arithmetic is in the manifest
+              # on purpose: if someone raises the iteration count past ~24 the
+              # first secrets rotate out of the tail and the masking assertion
+              # silently weakens from "all five rules" to "a subset".
+              #
+              # Each line targets a DIFFERENT rule class, so one pass proves
+              # several independent rules rather than five copies of one:
+              #   aws_access_key_id / aws_secret_access_key -> rules 2, 3
+              #   jwt                                          -> rule 4
+              #   Authorization: Bearer                        -> rule 5
+              #   postgres://user:pass@host:port               -> rule 6
+              #
+              # DELIBERATELY OMITTED: any `password=`, `token=` or bare
+              # `secret_access_key=` key=value pair. Those are redacted by
+              # `generic_secret_kv` (rule 7), whose replacement template is
+              # `${1}[REDACTED]${3}`. Rule 6's template is verifiably correct:
+              # its pattern is three sibling groups with no nesting, so group 3
+              # is `@host:port` and the password is genuinely replaced. Rule 7's
+              # pattern is NOT flat - it carries a named group, and the numeric
+              # index that `${3}` resolves to could not be confirmed to be the
+              # trailing quote rather than the secret itself (see the report to
+              # the e2e verifier). A chaos fixture should not be the thing that
+              # silently depends on an unverified group index, so the masking
+              # proof here rests only on rules whose replacement is unambiguous.
+              # Add a rule-7 probe here only once that is settled.
+              i=0
+              while [ "$i" -lt 20 ]; do
+                printf '%s\n' "CHAOS-CRED seq=$i aws_access_key_id=AKIAIOSFODNN7EXAMPLE aws_secret_access_key=\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\""
+                printf '%s\n' "CHAOS-CRED seq=$i jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkNoYW9zIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                printf '%s\n' "CHAOS-CRED seq=$i Authorization: Bearer chaos-planted-bearer-token-0123456789"
+                printf '%s\n' "CHAOS-CRED seq=$i dsn=postgres://chaos_user:Sup3rS3cretPassw0rd@db.production.svc.cluster.local:5432/billing"
+                i=$((i + 1))
+              done
+              printf '%s\n' "CHAOS-PHASE creds-planted next=memory-exhaustion"
+
+              # ------------------------------------------------------------------
+              # PHASE 2 — settle
+              # ------------------------------------------------------------------
+              # Five seconds, and the reason is not politeness. The kubelet's pod
+              # status manager batches status updates, and on a fast crash the
+              # Terminated state can be coalesced away before it is ever written
+              # to the apiserver. Sleeping first guarantees a `Running` status is
+              # published, so the later `Terminated` is its own distinct update
+              # and the informer cannot miss it. This is the single largest
+              # contributor to the fixture's determinism.
+              sleep 5
+
+              # ------------------------------------------------------------------
+              # PHASE 3 — exhaust memory
+              # ------------------------------------------------------------------
+              # Doubling, not linear appending. `S="${S}x"` repeated 128 times is
+              # quadratic: summing the realloc copies to reach 64 MiB is on the
+              # order of 4.6e15 bytes of memcpy, which is hours, not seconds. A
+              # chaos fixture that OOMs in four hours is a broken fixture.
+              # Doubling is geometric, so total copy work to reach 64 MiB is
+              # 1+2+4+...+64 = 127 MiB — sub-second.
+              #
+              # Why this is OOMKilled and not something else:
+              #   * The bytes are genuinely resident. `${S}${S}` reads and writes
+              #     every byte, so the pages are touched; there is no lazy
+              #     allocation for the kernel to reclaim, and no free() to undo it.
+              #   * The shell is the only process in the container cgroup and the
+              #     only one holding the memory, so the cgroup OOM killer has
+              #     exactly one candidate and SIGKILL necessarily lands on PID 1.
+              #     This is why the hot loop uses only shell builtins: a forked
+              #     child in the cgroup would be a second OOM candidate and could
+              #     be chosen instead, leaving the shell alive.
+              #   * The doubling transient guarantees the crossing. Growing the
+              #     string from 32 MiB to 64 MiB needs the old 32 MiB block live
+              #     while the new 64 MiB block is being written: ~96 MiB against a
+              #     64 MiB limit. Iteration 5 (string = 32 MiB, RSS ~34 MiB) is
+              #     safely under; iteration 6 cannot fit under any plausible
+              #     baseline, so the kill lands on iteration 6 every time.
+              # `\000` rather than `\0`: three-digit octal is the form POSIX
+              # specifies, and it removes the only ambiguous escape in the whole
+              # fixture. A `tr` that read `\0` as a literal '0' would silently
+              # produce a block of NULs, which command substitution then discards
+              # (or, worse, keeps), and the first doubling would behave nothing
+              # like the arithmetic below.
+              BLOCK=$(head -c 1048576 /dev/zero | tr '\000' 'x')
+              j=0
+              while [ "$j" -lt 32 ]; do
+                BLOCK="$BLOCK$BLOCK"
+                j=$((j + 1))
+                printf 'CHAOS-OOM iteration=%d heap_bytes=%d\n' "$j" "${#BLOCK}"
+              done
+
+              # Unreachable. Reached only if the container did NOT OOM, in which
+              # case the fixture is broken and must say so loudly rather than
+              # exiting 0 and reading as a healthy pod.
+              printf '%s\n' "CHAOS-FATAL allocation loop completed without OOM; fixture is broken"
+              exit 1
+
+          # Restricted-PSA compliant, and consistent with the hardening in
+          # deploy/sentinel.yaml. readOnlyRootFilesystem is safe here precisely
+          # because the payload never touches the filesystem: it allocates in
+          # the heap and writes to stdout. (A payload that filled a tmpfs or a
+          # scratch volume would instead die of ephemeral-storage exhaustion and
+          # report `Evicted` — the wrong failure shape entirely.)
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            limits:
+              # INVARIANT I-A2 (internal/emitter/validate.go): when
+              # reason == OOMKilled the emitter refuses the incident unless
+              # resource_limits.memory_limit is non-null. It is populated from
+              # the pod spec by ResourcesFor -> quantityString, and
+              # quantityString returns "" for an absent OR zero quantity, which
+              # nullable() turns into JSON null. So this line is what makes the
+              # incident emittable at all. `64Mi` also matches the agent's
+              # Quantity pattern ^[0-9]+(\.[0-9]+)?(m|k|Ki|M|Mi|G|Gi|T|Ti|P|Pi)?$
+              # and survives resource.Quantity.String() unchanged as "64Mi".
+              memory: 64Mi
+              # No `requests` block, deliberately. See the report: a request
+              # would let the scheduler reserve 64Mi of allocatable and refuse to
+              # place the pod on a small node, turning a chaos run into a
+              # Pending pod — the exact silent-failure mode ROADMAP 4.1.5 exists
+              # to rule out. Absent request => QoS Burstable (not BestEffort,
+              # which would make this pod first in line for node-pressure
+              # eviction), and it emits memory_request: null, which the agent
+              # permits.
+
+          # No liveness or readiness probe. A probe would restart the container on
+          # a schedule the fixture does not control, and readiness is meaningless
+          # for a pod whose only goal is to die.
+          # No terminationGracePeriodSeconds: the default 30s applies, and it is
+          # irrelevant here — an OOM kill is SIGKILL from the cgroup, not a
+          # cooperative shutdown that could be waited out.

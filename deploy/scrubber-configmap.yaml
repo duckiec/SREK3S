@@ -8,7 +8,7 @@ metadata:
 data:
   scrubber.json: |
     {
-    "version": "1",
+      "version": "1",
       "rules": [
         {
           "id": "pem_private_key",

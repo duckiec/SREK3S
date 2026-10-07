@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srek3s-scrubber
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srek3s.partOf" . | nindent 4 }}
+data:
+  scrubber.json: |
+{{ .Files.Get "files/scrubber.json" | indent 4 }}

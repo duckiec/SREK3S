@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srek3s-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: srek3s-agent
+    {{- include "srek3s.partOf" . | nindent 4 }}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: srek3s-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: srek3s-agent
+        {{- include "srek3s.partOf" . | nindent 8 }}
+      annotations:
+        checksum/agent: "replaced-by-pipeline"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+        - name: agent
+          image: {{ .Values.images.agent.repository }}:{{ .Values.images.agent.tag }}
+          imagePullPolicy: {{ .Values.images.agent.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: TMPDIR
+              value: /tmp
+            - name: SREK3S_MAX_ACTIVE_JOBS
+              value: "4"
+            - name: SREK3S_LOG_LEVEL
+              value: INFO
+            - name: SREK3S_MANIFEST_ROOT
+              value: /manifests
+            - name: LLM_PROVIDER
+              value: nvidia
+            - name: LLM_BASE_URL
+              value: https://integrate.api.nvidia.com/v1
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: NVIDIA_API_KEY
+                  optional: true
+            - name: TELEGRAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: TELEGRAM_API_KEY
+                  optional: true
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: TELEGRAM_CHAT_ID
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: manifests
+              mountPath: /manifests
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              cpu: "1"
+              ephemeral-storage: "128Mi"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: manifests
+          emptyDir:
+            sizeLimit: 256Mi

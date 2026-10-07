@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srek3s-target-manifest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srek3s.partOf" . | nindent 4 }}
+data:
+  oom-leak.yaml: |
+{{ .Files.Get "files/oom-leak.yaml" | indent 4 }}
