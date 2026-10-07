@@ -1,0 +1,15 @@
+apiVersion: v2
+name: srek3s
+description: SREK3S zero-trust, read-only Kubernetes incident response agent
+type: application
+version: 0.1.0
+appVersion: "1.1.1"
+keywords:
+  - sre
+  - incident-response
+  - kubernetes
+maintainers:
+  - name: duckiec
+home: https://github.com/duckiec/SREK3S
+sources:
+  - https://github.com/duckiec/SREK3S

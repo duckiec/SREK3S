@@ -169,6 +169,10 @@ def _applied_manifests() -> list[tuple[pathlib.Path, dict[str, Any]]]:
         for path in sorted(root.rglob("*.y*ml")):
             if path.name == "kustomization.yaml":
                 continue  # not applied directly; its `resources:` are checked elsewhere
+            if "helm" in path.parts:
+                continue  # Helm templates render first; the rendered output,
+                # not the template, is what reaches the cluster. Covered by
+                # test_helm_chart.py instead.
             for document in load(path):
                 found.append((path, document))
     return found

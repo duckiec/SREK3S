@@ -1,0 +1,26 @@
+# SREK3S chart defaults. With these values `helm template` renders the same
+# objects as `kubectl kustomize deploy/base`. Override only what your cluster
+# requires.
+images:
+  sentinel:
+    repository: registry.internal/srek3s-sentinel
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  agent:
+    repository: registry.internal/srek3s-agent
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+sentinel:
+  # Namespace the informer watches. Defaults to the release namespace's own
+  # value, which is the namespace deploy/rbac.yaml actually grants. To observe
+  # more, change this AND grant the read verbs there with a RoleBinding
+  # referring back to the ServiceAccount. Never use a ClusterRole.
+  watchNamespace: srek3s-system
+
+networkPolicy:
+  # Service CIDRs the Sentinel may reach on 443. Defaults cover k3s and
+  # kubeadm. If your control plane sits elsewhere, replace this list.
+  apiServerCidrs:
+    - 10.43.0.0/16
+    - 10.96.0.0/12
