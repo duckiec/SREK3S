@@ -137,11 +137,11 @@ Ingress to the Agent is permitted only from pods labelled
 
 ## Not Wired
 
-**The post-remediation verification loop.** `agent/verify.py` implements it and is
-covered by `test_verify.py` and `test_verification_e2e.py`, including a live-k3s leg
-that applied a real diff and observed both verdicts. No production module imports it:
-`main.py` and `triage.py` do not, and `triage.py` emits `verification_policy` on the
-wire with no consumer. Open task `ENV-2.7`.
+**The post-remediation verification loop is removed.** `agent/verify.py` and its
+tests (`test_verify.py`, `test_verification_e2e.py`) were deleted: nothing in
+production imported them, and Tier-1 incidents close when the verified diff is
+handed to a human, not when a loop re-observes the workload. `triage.py` still
+emits `verification_policy` on the wire with no consumer.
 
 **Tier-1 auto-patching as deployed.** `SREK3S_MANIFEST_ROOT` mounts an `emptyDir`, so
 the manifest provider cannot resolve its target file. Every incident escalates to

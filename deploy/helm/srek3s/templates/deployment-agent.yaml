@@ -76,6 +76,16 @@ spec:
                   name: srek3s-secrets
                   key: TELEGRAM_CHAT_ID
                   optional: true
+            - name: SREK3S_GITOPS_REPO_URL
+              value: {{ .Values.agent.gitops.repoUrl | quote }}
+            - name: SREK3S_GITOPS_REF
+              value: {{ .Values.agent.gitops.ref | quote }}
+            - name: SREK3S_GITOPS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: srek3s-secrets
+                  key: GITOPS_TOKEN
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             privileged: false

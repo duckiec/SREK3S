@@ -47,7 +47,8 @@ from pydantic import ValidationError
 import triage
 from budget import JobBudget, budget_from_env
 import classifier
-from classifier import ManifestProvider, manifest_provider_from_env
+from classifier import ManifestProvider
+from gitops import materialise_manifest_root
 from notify import dispatcher_from_env
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner
 from models import IncidentPayload, TriageResponse
@@ -255,7 +256,7 @@ def create_app(
     application.state.manifest_provider = (
         manifest_provider
         if manifest_provider is not None
-        else manifest_provider_from_env()
+        else materialise_manifest_root()
     )
 
     # Constructed eagerly, not lazily: tests inspect the runner's peak-concurrency
