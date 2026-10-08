@@ -288,9 +288,7 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 
 	// Periodic stats. Ends with the process, and logs a final snapshot through the
 	// same path, so the last thing in the log before exit is the state at exit.
-	tickerDone := make(chan struct{})
 	go func() {
-		defer close(tickerDone)
 		ticker := time.NewTicker(MetricsInterval)
 		defer ticker.Stop()
 		for {
@@ -329,10 +327,8 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 			"grace", ShutdownGrace,
 			"in_flight", pool.Stats().InFlight,
 		)
-		close(tickerDone)
 		return errors.New("shutdown drain timed out")
 	}
-	close(tickerDone)
 
 	logStats(log, watcher.Stats(), pool.Stats())
 	log.Info("sentinel stopped cleanly",

@@ -622,6 +622,59 @@ func newTestClient(t *testing.T, server *httptest.Server) *Client {
 	return client
 }
 
+// TestEmitterTimeoutExceedsAgentWorstCase pins the cross-language HTTP contract.
+//
+// The Sentinel's deadline must exceed the agent's worst-case service time, or
+// every Tier-2 request is abandoned client-side before the agent has finished its
+// two sequential LLM calls. This was 5s against a 120s agent and the failure was
+// silent: incidents were delivered, verdicts discarded, everything escalated.
+func TestEmitterTimeoutExceedsAgentWorstCase(t *testing.T) {
+	t.Parallel()
+	if DefaultTimeout <= AgentMaxServiceTime {
+		t.Fatalf("DefaultTimeout = %v, must exceed AgentMaxServiceTime (%v); "+
+			"the agent makes two sequential %v LLM calls on the Tier-2 path",
+			DefaultTimeout, AgentMaxServiceTime, AgentMaxServiceTime/2)
+	}
+}
+
+// TestInjectedClientWithNoTimeoutStillDelivers is a regression test for a latent
+// defect: the per-attempt deadline was read back off c.http.Timeout instead of the
+// resolved Config.Timeout. An injected client with Timeout == 0 (which
+// httptest's client is) made context.WithTimeout(ctx, 0) return an already-
+// cancelled context, so every attempt failed instantly and no incident could ever
+// be delivered through a caller-supplied client.
+func TestInjectedClientWithNoTimeoutStillDelivers(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"TRIAGED"}`))
+	}))
+	defer server.Close()
+
+	// Deliberately Timeout: 0 on the injected client - the shape that used to
+	// produce an already-cancelled context on every attempt.
+	client, err := New(Config{
+		BaseURL:         server.URL,
+		HTTPClient:      server.Client(),
+		MaxAttempts:     1,
+		SentinelVersion: "0.1.0",
+		Now:             func() time.Time { return fixedDetection.Add(412 * time.Millisecond) },
+		Events:          goldenEvents,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := client.http.Timeout; got != 0 {
+		t.Fatalf("precondition: injected client Timeout = %v, want 0", got)
+	}
+
+	err = client.Emit(context.Background(), buildGolden(t))
+	if err != nil {
+		t.Fatalf("Emit through an injected zero-timeout client: %v", err)
+	}
+}
+
 func TestEmitPostsToTheCanonicalPath(t *testing.T) {
 	rec := &recorder{}
 	server := httptest.NewServer(rec.handler(http.StatusOK, `{"verdict":"tier_1"}`))

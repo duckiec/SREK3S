@@ -110,10 +110,10 @@ jobs:
     # same as not existing.
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -140,10 +140,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -316,10 +316,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           # Pinned exactly, not to a range. The runtime image is
           # python:3.11-slim (ARCH §2), and a floating 3.11.x would let the gate
@@ -655,19 +655,19 @@ jobs:
     # serialising them would make a red run ambiguous about which thing broke.
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # QEMU is what makes a foreign-architecture RUN instruction work. BuildKit
       # cannot execute `go build` or `apt-get install` for another CPU without it,
       # and the failure is a bare `exec format error` from inside a build step —
       # which reads as a broken Dockerfile rather than as a missing emulator.
       - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Show the buildx builder and its platforms
         run: docker buildx inspect --bootstrap
@@ -687,7 +687,7 @@ jobs:
       # likely of the two to fail: `pip install` resolves a full dependency tree
       # for a foreign architecture, which is where a missing wheel surfaces.
       - name: Dry-run build — agent (linux/amd64 + linux/arm64)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: agent/Dockerfile
@@ -697,7 +697,7 @@ jobs:
           tags: srek3s-agent:dry-run
 
       - name: Dry-run build — sentinel (linux/amd64 + linux/arm64)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: cmd/sentinel/Dockerfile

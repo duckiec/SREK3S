@@ -548,24 +548,24 @@ the workload is still OOMKilled after the merge, the verdict is `UNRESOLVED` wit
 cause `OOM_KILLED` and the action is `PROMOTE_TO_TIER_2` — a human, again, and
 now with evidence that the automated remediation was wrong.
 
-> **That last step is not wired into the running service.** The loop is
-> implemented — `agent/verify.py`, 741 lines, and it is genuinely good code: the
-> observation window is bounded twice, by a monotonic deadline *and* by a fixed
-> iteration count, so a stepped clock cannot extend it, and `RequeueBudget` is
-> deliberately not a rewindable counter. It is covered by
-> `agent/tests/test_verify.py` and `agent/tests/test_verification_e2e.py`, plus a
-> live-k3s leg that applied a real diff and observed both a `VERIFIED` and an
-> `UNRESOLVED` verdict.
+> **There is no automated post-remediation verification loop in this repository.**
+> `agent/verify.py`, `agent/tests/test_verify.py` and
+> `agent/tests/test_verification_e2e.py` were deleted; see
+> `docs/security-invariants.md` for the record. Nothing imports a verifier,
+> because none exists: `main.py` and `triage.py` reference no such module.
+> `triage.py` emits `verification_policy` on the wire, and no HTTP service reads
+> that field.
 >
-> **But no production module imports it.** `main.py` and `triage.py` do not.
-> `triage.py` emits `verification_policy` on the wire; nothing in the HTTP service
-> reads that field. So today the verification verdict is **yours** to produce — the
-> paragraph above describes the intended contract and the policy object you would
-> evaluate, not a loop that runs while you watch. Open task: `ENV-2.7`.
+> **So the verification verdict is yours to produce.** The paragraph above
+> describes the intended contract and the policy object you would evaluate, not a
+> loop that runs while you watch. Do not go looking for `verify.py`, and do not
+> copy an old revision of this runbook's commands: a `pytest` invocation naming a
+> deleted file exits non-zero with `ERROR: file or directory not found`, which is
+> easy to misread as a real failure. Open task: `ENV-2.7`.
 >
-> Nothing in §5's No-Autofix guarantee changes: a component nothing imports cannot
-> acquire authority, and the write-incapability of `verify.py` is asserted
-> independently.
+> Nothing in §5's No-Autofix guarantee changes: the guarantees that hold are the
+> RBAC `Role` (no mutating verb reaches the apiserver), the agent's
+> `automountServiceAccountToken: false`, and the `extra="forbid"` wire contract.
 
 ---
 
@@ -637,20 +637,20 @@ marks the agent box a trust boundary and §2 records that it holds no cluster
 credential. It reaches the filesystem to read manifests for patch generation and
 nothing else. There is no verb to widen, because there is no identity.
 
-`agent/verify.py` makes this structural rather than aspirational. Its only
-capability is `ObservationReader.read`, a one-method `Protocol` that returns a
-value. It has no write verb, no Kubernetes client, no subprocess, no socket and no
-filesystem access — and `TestZeroWrites` asserts that by walking the module's
-**AST** for forbidden imports and for any mutating verb in a call-target or
-attribute position.
+Two layers make this structural rather than aspirational, and neither is
+`agent/verify.py` — that module, and the AST test that walked it, were deleted
+([§4](#4-reviewing-a-tier-1-gitops-pr)); do not cite them.
 
-Two notes so this citation is not read for more than it says. First, that module
-is **not wired into the service** — nothing in `main.py` or `triage.py` imports it,
-so the post-remediation loop is unreachable today ([§4](#4-reviewing-a-tier-1-gitops-pr)).
-That makes the guarantee *stronger*, not weaker: a component nothing imports cannot
-acquire authority. Second, the argument does not rest on `verify.py` alone. The
-agent's `ServiceAccount` automount is `false` in `deploy/agent.yaml`, so it holds
-no token to widen in the first place.
+**Layer 2a — there is no token to widen.** The agent's `ServiceAccount` automount
+is `false` in `deploy/agent.yaml`, and it names no `serviceAccountName` at all, so
+it holds no cluster credential by either route. `kubectl auth can-i` run as that
+identity returns `no` for every verb, because the identity does not exist.
+
+**Layer 2b — the only cluster-facing process has an enumerated Role.** The
+Sentinel's `Role` in `deploy/rbac.yaml` names only `get`, `list` and `watch`, and
+`internal/deploy/rbac_hardening_test.go` fails the build if any other verb appears
+in that file. `pods/log` is a separate subresource, so omitting it would be a
+silent failure — incidents would arrive with no logs rather than an error.
 
 ### Layer 3 — The response schema cannot express a write
 
@@ -686,11 +686,11 @@ Run the check. Do not read it and believe it:
 # Layer 1 - the RBAC manifest has no write verbs.
 go test ./internal/deploy/ -run TestSentinelRoleGrantsNoMutatingVerb -v
 
-# Layer 2 - the verification loop cannot write.
-~/SREK3S/.venv311/bin/python -m pytest agent/tests/test_verify.py -k ZeroWrites -v
+# Layer 2 - the agent is issued no ServiceAccount token at all.
+grep -n "automountServiceAccountToken" deploy/agent.yaml
 
 # Layer 2, at runtime rather than statically.
-~/SREK3S/.venv311/bin/python -m pytest agent/tests/test_verify.py -k RuntimeTripwire -v
+make test
 ```
 
 The `~/SREK3S/.venv311/bin/python -m` prefix is this host's requirement, not

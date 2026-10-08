@@ -294,10 +294,10 @@ for A includes fixture pods *starting*, not merely the tag existing.
 ## Apply
 
 ```bash
-# kustomize preserves the resource order in deploy/kustomization.yaml: namespace,
-# then RBAC, then the workloads. A Role applied before its Namespace exists fails
-# with "namespace not found", which is why that file is ordered by hand rather
-# than alphabetically.
+# Kustomize does NOT order resources, and `kubectl apply -k` sends them in the
+# order the API receives them - which is why deploy/kustomization.yaml lists them
+# by hand rather than alphabetically. A Role applied before its Namespace exists
+# fails with "namespace not found".
 # `sudo` on a k3s-installed host: /etc/rancher/k3s/k3s.yaml is 0600 and root-owned.
 sudo kubectl apply -k deploy/
 
@@ -305,30 +305,57 @@ sudo kubectl -n srek3s-system rollout status deployment/srek3s-sentinel --timeou
 sudo kubectl -n srek3s-system rollout status deployment/srek3s-agent    --timeout=120s
 ```
 
-Expect `deploy/` to come up **silent**, and know why before you go looking: with
-`WATCH_NAMESPACE: ""` against a `Role` scoped to `srek3s-system`, the Sentinel is
-refused the cluster-wide `LIST` it asks for. That is `docs/runbook.md` §1's open
-defect, it is a real one, and it is not a consequence of the image install. The
+Expect `deploy/` to come up with **no errors** in the Sentinel's log. The shipped
+`WATCH_NAMESPACE` is `srek3s-system`, which is the namespace `deploy/rbac.yaml`
+actually grants, so the shipped watch scope and the shipped read authority agree
+and the informer's `LIST` is authorised. An earlier revision of this page claimed
+the value shipped empty and told you to expect a silent, watching-nothing
+Sentinel; that was true of the old manifests and is **not** true of these. The
 rollouts above reaching ready is a statement about images and manifests only.
 
 ## Confirm the hardening actually took effect
 
+**The Sentinel image is `gcr.io/distroless/static-debian12`. It has no shell, no
+coreutils, and no `wget`.** Every `kubectl exec ... -- <binary>` form below
+therefore fails with `exec: "id": executable file not found in $PATH` — which is
+byte-for-byte indistinguishable from a pod that is not running at all. A previous
+revision of this page used those forms, and a CI revision of the same check
+swallowed the error and reported `in-cluster uid: unknown`: a **false accusation
+of a real hardening failure** against a correctly hardened pod. Do not run them.
+
+Observe the running process from its own startup log instead, which is what the
+in-cluster leg now does:
+
 ```bash
-# The effective UID must be 10001. This is the same assertion the CI container
-# smoke test makes, and it is the one field a manifest typo would silently lose:
-# `runAsNonRoot: true` with no `runAsUser` runs as the image's user, and a
-# Dockerfile edit that dropped USER would change that with no manifest diff.
-sudo kubectl -n srek3s-system exec deploy/srek3s-sentinel -- id -u   # => 10001
+# The effective UID/GID must be 10001. The Sentinel logs both at startup, so this
+# is the assertion that would otherwise have been made with `id -u`:
+#   runAsNonRoot: true with no runAsUser runs as the image's user, and a Dockerfile
+#   edit that dropped USER would change that with no manifest diff.
+sudo kubectl -n srek3s-system logs deploy/srek3s-sentinel | grep '"uid":10001'
+# => "msg":"sentinel starting" ... "uid":10001,"gid":10001
 
-# The read-only root filesystem is observable: the sentinel writes only to /tmp,
-# so an attempt to write elsewhere must fail.
-sudo kubectl -n srek3s-system exec deploy/srek3s-sentinel -- sh -c 'touch /root/x'  # must fail
+# The watch scope is reported by the Sentinel itself. Its presence is what
+# distinguishes a namespace-scoped watcher from a cluster-wide one:
+sudo kubectl -n srek3s-system logs deploy/srek3s-sentinel | grep '"msg":"watching one namespace"'
+```
 
-# And the RBAC must be read-only. A rejected write is the proof; a successful one
-# is an incident.
-sudo kubectl -n srek3s-system exec deploy/srek3s-sentinel -- \
-  sh -c 'wget -qO- --post-data="" http://localhost:6443/api/v1/namespaces/default/pods'
-# => a 403 with "forbidden: ... cannot create resource"
+For the two checks that need a shell, target the **agent**, whose image is
+`python:3.11-slim` and does have one:
+
+```bash
+# The read-only root filesystem is observable: the agent writes only to /tmp.
+sudo kubectl -n srek3s-system exec deploy/srek3s-agent -- sh -c 'touch /root/x'  # must fail
+```
+
+The read-only RBAC is proven from **outside** the pod, as the identity the
+Sentinel actually uses, not from inside it:
+
+```bash
+SA=system:serviceaccount:srek3s-system:srek3s-sentinel
+for verb in create patch update delete; do
+  sudo kubectl auth can-i "$verb" pods -n srek3s-system --as="$SA"   # => no
+done
+# A rejected write is the proof; a "yes" is an incident.
 ```
 
 ## Rollback

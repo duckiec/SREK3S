@@ -6,10 +6,32 @@ stated once here; no other section restates them.
 ## The Sentinel cannot mutate the cluster
 
 The Sentinel's ServiceAccount binds a namespaced `Role` granting exactly
-`["get", "list", "watch"]` on `pods`, `pods/log`, `pods/status`, `events`,
-`deployments` and `replicasets`. There is no `ClusterRole` and no
-`ClusterRoleBinding`. `pods/log` is listed as a separate subresource: omitting it does
-not error, it makes every incident arrive without logs.
+`["get", "list", "watch"]` on three rule groups, verbatim from `deploy/rbac.yaml` —
+the file of record, which is what this paragraph must be read against:
+
+```yaml
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+```
+
+There is no `ClusterRole` and no `ClusterRoleBinding`. Note there is **no**
+`pods/status`: an earlier revision of this document claimed it, which was wrong
+and is exactly the drift this paragraph exists to prevent. `pods/log` is listed as
+a separate subresource: omitting it does not error, it makes every incident arrive
+without logs.
+
+Three documents used to state three different grants for this Role
+(`docs/security-invariants.md` claimed `pods/status`, `CONTRIBUTING.md` omitted
+the `apps` rule entirely, and `.ai/INVARIANTS.md` repeated the `pods/status`
+error). `deploy/rbac.yaml` is the single source of truth; these documents
+restate it and must be corrected when it changes.
 
 The Agent mounts no ServiceAccount token at all
 (`automountServiceAccountToken: false`).

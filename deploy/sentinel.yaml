@@ -25,6 +25,14 @@ spec:
   # failover window; at one replica it is not needed.
   replicas: 1
   revisionHistoryLimit: 3
+  strategy:
+    # Recreate, not RollingUpdate. There is exactly one replica by design, and
+    # two watchers would double-emit every incident (the informer's dedup cache
+    # is per-process, so each admits the same failure and the agent triaged
+    # it twice). RollingUpdate's default maxUnavailable=0/maxSurge=1 would
+    # start the new pod BEFORE killing the old one — i.e. it engineers the
+    # exact two-watcher window this manifest's design exists to avoid.
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: srek3s-sentinel

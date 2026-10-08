@@ -128,6 +128,93 @@ def name_of(step: dict[str, Any]) -> str:
     return str(step.get("name", step.get("uses", "?")))
 
 
+def _join_continuations(script: str) -> str:
+    """Fold `\\`-continued shell lines into one logical line.
+
+    A wrapped pipeline puts its `|` on a line of its own, which is what let a
+    `grep -q` SIGPIPE race hide from check 6: the line carrying the pipe had no
+    producer on it, so the check skipped it. Joining before scanning closes that,
+    and it is the only way to see the pipeline the shell will actually run.
+
+    Lines whose trailing character is a single backslash - not an escaped
+    backslash - are joined to the next line with a single space.
+    """
+    out: list[str] = []
+    for raw in script.split("\n"):
+        stripped = raw.rstrip()
+        if out and _is_continued(out[-1]):
+            # Extend the ACCUMULATED line (out[-1]) with this one. The trailing
+            # backslash belongs to out[-1], so that is what gets stripped.
+            out[-1] = out[-1][:-1].rstrip() + " " + stripped.lstrip()
+            continue
+        out.append(stripped)
+    return "\n".join(out)
+
+
+def _is_continued(line: str) -> bool:
+    """True when `line` ends with an odd number of backslashes."""
+    trailing = len(line) - len(line.rstrip("\\"))
+    return trailing % 2 == 1
+
+
+def check_actions_pinned(job_name: str, job: dict[str, Any], audit: Audit) -> None:
+    """Require every third-party action to be pinned to a full commit SHA.
+
+    `uses: actions/checkout@v7` names a MUTABLE ref. Whoever controls that tag
+    controls what executes in this repository's CI - and release.yaml holds
+    `packages: write`, so the blast radius is package publishing, not just a
+    read-only build. A tag is a pointer; a 40-hex SHA is the commit.
+
+    The version comment after the SHA is what makes the pin maintainable, so its
+    absence is also a finding: a bare SHA with no version cannot be reviewed by
+    eye, and Dependabot updates the pair. That half cannot be checked here,
+    because YAML parses `# v7` as a COMMENT and strips it - so it lives in
+    check_actions_pin_comments, which reads the raw source text.
+    """
+    for step in job.get("steps", []):
+        uses = step.get("uses")
+        if not uses or str(uses).startswith("./"):
+            # A local composite action is part of this repository and cannot move.
+            continue
+        ref = str(uses).split("@", 1)[-1]
+        if re.fullmatch(r"[0-9a-f]{40}", ref):
+            continue
+        audit.add(
+            "7-pinned-shas",
+            "FAIL",
+            "{}: uses `{}` - a mutable ref. Pin to a full 40-character commit SHA "
+            "with a version comment, e.g. `uses: actions/checkout@<sha> # v7`".format(
+                name_of(step), uses
+            ),
+        )
+
+
+def check_actions_pin_comments(path: pathlib.Path, audit: Audit) -> None:
+    """Require a `# vX.Y.Z` comment beside every pinned action SHA.
+
+    A bare 40-hex SHA is immutable but unreviewable: nothing in the diff says
+    which release it names, and Dependabot bumps the SHA and the comment as a
+    pair. Read from the RAW source, because the parsed document cannot see it.
+    """
+    pattern = re.compile(
+        r"^\s*(?:-\s*)?uses:\s*([^\s#]+@[0-9a-f]{40})\s*(?:#\s*(\S+))?\s*$"
+    )
+    for number, raw in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        match = pattern.match(raw)
+        if match is None or match.group(2) is not None:
+            continue
+        audit.add(
+            "7-pin-comments",
+            "FAIL",
+            "{}:{}: `{}` is pinned to a SHA with no `# vX.Y.Z` version comment, "
+            "so the pin cannot be reviewed by eye or bumped safely".format(
+                path.name, number, match.group(1)
+            ),
+        )
+
+
 def index_of(steps: list[dict[str, Any]], predicate: Any) -> int:
     for i, step in enumerate(steps):
         if predicate(step):
@@ -472,16 +559,28 @@ def check_grep_q_pipefail_race(
             # Without pipefail the writer's 141 is discarded and the check
             # behaves. Flagging it anyway would bury the real finding.
             continue
-        for index, line in enumerate(run.split("\n"), start=1):
+        for index, line in enumerate(_join_continuations(run).split("\n"), start=1):
             stripped = line.strip()
             if stripped.startswith("#"):
                 continue
             if not re.search(r"\|\s*(?:sudo\s+)?grep\s+-[A-Za-z]*q", stripped):
                 continue
             # `grep -q` as the last element of a pipeline fed by a command.
-            # `cmd | grep -q` and `cmd \\\n  | grep -q` both land here once the
-            # continuation is joined, which is why the match is on the pipe
-            # rather than on a whole-line shape.
+            #
+            # Continuation lines are joined FIRST (see _join_continuations). The
+            # previous version iterated the raw lines and then asked for the
+            # producer as `stripped.split("|", 1)[0]`. For the extremely common
+            # wrapped form
+            #
+            #     kubectl ... \
+            #         | grep -q "watching one namespace" || {
+            #
+            # the line holding the pipe has an EMPTY producer, so the check
+            # `continue`d and never flagged it - while its own comment claimed
+            # both spellings "land here once the continuation is joined". Nothing
+            # joined them. Two steps in e2e-detonation.yaml were in exactly that
+            # shape, so the SIGPIPE race this function exists to eliminate was
+            # live in the committed workflow and the audit reported it clean.
             producer = stripped.split("|", 1)[0].strip()
             if not producer or producer.startswith("{"):
                 continue
@@ -632,12 +731,14 @@ def main(argv: list[str] | None = None) -> int:
     for path in workflows:
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
         print(f"\n########## {path.name} ##########")
+        check_actions_pin_comments(path, audit)
         for job_name, job in doc.get("jobs", {}).items():
             audit_job(job_name, job, audit)
             check_bash_syntax(job_name, job, audit)
             check_grep_q_pipefail_race(job_name, job, audit)
             check_multicommand_if(job_name, job, audit)
             check_agent_url_is_a_root(job_name, job, audit)
+            check_actions_pinned(job_name, job, audit)
 
     print("\n=== findings ===")
     print(audit.report())

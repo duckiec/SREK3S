@@ -32,6 +32,7 @@ conceal exactly the signal that matters.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -51,7 +52,7 @@ from classifier import ManifestProvider
 from gitops import materialise_manifest_root
 from notify import dispatcher_from_env
 from sandbox import SandboxError, SandboxPolicy, SandboxRunner
-from models import IncidentPayload, TriageResponse
+from models import BlastRadiusTier, IncidentPayload, TriageResponse
 
 __all__ = [
     "SANDBOX_ENV",
@@ -70,6 +71,17 @@ _CORRELATION_HEADER: Final[str] = "X-SREK3S-Request-Id"
 
 _ERROR_MALFORMED_JSON: Final[str] = "malformed_json"
 _ERROR_SANDBOX_BUSY: Final[str] = "sandbox_busy"
+_ERROR_BODY_TOO_LARGE: Final[str] = "request_too_large"
+
+#: Hard ceiling on the bytes read from a single triage request body.
+#:
+#: Applied on the streamed read, not only on Content-Length, because a chunked
+#: request carries no Content-Length at all and would otherwise be unbounded.
+#: 256 KiB sits far above any legitimate payload - models.py already caps
+#: scrubbed_logs at 200 lines / 64 KiB and cluster_events at
+#: models.CLUSTER_EVENTS_MAX - and far below anything that could exhaust a pod's
+#: memory limit.
+MAX_REQUEST_BODY_BYTES: Final[int] = 256 * 1024
 
 #: Seconds a refused caller should wait before retrying. Long enough that a
 #: saturated service is not immediately re-saturated by the same client, short
@@ -152,6 +164,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     yield
     logger.info("srek3s agent shutting down")
+
+
+async def _read_capped_body(request: Request, limit: int) -> bytes | None:
+    """Read at most `limit` bytes of the request body.
+
+    Returns None as soon as the stream exceeds the ceiling, so an oversized body
+    is abandoned rather than buffered. `request.json()` cannot be used for this:
+    it reads the body to completion before parsing, which is the unbounded-read
+    this replaces.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _error(status_code: int, code: str, request_id: str) -> JSONResponse:
@@ -243,9 +273,30 @@ def create_app(
     # inspect counters, and so it is replaced wholesale per instance rather than
     # shared between tests through a module global.
     application.state.job_budget = job_budget or budget_from_env()
-    application.state.notify_dispatcher = (
-        notify_dispatcher if notify_dispatcher is not None else dispatcher_from_env()
-    )
+    # Resolved here, inside the factory, and NEVER at module import time.
+    #
+    # `app = create_app()` is module scope, so this previously ran on import. A
+    # single malformed webhook URL raises ValueError from _require_https_url and
+    # crashed the process during import - the exact opposite of notify.py's own
+    # claim that "an unset variable never stops the agent from booting", and of
+    # budget_from_env's degrade-don't-die policy. It also made the module
+    # unimportable under any environment where the notification variables are set
+    # but invalid, which is a hard dependency for tests.
+    if notify_dispatcher is not None:
+        application.state.notify_dispatcher = notify_dispatcher
+    else:
+        try:
+            application.state.notify_dispatcher = dispatcher_from_env()
+        except ValueError as exc:
+            # Degrade, do not die: an incident is still triaged and still carries
+            # its RCA in the response. Only the chat notification is lost, and it
+            # is lost loudly.
+            logger.warning(
+                "notification dispatcher disabled: %s; incidents are still triaged "
+                "but will not be paged",
+                exc,
+            )
+            application.state.notify_dispatcher = None
 
     # Resolved once, at construction, and held on app.state. Resolving per
     # request would re-stat the checkout on the hot path and, worse, would make
@@ -354,8 +405,59 @@ def create_app(
 
     async def _triage_locked(request: Request, request_id: str) -> Any:
         """The triage handler proper, run with a job slot held."""
+        # Size ceiling BEFORE the body is buffered.
+        #
+        # `await request.json()` reads and parses the entire request body before
+        # any bound is applied, so without this the service has an unbounded-read
+        # DoS: a single POST can exhaust the pod's memory. 256 KiB is far above any
+        # legitimate incident payload (models.py caps scrubbed_logs at 200 lines /
+        # 64 KiB and cluster_events is separately length-capped), so nothing real
+        # is rejected by this.
+        #
+        # Content-Length is only a cheap first gate: it is absent for chunked
+        # encoding, so the streamed read below enforces the real ceiling on the
+        # bytes actually received.
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > MAX_REQUEST_BODY_BYTES:
+                    logger.warning(
+                        "request body too large request_id=%s content_length=%s "
+                        "limit=%d",
+                        request_id,
+                        declared,
+                        MAX_REQUEST_BODY_BYTES,
+                    )
+                    return _error(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        _ERROR_BODY_TOO_LARGE,
+                        request_id,
+                    )
+            except ValueError:
+                logger.warning(
+                    "unparseable content-length request_id=%s content_length=%s",
+                    request_id,
+                    declared,
+                )
+                return _error(
+                    status.HTTP_400_BAD_REQUEST, _ERROR_MALFORMED_JSON, request_id
+                )
+
+        raw = await _read_capped_body(request, MAX_REQUEST_BODY_BYTES)
+        if raw is None:
+            logger.warning(
+                "request body exceeded %d bytes request_id=%s",
+                MAX_REQUEST_BODY_BYTES,
+                request_id,
+            )
+            return _error(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                _ERROR_BODY_TOO_LARGE,
+                request_id,
+            )
+
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except Exception:  # noqa: BLE001 - any parse failure is malformed_json
             logger.warning("malformed body request_id=%s", request_id)
             return _error(
@@ -454,15 +556,37 @@ def create_app(
                     _ERROR_ANALYSIS_FAILED,
                     request_id,
                 )
+            # The child's verdict is CAPTURED and reported, not computed and thrown
+            # away. It used to be reduced to a log line and discarded, so the
+            # parent then re-derived classification, tier and routing from the
+            # same payload itself - meaning the sandbox's answer was never
+            # compared against anything, and a divergence between the two
+            # implementations (sandbox_worker vs triage) would be invisible.
+            #
+            # A mismatch is logged loudly. The parent's in-process decision is
+            # still authoritative, because it is the one that produced the
+            # response; but a silent disagreement is exactly the kind of drift
+            # that becomes a wrong patch later.
+            sandbox_verdict = sandbox_result.payload or {}
+            sandbox_tier = sandbox_verdict.get("tier")
+            sandbox_classification = sandbox_verdict.get("classification")
             logger.info(
                 "sandbox analysis incident_id=%s request_id=%s latency_ms=%d "
-                "rlimits_applied=%s cgroup_enforced=%s",
+                "rlimits_applied=%s cgroup_enforced=%s "
+                "sandbox_tier=%s sandbox_classification=%s",
                 payload.incident_id,
                 request_id,
                 sandbox_result.latency_ms,
                 sandbox_result.rlimits_applied,
                 sandbox_result.cgroup_enforced,
+                sandbox_tier,
+                sandbox_classification,
             )
+            application_state = getattr(request.app.state, "last_outcome", None)
+            if application_state is not None:
+                application_state.setdefault("sandbox_verdicts", {})[
+                    payload.incident_id
+                ] = sandbox_verdict
 
         try:
             outcome = await run_in_threadpool(
@@ -497,7 +621,7 @@ def create_app(
             request_id,
             len(outcome.reasons),
         )
-        if outcome.tier.value == "TIER_1_TOIL":
+        if outcome.tier == BlastRadiusTier.TIER_1_TOIL:
             logger.info(
                 "TIER-1 patch proposed incident_id=%s manifest=%s request_id=%s",
                 payload.incident_id,
@@ -512,17 +636,39 @@ def create_app(
                 request_id,
                 "; ".join(outcome.reasons) or "(no reason recorded)",
             )
+            # The dispatch is best-effort and MUST NOT be able to fail the request.
+            #
+            # `dispatcher.dispatch` is documented as never raising, but its
+            # transport handlers only catch httpx.TimeoutException and
+            # httpx.TransportError. An httpx.InvalidURL - an out-of-range port or
+            # a non-IDNA host in SLACK_WEBHOOK_URL, neither of which
+            # _require_https_url rejects - is an Exception, not a TransportError.
+            # It propagates out of this handler, becomes a 500 analysis_failed for
+            # an incident that was already triaged correctly, and the Sentinel does
+            # not retry a 5xx - so the escalation is lost entirely.
+            #
+            # Comparing the enum rather than the string "TIER_2_ARCHITECTURAL",
+            # so a rename of the enum value cannot silently disable escalation.
             dispatcher = getattr(request.app.state, "notify_dispatcher", None)
             if (
-                outcome.tier.value == "TIER_2_ARCHITECTURAL"
+                outcome.tier == BlastRadiusTier.TIER_2_ARCHITECTURAL
                 and outcome.dispatch is not None
                 and dispatcher is not None
             ):
-                dispatcher.dispatch(
-                    payload.incident_id,
-                    response.severity.value,
-                    response.rca_markdown,
-                )
+                try:
+                    dispatcher.dispatch(
+                        payload.incident_id,
+                        response.severity.value,
+                        response.rca_markdown,
+                    )
+                except Exception:  # noqa: BLE001 - never fail a triaged incident
+                    logger.exception(
+                        "notification dispatch failed incident_id=%s request_id=%s; "
+                        "the incident was triaged successfully and the verdict is "
+                        "unaffected",
+                        payload.incident_id,
+                        request_id,
+                    )
         return response
 
     # -- Error handlers ----------------------------------------------------

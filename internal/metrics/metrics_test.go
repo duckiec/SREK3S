@@ -1,11 +1,13 @@
 package metrics
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -49,6 +51,21 @@ func TestMetricsEndpointServesCounters(t *testing.T) {
 
 	if got := testutil.ToFloat64(r.IncidentsIntercepted); got != 1 {
 		t.Errorf("intercepted = %v, want 1", got)
+	}
+}
+
+// TestServeShutdownDoesNotPanic is a regression test for the double
+// close(done) panic that fired on every SIGTERM. The metrics goroutine and
+// Serve both closed the same channel.
+func TestServeShutdownDoesNotPanic(t *testing.T) {
+	r := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	if err := r.Serve(ctx, nil); err != nil {
+		t.Fatalf("Serve: %v", err)
 	}
 }
 

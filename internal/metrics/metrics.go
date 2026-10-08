@@ -77,10 +77,7 @@ func (r *Registry) Serve(ctx context.Context, log *slog.Logger) error {
 		Handler:           r.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	done := make(chan struct{})
-	defer close(done)
 	go func() {
-		defer close(done)
 		select {
 		case <-ctx.Done():
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
