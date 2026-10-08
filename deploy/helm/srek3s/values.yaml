@@ -19,6 +19,21 @@ sentinel:
   watchNamespace: srek3s-system
 
 agent:
+  # Repository-relative path, inside the cloned GitOps checkout, of the manifest
+  # this agent is allowed to patch.
+  #
+  # Left empty by default, which means the agent falls back to
+  # classifier.DEFAULT_TARGET_MANIFEST. That default is
+  # "deploy/payments/checkout-api.yaml", which does not exist in this
+  # repository, so an unset value makes every incident escalate under I-B2 with
+  # the reason "target manifest is unreadable" - a message that reads like a
+  # broken checkout rather than a missing configuration key.
+  #
+  # Set it whenever agent.gitops.repoUrl is set, e.g.
+  #   --set agent.gitops.repoUrl=https://github.com/duckiec/SREK3S.git \
+  #   --set agent.targetManifest=deploy/chaos/oom-leak.yaml
+  # and Tier-1 becomes reachable. The path must also be present in the checkout.
+  targetManifest: ""
   gitops:
     # Repository to clone at startup for Tier-1 verification. Empty means
     # the existing behaviour: SREK3S_MANIFEST_ROOT if mounted, otherwise
