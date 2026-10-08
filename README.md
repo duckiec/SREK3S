@@ -2,74 +2,145 @@
   <img src="docs/assets/banner.svg" alt="SREK3S banner: the project mark and wordmark" width="100%" />
   <br />
   <p>
-    <a href="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main" alt="CI" /></a> <a href="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg" alt="Release" /></a> <a href="https://github.com/duckiec/SREK3S"><img src="https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-4655db" alt="Multi-arch" /></a> <a href="https://go.dev"><img src="https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go" alt="Go" /></a> <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11-3776AB?logo=python" alt="Python" /></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a> <a href="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml"><img src="https://img.shields.io/badge/tests-1087%20passed%20%7C%20179%20go-success" alt="Tests" /></a>
+    <a href="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/ci.yaml/badge.svg?branch=main" alt="CI" /></a> <a href="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml"><img src="https://github.com/duckiec/SREK3S/actions/workflows/release.yaml/badge.svg" alt="Release" /></a> <a href="https://github.com/duckiec/SREK3S"><img src="https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-4655db" alt="Multi-arch" /></a> <a href="https://go.dev"><img src="https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go" alt="Go" /></a> <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11-3776AB?logo=python" alt="Python" /></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
   </p>
 </div>
 
-Most Kubernetes AI agents are a rootkit waiting to happen. They demand cluster-admin rights and stream raw stdout to external LLM APIs. SREK3S is a zero-trust, read-only incident response agent. It intercepts pod crashes, scrubs secrets in-memory before network egress, and sandboxes LLM triage in a POSIX-jailed worker. It generates verified GitOps patches with strictly zero cluster write authority and deterministically fails closed to human review.
+# SREK3S
 
-## Features
+## Secret-safe, read-only Kubernetes incident triage
 
-- **Zero cluster mutations**: namespaced `get`/`list`/`watch` only. No ClusterRole, no write field on either wire contract, no mounted token on the Agent.
-- **In-memory secret scrubbing**: 11 ordered regex rules run before egress. Nothing unmasked reaches a queue, a disk, or a socket.
-- **AST YAML validation**: a patch survives a YAML AST parse, then `git apply --check` against the target's own bytes.
-- **Deterministic Tier-2 escalation**: tier, patch, and every flag are computed before a model is consulted. Tier-2 carries no patch, unrepresentably.
-- **POSIX-jailed triage worker**: `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_CORE` set before `exec`, unraisable inside.
-- **Nine providers, three protocols**: Gemini, Anthropic Messages, OpenAI chat-completions. No credential degrades to deterministic prose.
+SREK3S watches for pod failures, scrubs credentials **in memory before anything
+leaves the node**, and produces a reviewable Git patch you can merge yourself. It
+holds a namespaced `get`/`list`/`watch` Role and nothing else — no ClusterRole, no
+write verb on either wire contract, and no ServiceAccount token mounted in the
+component that talks to the model.
 
-Full detail in [`docs/security-invariants.md`](docs/security-invariants.md).
+## See it in 60 seconds
 
-## Demo
-
-![SREK3S In-Memory Redaction & Fail-Closed Triage](docs/assets/demo.gif)
-
-*Live execution: A pod leaking an AWS Secret Access Key to container logs is intercepted and scrubbed in-memory by the Go Sentinel before network egress. The Python Agent applies POSIX sandboxing and YAML AST validation, rejecting hallucinated remedies and failing closed to Tier-2 architectural review.*
-
-## Quick Start
-
-Prerequisites: `git`, `kubectl`, and a cluster you can write to. For local development, Go 1.25+, Python 3.11, and Docker with buildx.
+![SREK3S in-memory redaction and fail-closed triage](docs/assets/demo.gif)
 
 ```bash
 git clone https://github.com/duckiec/SREK3S.git && cd SREK3S
+make demo
+```
 
-# Deploy SREK3S to any k8s/k3s cluster using prebuilt multi-arch images
+`make demo` runs three steps, and prints what each one is before it happens:
+
+| Step | What it does |
+|---|---|
+| `throwaway-up` | Starts a disposable k3s cluster in Docker, on its own bridge network |
+| `throwaway-wait` | Blocks until the node is Ready **and** cluster DNS resolves |
+| `throwaway-detonate` | Builds both images, installs the chart, applies a real OOMKill fixture, waits for triage, then asserts |
+
+**Your kubectl context is never switched.** Every command is pinned to
+`KUBECONFIG=/tmp/k3s-throwaway.yaml`, so a production kubeconfig you already have
+loaded stays loaded and stays untouched. Nothing is applied to any cluster except
+the throwaway, and no cluster-admin rights are needed anywhere in this repository.
+
+It ends with assertions, not a screenshot:
+
+```
+===================== ASSERTIONS ====================
+  [ok] sentinel emitted 3 incident(s)
+  [ok] agent triaged (3 verdict(s))
+  [ok] GitOps checkout succeeded (3 Tier-1 verdict(s))
+```
+
+Clean up with `make throwaway-down`.
+
+## Why SREK3S?
+
+**It fails closed, and the failure is unrepresentable.** Tier selection, the patch,
+and every validation flag are computed deterministically *before* a model is
+consulted. A `TIER_2_ARCHITECTURAL` response carrying a patch raises rather than
+being discouraged (`I-B1`), so a hallucinated remedy has nowhere to land. A system
+that proposes a patch it cannot prove is worse than one that stays quiet.
+
+**The read-only claim is checkable, not rhetorical.** The Sentinel's Role grants
+exactly `["get", "list", "watch"]` on `pods`, `pods/log` and `events`. The Agent
+sets `automountServiceAccountToken: false` and mounts no token at all. Neither
+contract has a field capable of expressing a write verb (`I-B5`), so a patch
+cannot carry one through the model.
+
+**Tier-1 and Tier-2 are deterministic, not a confidence score.** `TIER_1_TOIL` means
+the remedy was enumerated in advance — one manifest, one resource field, no code or
+image change — and then survived a YAML AST parse *and* `git apply --check`
+against the target's own bytes. Anything ambiguous is `TIER_2_ARCHITECTURAL`, which
+carries no patch at all.
+
+**Secrets are masked before egress, not after.** Eleven ordered rules run on the
+Go node in memory. Nothing unmasked reaches a queue, a disk, or a socket. Redaction
+is selective within the match, so `postgres://checkout:[REDACTED]@db-primary:5432/prod`
+keeps the host, port, database and user that the diagnosis depends on.
+
+**A bad log message stops the Sentinel; a bad log level does not.** A scrubber that
+fails to load means the guarantees no longer hold, so boot refuses. An unparseable
+`LOG_LEVEL` degrades to `INFO` with a comment explaining why. The distinction is
+the product: fail closed where silence would be a security defect, degrade loudly
+everywhere else.
+
+## Visual evidence
+
+[`examples/oom-recalibration/`](examples/oom-recalibration/) is one real incident,
+captured off the wire end to end: the crashing pod's log with a planted credential
+intact, the scrubbed payload that actually crossed, the Tier-1 decision, and the
+diff it produced — `memory: 64Mi` → `memory: 128Mi`, with `patch_validated: true`.
+Every byte is from a live run. Reproduce it with `make demo`.
+
+## Installation
+
+```bash
 kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/overlays/quickstart \
   | kubectl apply -f -
 ```
 
-Detonation: a real crashing workload with a planted credential.
+The Agent runs with `automountServiceAccountToken: false` and holds no token; only
+the Sentinel mounts one, and only to read.
 
-```bash
-make deploy-overlay OVERLAY=deploy/overlays/quickstart-live  # scope the Sentinel to the chaos namespace
-make chaos            # deploy the real-crash fixture
+The default install reaches `TIER_2_ARCHITECTURAL` for every incident. That is the
+designed safe state, not a misconfiguration — `agent.targetManifest` is the gate,
+and [`docs/security-invariants.md`](docs/security-invariants.md) explains why an
+empty target and a broken target look identical from the outside.
 
-# the raw container log, credential intact — this is the input
-kubectl -n sentinel-chaos logs deploy/real-crash | grep AWS_SECRET
+Prerequisites: `git`, `kubectl`, and a cluster you can write to.
 
-# the Sentinel's output, credential masked — this is what egress carries
-kubectl -n srek3s-system logs deploy/srek3s-sentinel -f | grep stats
+## Documentation
 
-make clean             # removes the sentinel-chaos namespace and .venv311
-```
+Start here:
 
-### Working on it
+| Document | Contents |
+|---|---|
+| [`docs/security-invariants.md`](docs/security-invariants.md) | **The guarantees.** Fail-closed boot, scrubbing, Tier-1 verification, RBAC and network posture, the `I-A*`/`I-B*` invariant tables, and the gaps that are still open |
+| [`docs/runbook.md`](docs/runbook.md) | Deploy, observe, interpret, review |
+| [`examples/oom-recalibration/`](examples/oom-recalibration/) | One captured incident, payload to patch |
 
-The Quick Start runs published images and builds nothing. To work on SREK3S, or to
-run the gates against your own build, you need the toolchain: Linux or WSL2, Go
-1.25+, Python 3.11 (`.venv311`), Docker with buildx, `gcc`, and a cluster.
+Then:
+
+| Document | Contents |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Component topology, and the detection and emission path a scrubbed payload travels |
+| [`docs/models.md`](docs/models.md) | Nine providers across three protocols, credential mounting, and adapter behaviour |
+| [`docs/development.md`](docs/development.md) | Gates, build, deploy, publishing, silent-failure modes, verification without a cluster |
+| [`docs/hardening-and-ci.md`](docs/hardening-and-ci.md) | Test matrices, static analysis, repository rulesets, and where the enforcement is weaker than it looks |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Invariants, gates, and the normative masking specification |
+| [`docs/lessons-learned.md`](docs/lessons-learned.md) | Defects found, including negative controls that failed for the wrong reason |
+| [`docs/offline-install.md`](docs/offline-install.md) | Installing images without a registry |
+| [`docs/ci-triage-protocol.md`](docs/ci-triage-protocol.md) | Reading a red CI run |
+
+## Working on it
+
+Linux or WSL2, Go 1.25+, Python 3.11, Docker with buildx, `gcc`, and a cluster.
 
 ```bash
 make doctor      # host pre-flight: OS, arch, docker+buildx, go, python 3.11+
 make bootstrap   # create .venv311, install agent deps, download Go modules
 make test        # every gate: go vet, gofmt, -race, black, flake8, mypy, pytest
+make check       # gates, then images, then supply-chain checks
 make deploy      # apply deploy/base and wait for both rollouts
 ```
 
-`make deploy` applies your locally built `registry.internal/...` images, so follow it
-with a plain `make deploy-overlay` and no `OVERLAY=` to detonate against your own
-build. The remaining targets are in [`docs/development.md`](docs/development.md).
-
-## Project Structure
+## Project structure
 
 ```
 cmd/sentinel/          Go entrypoint; wiring, flags, signal handling
@@ -85,21 +156,6 @@ scripts/               audit_workflow.py, bootstrap.sh
 docs/                  architecture, security invariants, models, development,
                        runbook, lessons learned, offline install, CI triage
 ```
-
-## Documentation
-
-| Document | Contents |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Component topology, and the detection and emission path a scrubbed payload travels |
-| [`docs/security-invariants.md`](docs/security-invariants.md) | The invariants and their enforcing tests, both wire contracts, and the 11 scrubber rules |
-| [`docs/models.md`](docs/models.md) | Nine providers across three protocols, credential mounting, and adapter behaviour |
-| [`docs/development.md`](docs/development.md) | Gates, build, deploy, publishing, silent-failure modes, and verification without a cluster |
-| [`docs/hardening-and-ci.md`](docs/hardening-and-ci.md) | Test matrices, static analysis, repository rulesets, and where the enforcement is weaker than it looks |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Invariants, gates, and the normative masking specification |
-| [`docs/runbook.md`](docs/runbook.md) | Deploy, observe, interpret, review |
-| [`docs/lessons-learned.md`](docs/lessons-learned.md) | Defects found, including negative controls that failed for the wrong reason |
-| [`docs/offline-install.md`](docs/offline-install.md) | Installing images without a registry |
-| [`docs/ci-triage-protocol.md`](docs/ci-triage-protocol.md) | Reading a red CI run |
 
 ---
 

@@ -39,6 +39,11 @@ DOCS = (
     "docs/runbook.md",
     "docs/offline-install.md",
     "docs/ci-triage-protocol.md",
+    # The captured-evidence page. It is the first thing a reader clicks from the
+    # README, and it quotes a diff with a fenced `diff` block containing lines that
+    # look exactly like the start of a heading - which is precisely why it needs to
+    # be in this tuple rather than trusted by eye.
+    "examples/oom-recalibration/README.md",
 )
 
 LINK = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")

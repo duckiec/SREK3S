@@ -144,11 +144,47 @@ limit into a latency problem and then into probe failures.
 
 | Pod | Permitted egress |
 |---|---|
-| Sentinel | TCP 443 to `10.43.0.0/16` and `10.96.0.0/12` (the cluster service CIDRs); TCP 8000 to the Agent pod |
+| Sentinel | TCP 443 to `10.43.0.0/16` and `10.96.0.0/12` (the cluster service CIDRs); TCP 6443 to `0.0.0.0/0`; TCP 8000 to the Agent pod |
 | Agent | UDP and TCP 53 to `kube-system`; TCP 443 to `0.0.0.0/0` |
 
-The Sentinel cannot reach an arbitrary external address. It reaches the API server
-through the service CIDRs and nothing else.
+The Sentinel cannot reach an arbitrary *service*. It reaches the API server through
+the service CIDRs and nothing else.
+
+**Why there is a `0.0.0.0/0` rule on the Sentinel, which sounds like the opposite of
+that claim.** NetworkPolicy evaluation order is not uniform, and getting it wrong
+makes the Sentinel unable to do its only job.
+
+kube-router — the default CNI on k3s, and therefore the default for anyone who
+follows the Quick Start — evaluates policy **after** kube-proxy has DNAT'd the
+ClusterIP. At that point the destination is no longer `10.43.0.1:443` but the
+apiserver's node address on `6443`, which matches neither the `ipBlock` above nor
+the port. Measured on a stock k3s, with two pods differing only in whether this
+policy applied:
+
+```
+NO NetworkPolicy        -> 10.43.0.1:443 = OPEN
+Sentinel-shaped policy  -> 10.43.0.1:443 = REFUSED
+```
+
+and the packet capture shows a healthy DNAT, which is what exonerates the
+dataplane:
+
+```
+cni0 In  10.42.0.20 -> 172.30.181.188:6443   Flags [S]    <- DNAT applied
+cni0 Out 10.43.0.1:443 -> 10.42.0.20         Flags [S.]   <- SYN-ACK returned
+```
+
+The rule permits the **port**, not an address. The port survives a reboot; the node
+address does not, which is why an earlier revision that hardcoded
+`172.30.181.188/32` was correctly rejected and then wrongly left without the port.
+On a pre-DNAT CNI the extra rule is inert.
+
+What it costs, stated plainly: the Sentinel may open a TCP connection to port 6443
+on any address it can route to. It still cannot do anything with that connection
+its namespaced Role does not permit, so this is defence in depth behind the RBAC
+control rather than a substitute for it. No other port, protocol or destination
+class is widened, and `test_sentinel_policy_widens_nothing_but_6443` fails if that
+ever changes.
 
 The Agent's TCP 443 rule is why a local Ollama on `11434` or vLLM on `8000` is refused
 by the network rather than by code. Widening that rule is an egress change with a
@@ -156,6 +192,106 @@ cluster-wide blast radius.
 
 Ingress to the Agent is permitted only from pods labelled
 `app.kubernetes.io/name: srek3s-sentinel`, on TCP 8000.
+
+## Boot fails closed, but only where silence would be a security property
+
+The Sentinel refuses to start rather than start degraded. A scrubber that fails to
+load is not a Sentinel with fewer rules; it is a Sentinel whose guarantees no
+longer hold, and the only safe reading of that state is to refuse to serve.
+
+`cmd/sentinel/main.go` reads the manifest and calls `scrubber.LoadManifestBytes`
+before the watcher exists. Either error returns wrapped, and `main` does not
+recover:
+
+```go
+raw, err := os.ReadFile(manifest)
+if err != nil {
+    return fmt.Errorf("read scrubber manifest %q: %w", manifest, err)
+}
+if err := scrubber.LoadManifestBytes(raw); err != nil {
+    return fmt.Errorf("load scrubber manifest %q: %w", manifest, err)
+}
+```
+
+`LoadManifestBytes` rejects a schema violation, an unknown rule ID, a duplicate ID,
+an out-of-order table, an omitted canonical rule, and an invalid regex. There is no
+partial install and no skip-and-continue, because a silently skipped rule is a
+security defect wearing a successful exit code.
+
+Two things about this are worth stating precisely rather than as a slogan:
+
+- **It is an exit 1, not a panic.** `internal/scrubber/loader.go` still documents
+  "the caller panics on a non-nil error", which is stale: the caller returns, and
+  the process exits non-zero. The distinction matters because a panic under a
+  recovering supervisor reads as a crash-loop and may be restarted into the same
+  failure, whereas exit 1 reads as a configuration error. The comment is wrong and
+  should be corrected when that file is next touched.
+- **It is not uniform, on purpose.** An unparseable `LOG_LEVEL` does *not* stop
+  boot; it falls back to `INFO`, with the reasoning in `newLogger`:
+
+  > A bad level is not worth refusing to start over: the safe default is the one
+  > that logs. Failing here would mean a typo in a ConfigMap takes the reliability
+  > monitor down, which is a worse outcome than verbose logs.
+
+That is the boundary. Fail closed where continuing means a guarantee is quietly
+absent. Degrade loudly where continuing means only that a log is chattier.
+
+## Escalation reaches a human, and what that path costs
+
+A `TIER_2_ARCHITECTURAL` outcome carries no patch. It carries a Markdown document,
+and getting that document to a human is the only thing standing between an incident
+and a page nobody reads.
+
+`agent/notify.py` dispatches it to Slack, Discord, PagerDuty and Telegram. Four
+properties are deliberate:
+
+- **It is a no-op unless configured.** `Dispatcher.enabled` is true only when at
+  least one target is set, and the triage path logs
+  `notify disabled: no webhook configured` rather than failing.
+- **It cannot raise.** Every target method returns a human verdict string — an HTTP
+  status, `no_chat_id`, or an exception class name — and never propagates. A
+  webhook outage must not turn into a triage failure, because the triage already
+  happened and is correct.
+- **It cannot block the Sentinel.** `dispatch(wait=False)` hands delivery to a
+  daemon thread and returns immediately, so a slow or hanging endpoint never delays
+  the HTTP 200 the emitter is waiting on. Tests pass `wait=True` to collect verdicts
+  deterministically.
+- **It cannot exfiltrate over plaintext.** `_require_https_url` rejects a target
+  URL that is not `https://` at construction time, before any incident exists to
+  send through it.
+
+Each call is bounded by `DISPATCH_TIMEOUT_SECONDS = 4.0`. Queueing is shed, not
+buffered, for the same reason the sandbox sheds at `429`: converting a capacity
+limit into a latency problem produces a worse failure than saying no.
+
+**Two gaps, stated rather than smoothed over.** Neither has an invariant ID, and
+neither is enforced today:
+
+1. **One unbounded thread per escalation.** `dispatch(wait=False)` starts a new
+   daemon thread for every incident with no pool and no cap. A burst of incidents
+   spawns a burst of threads, each holding an HTTP client for up to four seconds.
+   The timeout bounds each thread's lifetime; nothing bounds how many exist at once.
+2. **Telegram chat discovery is unauthenticated in effect.** When `chat_id` is not
+   configured, `_telegram_deliver` calls `getUpdates` and posts to whichever chat
+   most recently wrote to the bot. The bot token authenticates the *API call*, but
+   the *recipient* is chosen by anyone who messages the bot. That is acceptable for
+   a personal bot and is not acceptable for an incident channel; configure
+   `chat_id` explicitly.
+
+## Grants without a reader
+
+`deploy/rbac.yaml` grants `get`/`list`/`watch` on `apps` `deployments` and
+`replicasets`. Nothing reads them. The client in `internal/k8s/readonly.go`
+exposes exactly two readers, `CoreV1().Pods` and `CoreV1().Events`, and a
+non-test grep for `Deployments(` or `ReplicaSets(` across `internal/` and `cmd/`
+returns nothing.
+
+The grant is harmless — it is a read verb inside a namespace, and a namespaced Role
+cannot escalate itself — but it is a grant without a consumer, and every such
+grant is an invitation for the next reader to use it. It is kept rather than removed
+because `Role` rules are additive and cheap, and it is recorded here because a
+reader of this file should know it is not load-bearing. Two tests pin the current
+shape, so removing it is a deliberate change rather than a silent one.
 
 ## Not Wired
 
@@ -165,10 +301,31 @@ production imported them, and Tier-1 incidents close when the verified diff is
 handed to a human, not when a loop re-observes the workload. `triage.py` still
 emits `verification_policy` on the wire with no consumer.
 
-**Tier-1 auto-patching as deployed.** `SREK3S_MANIFEST_ROOT` mounts an `emptyDir`, so
-the manifest provider cannot resolve its target file. Every incident escalates to
-Tier-2 under I-B2 and no patch is proposed. This is the intended safe state and is
-indistinguishable from a working installation.
+**Tier-1 auto-patching as deployed.** Which of the two install paths you take
+decides this, and the difference is easy to miss because both produce Tier-2.
+
+- `deploy/agent.yaml` mounts an `emptyDir` at `SREK3S_MANIFEST_ROOT`. The manifest
+  provider cannot resolve a target file that is not there, so every incident
+  escalates under **I-B2** and no patch is proposed. That is the intended safe
+  state, and it is indistinguishable from a working installation if you only look
+  at the tier label.
+- The chart ships a default `agent.gitops.repoUrl`, so the Agent clones a
+  repository at startup instead. `agent.targetManifest` still defaults to empty,
+  and **an empty target manifest is the whole gate**: with it unset every incident
+  still escalates. Set it and Tier-1 becomes reachable:
+
+  ```bash
+  helm install srek3s deploy/helm/srek3s -n srek3s-system --create-namespace \
+    --set agent.gitops.repoUrl=https://github.com/duckiec/SREK3S.git \
+    --set agent.targetManifest=deploy/chaos/oom-leak.yaml
+  ```
+
+`make demo` sets both, which is why it produces `TIER_1_TOIL` verdicts where a
+default install produces `TIER_2_ARCHITECTURAL`. Both are correct; only one of them
+proposes a patch. The clone happens **once, at startup, with no retry** — a cluster
+whose DNS is not yet resolvable strands the Agent in the fallback for its whole
+lifetime, which is why `make demo` blocks on `throwaway-wait` before installing the
+chart.
 
 ## Contract A — Sentinel to Agent
 

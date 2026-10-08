@@ -300,6 +300,55 @@ test-parallel: ## Run both suites concurrently (flaky by design; you asked for i
 	wait
 
 # ---------------------------------------------------------------------------
+# demo
+# ---------------------------------------------------------------------------
+# The first thing a newcomer runs, so it has to be honest before it is impressive.
+# `make demo` builds images, installs the chart and detonates a real OOMKill on
+# a disposable cluster. It never touches a cluster you care about, and it says so
+# before doing anything, because a tool that mutates a cluster on first contact
+# does not get a second run.
+
+.PHONY: demo
+demo: ## 60-second proof on a disposable cluster: real crash, scrubbed incident, Tier-1 patch
+	@echo "==============================================================="
+	@echo " SREK3S demo"
+	@echo "==============================================================="
+	@echo ""
+	@echo " WHAT THIS DOES, IN ORDER"
+	@echo "   1. throwaway-up       a throwaway k3s cluster in Docker, on its own"
+	@echo "                         bridge network, with NO relation to any"
+	@echo "                         cluster you are using"
+	@echo "   2. throwaway-wait    blocks until the node is Ready AND cluster DNS"
+	@echo "                         resolves (the agent clones once at startup)"
+	@echo "   3. throwaway-detonate builds both images, installs the chart into the"
+	@echo "                         throwaway, applies deploy/chaos/oom-leak.yaml,"
+	@echo "                         and waits for the Sentinel to observe the real"
+	@echo "                         OOMKill, scrub it, and have the agent produce a"
+	@echo "                         verified Tier-1 patch"
+	@echo ""
+	@echo " WHAT IT WILL NOT TOUCH"
+	@echo "   Your current kubectl context is never switched. Every command here"
+	@echo "   is pinned with KUBECONFIG=$(THROWAWAY_KUBECONFIG), so if you have a"
+	@echo "   production kubeconfig loaded it stays loaded and stays untouched."
+	@echo "   Nothing is applied to any cluster except the throwaway."
+	@echo ""
+	@echo " WHAT IT LEAVES BEHIND"
+	@echo "   The throwaway container, so you can read the logs. Remove it with:"
+	@echo "       make throwaway-down"
+	@echo ""
+	@echo "   It costs a multi-arch-free image build on first run."
+	@echo "==============================================================="
+	@echo ""
+	@$(MAKE) throwaway-up
+	@$(MAKE) throwaway-wait
+	@$(MAKE) throwaway-detonate
+	@echo ""
+	@echo "==============================================================="
+	@echo " demo complete"
+	@echo "==============================================================="
+	@echo " Clean up the throwaway with:  make throwaway-down"
+
+# ---------------------------------------------------------------------------
 # check
 # ---------------------------------------------------------------------------
 # `check` used to be `test build` and nothing else. Three properties that had
@@ -406,6 +455,58 @@ throwaway-up: ## Start the disposable k3s cluster and write its kubeconfig
 	@echo "    use with:  export KUBECONFIG=$(THROWAWAY_KUBECONFIG)"
 	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) get nodes
 
+.PHONY: throwaway-wait
+throwaway-wait: ## Block until the throwaway is genuinely ready: node Ready AND DNS resolving
+	@# Readiness is two conditions, and the second is the one that is easy to miss.
+	@#
+	@# `throwaway-up` waits for a Ready NODE. That is necessary and it is not
+	@# sufficient: the Agent clones its GitOps repo once, at startup, before it
+	@# serves its first request. A cluster that has a Ready node but no resolver
+	@# yet makes that clone fail, and the agent then degrades PERMANENTLY to the
+	@# manifest-root fallback with no retry:
+	@#
+	@#   fatal: unable to access 'https://github.com/...': Could not resolve host
+	@#   ...; falling back to SREK3S_MANIFEST_ROOT
+	@#
+	@# Every subsequent incident then escalates to Tier-2 for a reason that has
+	@# nothing to do with the incident, which is the worst way for a demo to fail.
+	@# The symptom looks like a broken product; the cause is a cluster that was
+	@# Ready for four seconds.
+	@#
+	@# The probe is kube-dns ENDPOINTS rather than a pod running a resolver,
+	@# deliberately: this runs BEFORE the images are imported, so there is no
+	@# image in the throwaway yet to run a probe in. Endpoints being non-empty is
+	@# the earliest signal that a resolver will answer.
+	@echo "==> waiting for a Ready node"
+	@for i in $$(seq 1 60); do \
+		if KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) get nodes --no-headers 2>/dev/null | grep -q ' Ready '; then \
+			echo "==> node Ready after $$((i * 2))s"; break; \
+		fi; \
+		if [ $$i -eq 60 ]; then \
+			echo "FATAL: no Ready node after 120s." >&2; \
+			echo "       Is $(THROWAWAY_NAME) running? 'make throwaway-up'." >&2; \
+			exit 1; \
+		fi; \
+		sleep 2; \
+	done
+	@echo "==> waiting for cluster DNS to answer"
+	@for i in $$(seq 1 60); do \
+		EPS="$$(KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n kube-system get endpoints kube-dns \
+			-o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"; \
+		if printf '%s' "$$EPS" | grep -q '[0-9]'; then \
+			echo "==> kube-dns ready after $$((i * 2))s ($$EPS)"; break; \
+		fi; \
+		if [ $$i -eq 60 ]; then \
+			echo "FATAL: kube-dns published no endpoints after 120s." >&2; \
+			echo "       The Agent clones GitOps at startup and does not retry, so" >&2; \
+			echo "       installing now would strand it in Tier-2 for the whole run." >&2; \
+			$(DOCKER) logs --tail 20 "$(THROWAWAY_NAME)" >&2 || true; \
+			exit 1; \
+		fi; \
+		sleep 2; \
+	done
+	@echo "==> throwaway is ready"
+
 .PHONY: throwaway-down
 throwaway-down: ## Stop and remove the disposable cluster and its kubeconfig
 	@if $(DOCKER) ps -a --format '{{.Names}}' | grep -qx "$(THROWAWAY_NAME)"; then \
@@ -448,6 +549,11 @@ throwaway-detonate: throwaway-up ## Full live E2E: build, import, install, deton
 	@# documents for its own namespace: resource order is not alphabetical.
 	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) apply -f "$(ROOT)/deploy/overlays/local-live/chaos-namespace.yaml" >/dev/null
 	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) apply -f "$(ROOT)/deploy/overlays/local-live/chaos-rbac.yaml" >/dev/null
+	@# HERE and not only in `make demo`: the Agent's one-shot GitOps clone runs at
+	@# pod start, so the resolver must exist before the chart lands. Gating this in
+	@# the demo alone would leave `make throwaway-detonate` - the target CI and
+	@# contributors actually use - racy.
+	@$(MAKE) throwaway-wait
 	@echo "==> installing the chart (watch scope: $(THROWAWAY_WATCH_NS))"
 	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) helm install "$(THROWAWAY_RELEASE)" \
 		"$(ROOT)/deploy/helm/srek3s" -n "$(SYSTEM_NAMESPACE)" --create-namespace \
