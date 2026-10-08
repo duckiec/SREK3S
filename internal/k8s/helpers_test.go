@@ -82,6 +82,38 @@ func waitForStore(
 	t.Fatalf("informer never stored %s in phase %s", key, phase)
 }
 
+// waitForStats blocks until the watcher reports at least the given counts.
+//
+// PodWatcher.Stats() is documented as NOT atomic across counters: it snapshots
+// four counters that the Run goroutine increments independently. A test that
+// reads them straight after delivering an object therefore races - it can read
+// Emitted before the Run goroutine has incremented it, even though the incident
+// has already been handed to the channel. Under `-race` that surfaced as a
+// spurious "Emitted = 0, want 1" roughly one run in eight.
+//
+// Waiting on the counts is what makes the assertion about the invariant rather
+// than about scheduling; the exact-value assertions that follow are unchanged,
+// so a watcher that emits twice or suppresses nothing still fails.
+func waitForStats(t *testing.T, watcher *PodWatcher, emitted, suppressed uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := watcher.Stats()
+		if stats.Emitted >= emitted && stats.DedupSuppressed >= suppressed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stats := watcher.Stats()
+	t.Fatalf(
+		"watcher never reported Emitted >= %d and DedupSuppressed >= %d; last saw emitted=%d suppressed=%d",
+		emitted,
+		suppressed,
+		stats.Emitted,
+		stats.DedupSuppressed,
+	)
+}
+
 func waitForSync(t *testing.T, watcher *PodWatcher) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
