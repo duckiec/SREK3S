@@ -58,3 +58,14 @@ networkPolicy:
   apiServerCidrs:
     - 10.43.0.0/16
     - 10.96.0.0/12
+
+  # Port the API server is reached on once kube-proxy has DNAT'd the ClusterIP.
+  #
+  # Rendered as a separate egress rule on 0.0.0.0/0 because kube-router — the
+  # default CNI on k3s, and therefore the Quick Start's default — evaluates
+  # NetworkPolicy AFTER DNAT. Without this rule the Sentinel cannot reach the
+  # API server on a default k3s install and cannot watch its own cluster.
+  #
+  # Port, not address, on purpose: the port survives a reboot, the node address
+  # does not. Change it only if your control plane really is on another port.
+  apiServerPort: 6443

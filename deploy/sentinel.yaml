@@ -366,6 +366,36 @@ spec:
     # their own overlay — where an ephemeral address belongs, and where the
     # derivation step is documented rather than forgotten.
     #
+    # BUT "should say so in their own overlay" WAS WRONG, and this is the second
+    # time that reasoning has been wrong in this exact rule. It assumed the only
+    # supported evaluation order is PRE-DNAT. On kube-router — which is the DEFAULT
+    # CNI on k3s, and therefore the default install for anyone who runs the
+    # Quick Start — NetworkPolicy is evaluated AFTER kube-proxy has DNAT'd the
+    # ClusterIP. By then the packet's destination is no longer 10.43.0.1:443 but
+    # the apiserver's node address on 6443, which matches neither the ipBlock above
+    # nor the port. The rule denies, and kube-router REJECTS rather than drops, so
+    # the Sentinel sees the same symptom this comment has been describing:
+    #
+    #     W reflector.go:561] failed to list *v1.Pod: Get
+    #       "https://10.43.0.1:443/api/v1/namespaces/.../pods..."
+    #       dial tcp 10.43.0.1:443: connect: connection refused
+    #
+    # Measured on a stock k3s, one pod with no policy and one with this exact rule
+    # differ in exactly this way and nothing else:
+    #
+    #     NO NetworkPolicy        -> 10.43.0.1:443 = OPEN
+    #     Sentinel-shaped policy  -> 10.43.0.1:443 = REFUSED
+    #
+    # The packet capture confirms the DNAT is healthy and the POLICY is the cause:
+    #
+    #     cni0 In  10.42.0.20 -> 172.30.181.188:6443   Flags [S]    <- DNAT applied
+    #     cni0 Out 10.43.0.1:443 -> 10.42.0.20         Flags [S.]   <- SYN-ACK returned
+    #
+    # So the fix below permits TCP 6443 by PORT, which is stable across reboots,
+    # rather than by address, which is not. That is what this rule needed all along:
+    # the earlier revision rejected the node ADDRESS for being ephemeral, and
+    # rightly so, but then never added the port.
+    #
     # VERIFY AFTER ANY CHANGE: the check that matters is behavioural, not static. No
     # test in this repository can ask an apiserver whether egress works, and a YAML
     # parser can only confirm the document is well-formed. Confirm the reflector's
@@ -380,6 +410,31 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # -------------------------------------------------------------------------
+    # THE SAME API SERVER, AS IT LOOKS AFTER DNAT.
+    #
+    # Inert on a pre-DNAT CNI (the packet above already matched). Required on
+    # kube-router, k3s's default, where the ClusterIP is rewritten to the
+    # apiserver's node address on 6443 BEFORE policy is evaluated.
+    #
+    # Permitted by PORT, not by address, because 6443 does not change across
+    # reboots and the node address does. That is the whole point: an earlier
+    # revision rejected hardcoding `172.30.181.188/32` precisely because WSL
+    # reassigns it, and then declined to add the port, leaving the default k3s
+    # install with a Sentinel that cannot watch its own cluster.
+    #
+    # WHAT THIS COSTS, precisely: the Sentinel may open a TCP connection to port
+    # 6443 on any address the pod can route to. It still cannot DO anything with
+    # it that its namespaced Role does not permit — this is defence in depth
+    # behind the RBAC control, not a replacement for it. No other port, protocol
+    # or destination class is widened.
+    # -------------------------------------------------------------------------
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 6443
     # The agent, for POST /v1/incidents.
     - to:
         - podSelector:
