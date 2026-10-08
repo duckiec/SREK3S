@@ -238,12 +238,26 @@ spec:
                   optional: true
 
             # SREK3S_GITOPS_REPO_URL - the GitOps repository to clone at
-            # startup for Tier-1 patch verification (I-B2). Unset means the
-            # existing behaviour: SREK3S_MANIFEST_ROOT if mounted, otherwise
-            # every incident escalates. A failed clone degrades the same way;
-            # it never crashes the agent.
+            # startup for Tier-1 patch verification (I-B2).
+            #
+            # This is a plain env var and NOT a secretKeyRef: a public repository
+            # URL is not a credential, and putting it in the Secret would make the
+            # Token and the URL look equally sensitive when only one is. The token
+            # stays in `srek3s-secrets` below.
+            #
+            # It defaults to this project's own public repository so that a fresh
+            # `kubectl apply -k deploy/` can actually reach Tier-1 instead of
+            # booting with a manifest path that does not exist and escalating every
+            # incident under I-B2 with the misleading reason "target manifest is
+            # unreadable" (which reads like a broken checkout, not a missing
+            # configuration key).
+            #
+            # Empty still means: SREK3S_MANIFEST_ROOT if mounted, otherwise every
+            # incident escalates. A failed clone degrades the same way; it never
+            # crashes the agent. See SREK3S_TARGET_MANIFEST below for the other
+            # half of a working Tier-1 configuration.
             - name: SREK3S_GITOPS_REPO_URL
-              value: ""
+              value: https://github.com/duckiec/SREK3S.git
             - name: SREK3S_GITOPS_REF
               value: main
             - name: SREK3S_GITOPS_TOKEN

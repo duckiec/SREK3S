@@ -39,7 +39,12 @@ agent:
     # the existing behaviour: SREK3S_MANIFEST_ROOT if mounted, otherwise
     # every incident escalates. The token always comes from the
     # srek3s-secrets Secret, never from values.
-    repoUrl: ""
+    #
+    # This default MUST equal deploy/agent.yaml's SREK3S_GITOPS_REPO_URL.
+    # test_helm_chart.py::test_render_matches_kustomize_base compares the two
+    # renders byte for byte, and it caught exactly this divergence the first
+    # time one side was changed without the other. Keep them in step.
+    repoUrl: https://github.com/duckiec/SREK3S.git
     ref: main
 
 monitoring:

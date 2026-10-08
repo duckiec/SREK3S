@@ -84,6 +84,45 @@ PLATFORM ?=
 CHAOS_NAMESPACE ?= sentinel-chaos
 SYSTEM_NAMESPACE ?= srek3s-system
 
+# ---------------------------------------------------------------------------
+# THROWAWAY CLUSTER
+# ---------------------------------------------------------------------------
+# A disposable single-node k3s, used for the live E2E leg. It exists as a
+# `docker run` container rather than an install on the host because that is the
+# only way to get a second control plane on a machine that already runs one
+# without the two fighting over the same data directory, cgroups and containerd
+# socket.
+#
+# It runs on its OWN docker network with its own subnet, and its own data
+# directory inside the container, so it shares nothing with the host cluster
+# except memory and CPU. Do not put it on the host network: kube-proxy in a
+# host-networked container writes to the host's netfilter tables.
+THROWAWAY_NAME       ?= k3s-throwaway
+THROWAWAY_IMAGE      ?= rancher/k3s:v1.36.4-k3s1
+THROWAWAY_NETWORK    ?= throwaway
+THROWAWAY_SUBNET     ?= 192.168.100.0/24
+THROWAWAY_IP         ?= 192.168.100.2
+THROWAWAY_APISERVER  ?= 6445
+THROWAWAY_KUBECONFIG ?= /tmp/k3s-throwaway.yaml
+THROWAWAY_RELEASE    ?= srek3s
+
+# The throwaway sentinel watches the chaos namespace so the chaos fixture's
+# hardcoded `namespace: sentinel-chaos` lines up with a grant it actually holds.
+# The chaos Role/RoleBinding for that namespace come from
+# deploy/overlays/local-live/chaos-rbac.yaml, applied below. This is set at
+# install time rather than baked into the chart so the production overlay does
+# not inherit a fixture scope.
+THROWAWAY_WATCH_NS   ?= $(CHAOS_NAMESPACE)
+
+# The container's containerd socket. Images are built on the host and piped in,
+# because there is no registry between them.
+THROWAWAY_CTR        := /run/k3s/containerd/containerd.sock
+THROWAWAY_CTR_ADDR   := --address $(THROWAWAY_CTR) --namespace k8s.io
+
+# kubectl pinned to the throwaway, for use inside recipe bodies where the
+# KUBECONFIG prefix would otherwise have to be repeated on every line.
+THROWAWAY_KUBECONFIG_KUBECTL := KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL)
+
 # A `make` variable cannot run a shell at expansion time without costing a
 # subshell per use, so the lookup happens once here. `$(shell ...)` is used for
 # exactly one thing: deciding whether a usable interpreter exists.
@@ -101,6 +140,10 @@ done; exit 1)
 # overridable so a developer on a remote cluster can point at their own kubeconfig.
 DOCKER ?= docker
 KUBECTL ?= kubectl
+
+# Where `go install` puts binaries (GOBIN, else $GOPATH/bin). Used by
+# check-supply-chain to find govulncheck without hardcoding a path.
+GOBIN ?= $(shell go env GOPATH 2>/dev/null)/bin
 
 # ---------------------------------------------------------------------------
 # DOCKER PERMISSIONS — detected once, explained once
@@ -232,8 +275,218 @@ test-parallel: ## Run both suites concurrently (flaky by design; you asked for i
 	$(MAKE) test-python & \
 	wait
 
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+# `check` used to be `test build` and nothing else. Three properties that had
+# already produced defects were therefore only ever verified by remembering to
+# run them, and each one cost a real bug:
+#
+#   * A stale `govulncheck.txt` sat in the repository for a release. Nobody
+#     noticed because nothing ran govulncheck locally.
+#   * The chart rendered a Namespace, so every `helm install` failed. `make test`
+#     was green throughout, because it never rendered the chart.
+#   * The chart and `deploy/base` silently diverged. Same cause.
+#
+# So they are dependencies now, not folklore.
 .PHONY: check
-check: test build ## Gates then images
+check: test build check-supply-chain ## Gates, then images, then the checks that were being forgotten
+
+# The dependency checks. Split out so CI and a developer can run exactly this
+# subset without rebuilding images.
+.PHONY: check-supply-chain
+check-supply-chain: ## helm lint, chart/base parity, govulncheck, workflow audit
+
+	@echo "==> helm lint --strict"
+	@helm lint --strict "$(ROOT)/deploy/helm/srek3s"
+
+	@echo "==> chart / deploy-base parity"
+	@# Deliberately NOT a naive byte diff of the two renders. They differ by one
+	@# object on purpose: `deploy/base` renders a Namespace because kustomize has
+	@# no `--create-namespace`, while the chart must not render one or every
+	@# `helm install` fails (with or without that flag). The invariant is therefore
+	@# "the chart renders no Namespace, and every other object is byte-identical",
+	@# and test_helm_chart.py::test_render_matches_kustomize_base already encodes
+	@# it. Re-implementing it here as a shell diff would reintroduce the false
+	@# failure that motivated the test.
+	@test -n "$(PYTHON)" || { echo "FATAL: no Python 3.11+ interpreter. Run 'make bootstrap'." >&2; exit 1; }
+	@"$(PYTHON)" -m pytest "$(PYTEST_DIR)/test_helm_chart.py::test_render_matches_kustomize_base" -q
+
+	@echo "==> govulncheck"
+	@GOVULNCHECK="$$(command -v govulncheck || echo '$(GOBIN)/govulncheck')"; \
+	if [ ! -x "$$GOVULNCHECK" ]; then \
+		echo "FATAL: govulncheck not found." >&2; \
+		echo "       Install it with: go install golang.org/x/vuln/cmd/govulncheck@latest" >&2; \
+		echo "       (or point GOVULNCHECK= at an existing binary)" >&2; \
+		exit 1; \
+	fi; \
+	cd "$(ROOT)" && "$$GOVULNCHECK" ./...
+
+	@echo "==> workflow definition audit"
+	@"$(PYTHON)" "$(ROOT)/scripts/audit_workflow.py" --strict
+
+# ---------------------------------------------------------------------------
+# throwaway (disposable cluster for the live E2E leg)
+# ---------------------------------------------------------------------------
+# These three targets exist because the E2E leg was previously ~15 hand-typed
+# commands with a memorised sequence of docker flags, a kubeconfig path that
+# only existed for as long as /tmp did, and a binfmt handler that had to be
+# registered by hand on an arm64 host. A verification you have to remember is a
+# verification that gets skipped.
+
+.PHONY: throwaway-up
+throwaway-up: ## Start the disposable k3s cluster and write its kubeconfig
+	@echo "==> throwaway: network $(THROWAWAY_NETWORK) ($(THROWAWAY_SUBNET))"
+	@$(DOCKER) network inspect "$(THROWAWAY_NETWORK)" >/dev/null 2>&1 \
+		|| $(DOCKER) network create --subnet "$(THROWAWAY_SUBNET)" "$(THROWAWAY_NETWORK)" >/dev/null
+	@if $(DOCKER) ps -a --format '{{.Names}}' | grep -qx "$(THROWAWAY_NAME)"; then \
+		echo "==> removing the previous $(THROWAWAY_NAME)"; \
+		$(DOCKER) rm -f "$(THROWAWAY_NAME)" >/dev/null; \
+	fi
+	@# binfmt handlers are HOST-GLOBAL and are the one thing a throwaway cannot
+	@# avoid touching. They are needed only for cross-architecture builds (see
+	@# the CROSS-ARCHITECTURE BUILDS note above); on an amd64 host this is a no-op.
+	@if [ "$$(uname -m)" = "aarch64" ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then \
+		echo "==> registering binfmt handler for linux/amd64 (host is aarch64)"; \
+		$(DOCKER) run --privileged --rm tonistiigi/binfmt --install amd64 >/dev/null; \
+	fi
+	@echo "==> starting $(THROWAWAY_NAME)"
+	@$(DOCKER) run -d --privileged --name "$(THROWAWAY_NAME)" \
+		--network "$(THROWAWAY_NETWORK)" --hostname "$(THROWAWAY_NAME)" \
+		-p $(THROWAWAY_APISERVER):6443 \
+		"$(THROWAWAY_IMAGE)" server \
+		--disable traefik --disable servicelb --disable metrics-server >/dev/null
+	@echo "==> waiting for the API server"
+	@# The bundled `kubectl`, NOT `k3s kubectl`. Inside the rancher/k3s image the
+	@# `k3s` multicall dispatches to the kubectl sub-binary in a way that answers
+	@# `unknown command "kubectl" for "kubectl"` and still exits 0, so a probe
+	@# built on it waits out the full timeout against a perfectly healthy cluster.
+	@# Requires a READY node, not merely a responsive API server. The apiserver
+	@# answers well before the node object is registered, so an API-only probe
+	@# reports ready and then prints "No resources found" two lines later.
+	@for i in $$(seq 1 60); do \
+		if $(DOCKER) exec "$(THROWAWAY_NAME)" kubectl get nodes --no-headers 2>/dev/null | grep -q ' Ready '; then \
+			echo "==> ready after $$((i * 2))s"; break; \
+		fi; \
+		if [ $$i -eq 60 ]; then \
+			echo "FATAL: no Ready node after 120s" >&2; \
+			$(DOCKER) logs --tail 20 "$(THROWAWAY_NAME)" >&2 || true; \
+			exit 1; \
+		fi; \
+		sleep 2; \
+	done
+	@echo "==> writing $(THROWAWAY_KUBECONFIG)"
+	@$(DOCKER) cp "$(THROWAWAY_NAME):/etc/rancher/k3s/k3s.yaml" "$(THROWAWAY_KUBECONFIG)"
+	@sed -i.bak "s#https://127.0.0.1:6443#https://$(THROWAWAY_IP):6443#" "$(THROWAWAY_KUBECONFIG)"
+	@rm -f "$(THROWAWAY_KUBECONFIG).bak"
+	@echo "    use with:  export KUBECONFIG=$(THROWAWAY_KUBECONFIG)"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) get nodes
+
+.PHONY: throwaway-down
+throwaway-down: ## Stop and remove the disposable cluster and its kubeconfig
+	@if $(DOCKER) ps -a --format '{{.Names}}' | grep -qx "$(THROWAWAY_NAME)"; then \
+		echo "==> stopping $(THROWAWAY_NAME)"; \
+		$(DOCKER) rm -f "$(THROWAWAY_NAME)" >/dev/null && echo "    removed"; \
+	else \
+		echo "==> $(THROWAWAY_NAME) is not present"; \
+	fi
+	@rm -f "$(THROWAWAY_KUBECONFIG)" && echo "==> removed $(THROWAWAY_KUBECONFIG)"
+	@$(DOCKER) network rm "$(THROWAWAY_NETWORK)" >/dev/null 2>&1 \
+		&& echo "==> removed network $(THROWAWAY_NETWORK)" || true
+
+.PHONY: throwaway-detonate
+throwaway-detonate: throwaway-up ## Full live E2E: build, import, install, detonate, show logs
+	@echo "==> context: $(THROWAWAY_KUBECONFIG)"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) get nodes >/dev/null \
+		|| { echo "FATAL: throwaway is not reachable; run 'make throwaway-up' first" >&2; exit 1; }
+	@echo "==> building images"
+	@$(MAKE) build-sentinel build-agent
+	@echo "==> importing images into $(THROWAWAY_NAME) containerd"
+	@$(DOCKER) save "$(SENTINEL_TAG)" "$(AGENT_TAG)" busybox:1.36.1 \
+		| $(DOCKER) exec -i "$(THROWAWAY_NAME)" ctr $(THROWAWAY_CTR_ADDR) images import - >/dev/null
+	@echo "==> cleaning any previous release"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) helm uninstall "$(THROWAWAY_RELEASE)" -n "$(SYSTEM_NAMESPACE)" >/dev/null 2>&1 || true
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) delete ns "$(SYSTEM_NAMESPACE)" --wait=true >/dev/null 2>&1 || true
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) delete ns "$(CHAOS_NAMESPACE)" --wait=true >/dev/null 2>&1 || true
+	@echo "==> creating the chaos namespace and granting the sentinel read verbs there"
+	@# BEFORE the chart, deliberately. A RoleBinding may reference a ServiceAccount
+	@# that does not exist yet - the apiserver accepts it and resolves the subject
+	@# when the account appears - so this ordering is legal and removes the race
+	@# that the other way round introduces. Installing first and granting
+	@# afterwards leaves the Sentinel's informer retrying a forbidden LIST:
+	@#
+	@#   failed to list *v1.Pod: pods is forbidden: User
+	@#   "system:serviceaccount:srek3s-system:srek3s-sentinel" cannot list
+	@#   resource "pods" in API group "" in the namespace "sentinel-chaos"
+	@#
+	@# which it recovers from, so the detonation still passes and the ordering
+	@# defect is invisible in the result. Same trap deploy/kustomization.yaml
+	@# documents for its own namespace: resource order is not alphabetical.
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) apply -f "$(ROOT)/deploy/overlays/local-live/chaos-namespace.yaml" >/dev/null
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) apply -f "$(ROOT)/deploy/overlays/local-live/chaos-rbac.yaml" >/dev/null
+	@echo "==> installing the chart (watch scope: $(THROWAWAY_WATCH_NS))"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) helm install "$(THROWAWAY_RELEASE)" \
+		"$(ROOT)/deploy/helm/srek3s" -n "$(SYSTEM_NAMESPACE)" --create-namespace \
+		--set sentinel.watchNamespace="$(THROWAWAY_WATCH_NS)" \
+		--set agent.gitops.repoUrl=https://github.com/duckiec/SREK3S.git \
+		--set agent.targetManifest=deploy/chaos/oom-leak.yaml \
+		--wait --timeout 300s
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" rollout status deployment/srek3s-sentinel --timeout=180s
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" rollout status deployment/srek3s-agent --timeout=180s
+	@echo "==> detonating $(ROOT)/deploy/chaos/oom-leak.yaml"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) apply -f "$(ROOT)/deploy/chaos/oom-leak.yaml" -n "$(CHAOS_NAMESPACE)"
+	@echo "==> waiting for the failure to be observed and triaged"
+	@sleep 60
+	@echo
+	@echo "===================== sentinel ====================="
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" logs deployment/srek3s-sentinel --tail=15
+	@echo
+	@echo "===================== ASSERTIONS ===================="
+	@# A detonation target that prints logs and exits 0 whether or not anything was
+	@# detected is worse than no target: it manufactures a green result from a
+	@# failed run. These assertions are what make this a verification.
+	@#
+	@# Each one is a SELF-CONTAINED shell. A `@`-prefixed recipe line is its own
+	@# `bash -c`, so a variable assigned on one line does not survive to the next -
+	@# the first draft of this block spread one script over several lines and the
+	@# assertion silently passed with an empty variable. The extraction pattern
+	@# also avoids literal double quotes, which do not survive `bash -c` inside a
+	@# make recipe cleanly; `[^0-9]*` stands in for the JSON colon.
+	@S="$$($(THROWAWAY_KUBECONFIG_KUBECTL) -n $(SYSTEM_NAMESPACE) logs deployment/srek3s-sentinel --tail=300 2>/dev/null || true)"; \
+	E="$$(printf '%s' "$$S" | grep -oE 'watcher_emitted[^0-9]*[0-9]+' | tail -1 | grep -oE '[0-9]+$$' || true)"; \
+	if [ "$${E:-0}" -lt 1 ]; then \
+		echo "FATAL: the Sentinel emitted no incidents (watcher_emitted=$${E:-0})." >&2; \
+		printf '%s' "$$S" | grep -q 'connection refused' \
+			&& { echo "       The informer cannot reach the API server ClusterIP. The Sentinel" >&2; \
+			     echo "       is healthy and authorised; the cluster dataplane is not. Check" >&2; \
+			     echo "       kube-proxy ClusterIP DNAT from a pod in this cluster." >&2; }; \
+		printf '%s' "$$S" | grep -q 'is forbidden' \
+			&& echo "       The Sentinel lacks read verbs in $(THROWAWAY_WATCH_NS)." >&2; \
+		exit 1; \
+	fi; \
+	echo "  [ok] sentinel emitted $$E incident(s)"
+	@A="$$($(THROWAWAY_KUBECONFIG_KUBECTL) -n $(SYSTEM_NAMESPACE) logs deployment/srek3s-agent --tail=300 2>/dev/null || true)"; \
+	if ! printf '%s' "$$A" | grep -q 'triaged incident_id'; then \
+		echo "FATAL: the Agent never reported a triage verdict." >&2; \
+		printf '%s\n' "$$A" | tail -20 >&2; \
+		exit 1; \
+	fi; \
+	echo "  [ok] agent triaged ($$(printf '%s' "$$A" | grep -c 'triaged incident_id' || true) verdict(s))"
+	@A="$$($(THROWAWAY_KUBECONFIG_KUBECTL) -n $(SYSTEM_NAMESPACE) logs deployment/srek3s-agent --tail=300 2>/dev/null || true)"; \
+	if printf '%s' "$$A" | grep -q 'GitOps clone.*failed'; then \
+		echo "FATAL: the GitOps clone failed; Tier-1 is unreachable." >&2; \
+		printf '%s\n' "$$A" | grep 'GitOps clone' >&2; \
+		exit 1; \
+	fi; \
+	echo "  [ok] GitOps checkout succeeded ($$(printf '%s' "$$A" | grep -c 'tier=TIER_1_TOIL' || true) Tier-1 verdict(s))"
+	@echo
+	@echo "===================== agent ========================"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" logs deployment/srek3s-agent --tail=25
+	@echo
+	@echo "===================== agent ========================"
+	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" logs deployment/srek3s-agent --tail=25
+	@echo
+	@echo "==> scratch cluster: 'make throwaway-down' when finished"
 
 # ---------------------------------------------------------------------------
 # build
