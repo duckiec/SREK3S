@@ -2182,15 +2182,16 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
       go >= 1.26.0 (running go 1.25.14; GOTOOLCHAIN=local)
 
   The pin was `v1.8.0`, because that is what `@latest` resolved to on the machine
-  the gate was developed on — and that machine runs Go 1.26.8. CI pins `GO_VERSION`
+  the gate was developed on — and that machine runs Go 1.26.8. CI pinned `GO_VERSION`
   to 1.25. **The tool was verified on a different toolchain than the one that would
   have to install it.** Every local check passed, because locally it genuinely
   built; the incompatibility only exists on CI's version, so nothing short of
   running CI could have surfaced it.
 
-  Fixed by pinning `v1.7.0`, the newest release declaring `go 1.25.0`. Raising the
-  project's baseline to 1.26 was the alternative and was rejected as
-  disproportionate — the scanner is a tool, not the project.
+  Fixed, in the first instance, by pinning `v1.7.0`, the newest release declaring
+  `go 1.25.0`. Raising the project's baseline to 1.26 was the alternative and was
+  rejected as disproportionate — the scanner is a tool, not the project, and 1.25
+  built fine.
 
   The replacement was verified to still be a control rather than merely something
   that compiles: it still resolves GO-2026-5970 and exits 3 on a vulnerable tree,
@@ -2204,7 +2205,54 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   post-mortem 34 and 25 are both about checks that read their own documentation.
   The honest position is that this class of bug fails loudly in about five seconds
   with a precise message, rather than silently, and that is acceptable for a
-  compatibility constraint. It will recur when Go 1.25 is EOL.
+  compatibility constraint.
+
+- **The decision above was reversed by the thing it was protecting against, and it
+  is worth recording that it reversed *well*.** The prediction was "it will recur
+  when Go 1.25 is EOL". What actually happened is that it recurred sooner and for a
+  sharper reason: on 2026-10-08 the advisory DB published nine reachable
+  vulnerabilities in **Go 1.25's own standard library** —
+
+      GO-2026-6603  GO-2026-6605  GO-2026-6607  GO-2026-6608  GO-2026-6610
+      GO-2026-6611  GO-2026-6612  GO-2026-6613  GO-2026-6617
+
+  — all in `net/http`, `net/textproto`, `crypto/tls` and `golang.org/x/net`, all
+  patched only in Go 1.26. G7 went red on `main` and there was no version of
+  "keep the project on 1.25" that produced a clean scan, because the scanner was
+  right: the code *was* calling into the affected symbols.
+
+  The lesson is not "1.26 was the correct baseline all along". It is narrower and
+  more uncomfortable: **pinning a tool below the newest release is only a
+  temporary way to avoid a decision, and the decision still arrives.** The 1.25
+  baseline was held for a reason that was true when written — the newest scanner
+  would not install on it — and that reason expired the moment the standard library
+  the project shipped became the vulnerable one. The cost of deferring was not
+  abstract drift; it was a red `main`.
+
+  Three things changed together, because changing any one of them alone would have
+  been wrong:
+
+  1. `go.mod` `go 1.25.0` → `1.26.0`, `GO_VERSION` in both workflows, the
+     `golang:1.25-bookworm` build stage, `scripts/bootstrap.sh`'s `REQUIRED_GO`,
+     and the README badge and prerequisites. The **Dockerfile is not
+     bookkeeping** — an image built on 1.25 would ship a statically linked binary
+     carrying all nine advisories while CI went green on a different toolchain, and
+     the gate would have cleared the tree it was pointed at while missing the
+     artifact it was shipping.
+  2. `golang.org/x/net` `v0.56.0` → `v0.60.0`, the fix for the five
+     `x/net`-module advisories (GO-2026-6603/6610/6611/6612/6617). This one was
+     genuinely ordinary.
+  3. The scanner pin back to `v1.8.0`, whose `go 1.26.0` requirement is now
+     satisfied. It was re-verified on both axes before adoption rather than assumed:
+     exit 0 and "No vulnerabilities found" on the fixed tree, exit 3 naming all
+     five on the pre-fix tree. The third axis — still fail-open on an unreachable
+     database, which is why the reachability precheck exists — is unchanged across
+     every v1.x release.
+
+  What is **still not guarded**, unchanged: no test asserts the pin is compatible
+  with `GO_VERSION`. That needs the network, and the failure is loud rather than
+  silent. The precheck ordering still protects the DB half, and
+  `TestReachableCveGate` still guards the gate's four ways of becoming a no-op.
 
 ## 39. Deferred To v0.1.1 — What Is Not Covered Yet (v1.1.0)
 
