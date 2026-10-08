@@ -49,12 +49,21 @@
 # image and the manifest could disagree while both looked correct.
 
 # ---------------------------------------------------------------------------
-# Build stage. Pinned to the minor version go.mod requires (1.25) rather than
+# Build stage. Pinned to the minor version go.mod requires (1.26) rather than
 # `latest`: a build that silently changes Go version can change what a build tag
 # means, and a tag like `ignore` or `osusergo` is exactly the kind of thing that
 # differs between releases.
+#
+# 1.26 IS NOT COSMETIC, AND THIS LINE IS THE REASON. Go 1.25's net/http and
+# crypto/tls carry nine reachable advisories (GO-2026-6603 through GO-2026-6617,
+# and GO-2026-6605/6607/6608/6613) that the project's own G7 gate reports and that
+# are only patched in 1.26. An image built `FROM golang:1.25-bookworm` would ship a
+# statically linked binary carrying them while CI went green on a different
+# toolchain — the scanner would clear the tree it was pointed at and miss the
+# binary it was shipping. Bumping this line is what makes the gate and the artifact
+# the same question.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 
 WORKDIR /src
 
