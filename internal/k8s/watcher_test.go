@@ -760,6 +760,10 @@ func TestInformerDeduplicatesRapidRepeats(t *testing.T) {
 		watcher.onUpdate(nil, pod)
 	}
 
+	// The Run goroutine increments these; read them only after it has. See
+	// waitForStats for why reading them immediately is a scheduling race.
+	waitForStats(t, watcher, 1, 1)
+
 	if got := watcher.Stats().DedupSuppressed; got == 0 {
 		t.Errorf("DedupSuppressed = 0; %d repeats were not suppressed", 20)
 	}

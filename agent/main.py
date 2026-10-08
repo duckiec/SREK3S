@@ -429,7 +429,7 @@ def create_app(
                         MAX_REQUEST_BODY_BYTES,
                     )
                     return _error(
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        status.HTTP_413_CONTENT_TOO_LARGE,
                         _ERROR_BODY_TOO_LARGE,
                         request_id,
                     )
@@ -451,7 +451,7 @@ def create_app(
                 request_id,
             )
             return _error(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status.HTTP_413_CONTENT_TOO_LARGE,
                 _ERROR_BODY_TOO_LARGE,
                 request_id,
             )
