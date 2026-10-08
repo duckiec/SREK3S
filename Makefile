@@ -119,10 +119,6 @@ THROWAWAY_WATCH_NS   ?= $(CHAOS_NAMESPACE)
 THROWAWAY_CTR        := /run/k3s/containerd/containerd.sock
 THROWAWAY_CTR_ADDR   := --address $(THROWAWAY_CTR) --namespace k8s.io
 
-# kubectl pinned to the throwaway, for use inside recipe bodies where the
-# KUBECONFIG prefix would otherwise have to be repeated on every line.
-THROWAWAY_KUBECONFIG_KUBECTL := KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL)
-
 # A `make` variable cannot run a shell at expansion time without costing a
 # subshell per use, so the lookup happens once here. `$(shell ...)` is used for
 # exactly one thing: deciding whether a usable interpreter exists.
@@ -140,6 +136,34 @@ done; exit 1)
 # overridable so a developer on a remote cluster can point at their own kubeconfig.
 DOCKER ?= docker
 KUBECTL ?= kubectl
+
+# kubectl pinned to the throwaway, for use inside recipe bodies where the
+# KUBECONFIG prefix would otherwise have to be repeated on every line.
+#
+# THIS MUST BE DEFINED AFTER `KUBECTL`, AND THAT IS NOT COSMETIC.
+#
+# `:=` expands immediately at the point of definition. When this line sat above
+# `KUBECTL ?= kubectl`, `$(KUBECTL)` was still undefined here, so the variable
+# silently became the empty string and every use site expanded to
+#
+#     KUBECONFIG=/tmp/k3s-throwaway.yaml  -n srek3s-system logs ...
+#
+# with no `kubectl` in it at all. bash then failed to find `-n`, `2>/dev/null
+# || true` swallowed the error, the assertion read an empty string, and
+# throwaway-detonate reported `watcher_emitted=0` for a Sentinel that had in
+# fact emitted three.
+#
+# That failure had been there from the first draft. It agreed with the truth for
+# a while only because the Sentinel genuinely WAS emitting zero — a real bug
+# (the NetworkPolicy denied post-DNAT API access) was producing the same number
+# as a broken assertion. Fixing the Sentinel left the assertion still reporting
+# zero, which is how the two were told apart.
+#
+# A verification that reports the right answer for the wrong reason is worse
+# than no verification: it retires the alarm that would have caught the next
+# fault. `agent/tests/test_makefile.py` now asserts this ordering so a future
+# reordering cannot reintroduce it silently.
+THROWAWAY_KUBECONFIG_KUBECTL := KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL)
 
 # Where `go install` puts binaries (GOBIN, else $GOPATH/bin). Used by
 # check-supply-chain to find govulncheck without hardcoding a path.

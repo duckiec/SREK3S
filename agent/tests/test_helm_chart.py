@@ -105,13 +105,65 @@ def test_default_render_denies_9090_ingress() -> None:
 def test_api_server_cidr_override_reaches_the_policy() -> None:
     docs = render(["--set", "networkPolicy.apiServerCidrs[0]=10.100.0.0/16"])
     policy = one(docs, "NetworkPolicy", "srek3s-sentinel")
-    cidrs = [
+    cluster_ip_cidrs = [
         to["ipBlock"]["cidr"]
         for rule in policy["spec"]["egress"]
         for to in rule.get("to", [])
-        if "ipBlock" in to
+        if "ipBlock" in to and to["ipBlock"]["cidr"] != "0.0.0.0/0"
     ]
-    assert cidrs == ["10.100.0.0/16"]
+    assert cluster_ip_cidrs == ["10.100.0.0/16"]
+
+
+@needs_helm
+def test_sentinel_policy_permits_the_api_server_after_dnat() -> None:
+    """The Sentinel must be able to reach the API server on a post-DNAT CNI.
+
+    kube-router is k3s's default CNI, and it evaluates NetworkPolicy AFTER
+    kube-proxy has DNAT'd the ClusterIP. A policy that only allows
+    `<service CIDR>:443` therefore denies every real connection, because by the
+    time it is evaluated the destination is the apiserver's node address on 6443.
+
+    The shipped symptom is a Sentinel that starts cleanly, logs
+    `sentinel running`, and then never watches anything:
+
+        W reflector.go:561] failed to list *v1.Pod: Get
+          "https://10.43.0.1:443/api/v1/namespaces/<ns>/pods?limit=500"
+          dial tcp 10.43.0.1:443: connect: connection refused
+
+    and a packet capture shows the DNAT is fine. This test cannot observe that
+    end to end — no static check can — so it pins the rule that closes the gap.
+    The behavioural proof is `make throwaway-detonate`, which fails loudly if
+    `watcher_emitted` is 0.
+    """
+    policy = one(render(), "NetworkPolicy", "srek3s-sentinel")
+    dnat_ports = [
+        port["port"]
+        for rule in policy["spec"]["egress"]
+        if any(to.get("ipBlock", {}).get("cidr") == "0.0.0.0/0" for to in rule["to"])
+        for port in rule["ports"]
+    ]
+    assert dnat_ports == [6443], (
+        "the Sentinel's egress policy must permit TCP 6443 to 0.0.0.0/0 so "
+        "that post-DNAT CNIs such as kube-router allow API access; without it "
+        "the Sentinel cannot watch its own cluster on a default k3s install"
+    )
+
+
+@needs_helm
+def test_sentinel_policy_widens_nothing_but_6443() -> None:
+    """The post-DNAT rule must not become a general egress hole.
+
+    It is permitted by port precisely so it stays one port wide. If someone
+    widens it to all ports, or adds another any-destination rule, the Sentinel's
+    defence in depth is gone and this fails.
+    """
+    policy = one(render(), "NetworkPolicy", "srek3s-sentinel")
+    for rule in policy["spec"]["egress"]:
+        to_anywhere = any(
+            to.get("ipBlock", {}).get("cidr") == "0.0.0.0/0" for to in rule["to"]
+        )
+        ports = [p["port"] for p in rule["ports"]]
+        assert not to_anywhere or ports == [6443], rule
 
 
 @needs_helm_kubectl
