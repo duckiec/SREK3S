@@ -116,7 +116,24 @@ def test_api_server_cidr_override_reaches_the_policy() -> None:
 
 @needs_helm_kubectl
 def test_render_matches_kustomize_base() -> None:
-    """Byte-identical invariant: default render equals deploy/base render."""
+    """Every object the chart renders is byte-identical to deploy/base.
+
+    One documented exception: the Namespace.
+
+    `deploy/base` renders a Namespace because kustomize has no equivalent of
+    `helm --create-namespace` and something must create it. The chart
+    deliberately does NOT, because rendering one made `helm install` fail in
+    both directions:
+
+        $ helm install srek3s ./chart -n srek3s-system
+        Error: INSTALLATION FAILED: namespaces "srek3s-system" not found
+        $ helm install srek3s ./chart -n srek3s-system --create-namespace
+        Error: INSTALLATION FAILED: namespaces "srek3s-system" already exists
+
+    The chart lost ownership of the object, so the invariant is restated rather
+    than deleted: nothing else may drift, and the absence of the Namespace is
+    asserted rather than tolerated.
+    """
     import yaml as _yaml
 
     base = subprocess.run(
@@ -136,7 +153,31 @@ def test_render_matches_kustomize_base() -> None:
         if d
     }
     got = {(d.get("kind"), d.get("metadata", {}).get("name")): d for d in render()}
-    assert set(got) == set(want), (set(got) ^ set(want),)
-    for key in want:
+
+    namespaces = {k for k in want if k[0] == "Namespace"}
+    assert namespaces, "deploy/base should still create the namespace"
+    assert not (set(got) & namespaces), (
+        f"the chart must not render a Namespace: {set(got) & namespaces}; "
+        "helm --create-namespace owns it, and rendering one makes every "
+        "helm install fail"
+    )
+
+    comparable_want = {k: v for k, v in want.items() if k[0] != "Namespace"}
+    assert set(got) == set(comparable_want), (set(got) ^ set(comparable_want),)
+    for key in comparable_want:
         assert got[key] == want[key], f"{key} differs between helm and kustomize"
         _ = json.dumps(got[key], sort_keys=True)
+
+
+def test_the_chart_renders_no_namespace_object() -> None:
+    """Guard the fix at its source: the template must not come back.
+
+    A regression here is silent until someone runs `helm install` in anger, and
+    the failure mode is a confusing error rather than an obvious one.
+    """
+    template = REPO_ROOT / "deploy" / "helm" / "srek3s" / "templates" / "namespace.yaml"
+    assert not template.exists(), (
+        "templates/namespace.yaml must not exist: helm --create-namespace owns "
+        "the namespace, and a chart-rendered Namespace makes helm install fail "
+        "with either 'not found' or 'already exists'"
+    )

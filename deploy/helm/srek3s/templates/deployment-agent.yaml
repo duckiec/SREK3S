@@ -48,6 +48,14 @@ spec:
               value: INFO
             - name: SREK3S_MANIFEST_ROOT
               value: /manifests
+            # The manifest this agent may patch, relative to the GitOps checkout.
+            # Emitted only when set, so an unconfigured install is byte-identical
+            # to the previous render rather than gaining an empty override that
+            # would shadow classifier.DEFAULT_TARGET_MANIFEST with "".
+            {{- with .Values.agent.targetManifest }}
+            - name: SREK3S_TARGET_MANIFEST
+              value: {{ . | quote }}
+            {{- end }}
             - name: LLM_PROVIDER
               value: nvidia
             - name: LLM_BASE_URL

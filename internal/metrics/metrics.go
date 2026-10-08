@@ -78,12 +78,17 @@ func (r *Registry) Serve(ctx context.Context, log *slog.Logger) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		select {
-		case <-ctx.Done():
-			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = server.Shutdown(shutCtx)
-		}
+		// A direct receive, not a one-case select: there is nothing to race
+		// against, and `select { case <-ctx.Done(): ... }` is staticcheck S1000.
+		//
+		// This goroutine used to `defer close(done)` on a channel that Serve
+		// also closed, which panicked on every SIGTERM. The channel is gone;
+		// nothing here needs to signal anything, because ListenAndServe
+		// returns as soon as Shutdown completes.
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutCtx)
 	}()
 	if log != nil {
 		log.Info("metrics listening", "addr", Addr)
