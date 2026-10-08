@@ -23,7 +23,26 @@ import (
 // requires every blocking operation to be context-bounded; a timeout configured
 // only on the caller's context would be one `context.Background()` away from
 // unbounded.
-const DefaultTimeout = 5 * time.Second
+//
+// It MUST exceed the agent's worst-case service time (see [AgentMaxServiceTime]),
+// and this value previously did not: it was 5s against an agent that makes two
+// sequential LLM calls of up to 60s each on the Tier-2 path. Every Tier-2 request
+// therefore timed out client-side, was retried up to DefaultMaxAttempts, and
+// escalated — while the agent burned a threadpool thread for up to two minutes.
+// The failure is silent: the incident is delivered, the verdict is discarded.
+const DefaultTimeout = 130 * time.Second
+
+// AgentMaxServiceTime is the upper bound on the agent's worst-case time to first
+// response body byte, as a cross-language contract.
+//
+// agent/llm.py LLM_TIMEOUT_SECONDS is 60s per model call, and
+// agent/triage.py's Tier-2 path makes two sequential calls (_narrative_overlay,
+// then _model_rca_section) plus retry sleeps. 120s of model time plus overhead is
+// the figure; DefaultTimeout carries 10s of headroom on top.
+//
+// If either side changes, change both. TestEmitterTimeoutExceedsAgentWorstCase
+// in emitter_test.go pins the Go half against this constant.
+const AgentMaxServiceTime = 120 * time.Second
 
 // IncidentsPath is the canonical wire endpoint (ARCH §4, agent/main.py
 // TRIAGE_PATH).
@@ -83,10 +102,19 @@ type Config struct {
 // goroutine is already bounded and already has a per-incident timeout - a retry
 // loop here cannot outlive the worker that called it.
 type Client struct {
-	baseURL       string
-	incidentsURL  string
-	http          *http.Client
-	maxAttempts   int
+	baseURL      string
+	incidentsURL string
+	http         *http.Client
+	maxAttempts  int
+	// timeout is the effective per-attempt deadline, resolved in New and stored
+	// here rather than read back off c.http.Timeout at call time. An injected
+	// HTTPClient may legitimately carry Timeout == 0 (meaning "no client-level
+	// deadline", e.g. httptest's client), and context.WithTimeout(ctx, 0)
+	// returns an ALREADY-cancelled context - so every attempt would fail
+	// instantly with "context deadline exceeded" and no incident could ever be
+	// delivered. Reading the timeout off the client instead of the resolved
+	// config value is what introduced that.
+	timeout       time.Duration
 	now           func() time.Time
 	events        func(*worker.Incident) []ClusterEvent
 	version       string
@@ -130,6 +158,7 @@ func New(cfg Config) (*Client, error) {
 		baseURL:      baseURL,
 		incidentsURL: baseURL + IncidentsPath,
 		maxAttempts:  attempts,
+		timeout:      timeout,
 		now:          now,
 		events:       cfg.Events,
 		version:      cfg.SentinelVersion,
@@ -288,7 +317,7 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 		// The per-attempt context is derived from the caller's, so a cancellation
 		// from the pool's per-incident timeout still propagates and the retry loop
 		// cannot outlive its worker.
-		attemptCtx, cancel := context.WithTimeout(ctx, c.http.Timeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
 		status, detail, err := c.post(attemptCtx, body)
 		cancel()
 

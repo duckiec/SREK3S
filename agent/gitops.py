@@ -130,30 +130,45 @@ def _clone(url: str, token: str, ref: str, dest: str, timeout: float) -> str | N
 def materialise_manifest_root(env: Mapping[str, str] | None = None) -> ManifestProvider:
     """Build the manifest provider, cloning a GitOps checkout when configured.
 
-    Resolution order:
+    Resolution order (this order was previously INVERTED, which made the whole
+    module dead code as shipped):
 
-    * ``SREK3S_MANIFEST_ROOT`` names a usable directory -> use it, as before.
     * ``SREK3S_GITOPS_REPO_URL`` is set -> shallow-clone it into a fresh
-      directory under the process temp dir and serve that.
-    * neither -> the unreadable provider, as before.
+      directory under the process temp dir and serve that. THIS IS CHECKED
+      FIRST.
+    * ``SREK3S_MANIFEST_ROOT`` names a usable directory -> use it.
+    * neither -> the unreadable provider.
 
-    A failed clone logs once and returns the unreadable provider. The caller
-    keeps answering incident traffic; every incident simply escalates.
+    Why the order matters. deploy/agent.yaml and the Helm chart BOTH set
+    SREK3S_MANIFEST_ROOT=/manifests *and* SREK3S_GITOPS_REPO_URL. The old code
+    tested MANIFEST_ROOT first and returned immediately, so _clone never ran in
+    either deployment, SREK3S_GITOPS_TOKEN was read and never used, and the
+    agent served an emptyDir that is indistinguishable from a real checkout.
+
+    The root is still honoured when no repo URL is configured - that is the
+    documented file-mounted mode - but a configured repository now wins, and the
+    provider that is actually built is logged by name so this can never be
+    ambiguous again.
+
+    A failed clone logs once and falls back to the manifest root if there is a
+    usable one, and only then to the unreadable provider. The caller keeps
+    answering incident traffic; every incident simply escalates.
     """
     source = os.environ if env is None else env
-    if (source.get(MANIFEST_ROOT_ENV) or "").strip():
-        return manifest_provider_from_env(dict(source))
+    root = (source.get(MANIFEST_ROOT_ENV) or "").strip()
 
     url = (source.get(GITOPS_REPO_URL_ENV) or "").strip()
     if not url:
-        return manifest_provider_from_env(dict(source))
+        return _from_root(root, dict(source))
+
     if not url.startswith("https://"):
         logger.warning(
-            "%s must be an https URL, got %r; every incident escalates",
+            "%s must be an https URL, got %r; falling back to %s",
             GITOPS_REPO_URL_ENV,
             url,
+            MANIFEST_ROOT_ENV,
         )
-        return unreadable_manifest_provider()
+        return _from_root(root, dict(source))
 
     token = (source.get(GITOPS_TOKEN_ENV) or "").strip()
     if token:
@@ -165,29 +180,61 @@ def materialise_manifest_root(env: Mapping[str, str] | None = None) -> ManifestP
     ref = (source.get(GITOPS_REF_ENV) or "").strip() or DEFAULT_REF
     if ref.startswith("-"):
         logger.warning(
-            "%s=%r is not a valid ref; every incident escalates",
+            "%s=%r is not a valid ref; falling back to %s",
             GITOPS_REF_ENV,
             ref,
+            MANIFEST_ROOT_ENV,
         )
-        return unreadable_manifest_provider()
+        return _from_root(root, dict(source))
     timeout = _resolve_timeout(source.get(GITOPS_TIMEOUT_ENV) or "")
 
     try:
         dest = tempfile.mkdtemp(prefix="srek3s-gitops-")
     except OSError as exc:
         logger.warning("could not create GitOps checkout directory: %s", exc)
-        return unreadable_manifest_provider()
+        return _from_root(root, dict(source))
 
     failure = _clone(url, token, ref, dest, timeout)
     if failure is not None:
         logger.warning(
-            "GitOps clone of %s failed (%s); every incident escalates",
+            "GitOps clone of %s failed (%s); falling back to %s",
             GITOPS_REPO_URL_ENV,
             failure,
+            MANIFEST_ROOT_ENV,
         )
-        return unreadable_manifest_provider()
+        _rmtree(dest)
+        return _from_root(root, dict(source))
     try:
-        return FileManifestProvider(dest)
+        provider = FileManifestProvider(dest)
     except ValueError as exc:
         logger.warning("cloned GitOps checkout is unusable: %s", exc)
+        _rmtree(dest)
+        return _from_root(root, dict(source))
+
+    # Which provider was actually built. The emptyDir case and a real checkout
+    # were previously indistinguishable from each other in the logs, which is
+    # precisely the failure classifier._target_manifest_is_wellformed's comment
+    # says it wants to avoid.
+    logger.info(
+        "GitOps checkout materialised from %s (ref=%s) at %s; %s is set but NOT used",
+        url,
+        ref,
+        dest,
+        MANIFEST_ROOT_ENV,
+    )
+    return provider
+
+
+def _rmtree(path: str) -> None:
+    """Remove a temp checkout directory, ignoring failure."""
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:  # pragma: no cover - defensive
+        pass
+
+
+def _from_root(root: str, env: Mapping[str, str]) -> ManifestProvider:
+    """Serve ``root`` if it is configured, else the unreadable provider."""
+    if not root:
         return unreadable_manifest_provider()
+    return manifest_provider_from_env(dict(env))

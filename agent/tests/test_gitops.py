@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -35,13 +36,32 @@ def test_no_config_falls_back_to_existing_behavior() -> None:
     assert provider.read_manifest("deploy/x.yaml") is None
 
 
-def test_manifest_root_still_wins(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_configured_repo_wins_over_manifest_root(tmp_path: Any) -> None:
+    """A configured repository must be cloned, even when MANIFEST_ROOT is set.
+
+    This is the defect fix. deploy/agent.yaml and the Helm chart both set
+    SREK3S_MANIFEST_ROOT=/manifests (an emptyDir) AND SREK3S_GITOPS_REPO_URL.
+    The old resolution order tested MANIFEST_ROOT first and returned immediately,
+    so _clone never ran in either shipped deployment, SREK3S_GITOPS_TOKEN was
+    read and never used, and the whole GitOps module was dead code that looked
+    exactly like a working configuration.
+    """
     target = tmp_path / "deploy" / "x.yaml"
     target.parent.mkdir(parents=True)
     target.write_text("apiVersion: v1\n")
-    with mock.patch.object(subprocess, "run") as run:
+
+    cloned: dict[str, Any] = {}
+
+    def fake_run(cmd: Any, **kwargs: Any) -> Any:
+        cloned["cmd"] = cmd
+        # The clone is expected to populate the destination directory; do that
+        # here so FileManifestProvider can be constructed from it.
+        dest = cmd[-1]
+        (Path(dest) / "deploy").mkdir(parents=True, exist_ok=True)
+        (Path(dest) / "deploy" / "x.yaml").write_text("apiVersion: v1\n")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(subprocess, "run", side_effect=fake_run):
         provider = materialise_manifest_root(
             {
                 MANIFEST_ROOT_ENV: str(tmp_path),
@@ -49,7 +69,37 @@ def test_manifest_root_still_wins(
                 GITOPS_TOKEN_ENV: "tok",
             }
         )
+
+    assert "clone" in cloned["cmd"], "the clone must run when a repo is configured"
+    assert provider.read_manifest("deploy/x.yaml") is not None
+
+
+def test_manifest_root_still_serves_when_no_repo_configured(tmp_path: Any) -> None:
+    """The file-mounted mode is still honoured when no repository is set."""
+    target = tmp_path / "deploy" / "x.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("apiVersion: v1\n")
+    with mock.patch.object(subprocess, "run") as run:
+        provider = materialise_manifest_root({MANIFEST_ROOT_ENV: str(tmp_path)})
     run.assert_not_called()
+    assert provider.read_manifest("deploy/x.yaml") is not None
+
+
+def test_failed_clone_falls_back_to_manifest_root(tmp_path: Any) -> None:
+    """A failed clone degrades to the mounted root rather than to nothing."""
+    target = tmp_path / "deploy" / "x.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("apiVersion: v1\n")
+
+    def failing_run(cmd: Any, **kwargs: Any) -> Any:
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=128, stdout="", stderr="fatal: not found"
+        )
+
+    with mock.patch.object(subprocess, "run", side_effect=failing_run):
+        provider = materialise_manifest_root(
+            {MANIFEST_ROOT_ENV: str(tmp_path), GITOPS_REPO_URL_ENV: URL}
+        )
     assert provider.read_manifest("deploy/x.yaml") is not None
 
 

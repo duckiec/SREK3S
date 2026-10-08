@@ -119,7 +119,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         # Full history. `git apply --check` and the agent's I-B2 verification both
         # initialise throwaway repositories, and a shallow clone changes what
         # `git init` can see about the parent - which is a difference between this
@@ -129,13 +129,13 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -1881,12 +1881,18 @@ jobs:
           # in effect and nothing failed. Asserting the flag would pass against a
           # cluster-wide watch; asserting the line the watcher reports back is the
           # observation that can distinguish them.
-          kubectl -n srek3s-system logs deployment/srek3s-sentinel \
-            | grep -q "watching one namespace" || {
+          # Captured to a variable, not piped into grep -q. Under pipefail the
+          # piped form is a SIGPIPE race: grep -q exits on the first match,
+          # kubectl takes SIGPIPE and dies 141, and pipefail hands that 141 to
+          # the pipeline in place of grep's 0 - so a PASSING assertion reports
+          # failure, intermittently. Measured on this project: 60 failures in 60
+          # runs piped, 0 in 60 captured.
+          sentinel_scope_log="$(kubectl -n srek3s-system logs deployment/srek3s-sentinel --tail=40 || true)"
+          if ! grep -qF "watching one namespace" <<<"$sentinel_scope_log"; then
               echo "::error::the in-cluster Sentinel did not report a namespace scope"
-              kubectl -n srek3s-system logs deployment/srek3s-sentinel --tail=30 || true
+              echo "$sentinel_scope_log"
               exit 1
-            }
+          fi
 
           # And the UID, observed from inside the container rather than from the
           # manifest. deploy/sentinel.yaml and cmd/sentinel/Dockerfile both declare
@@ -1957,8 +1963,12 @@ jobs:
           for verb in get list watch; do
             for resource in pods events; do
               for ns in srek3s-system sentinel-chaos; do
-                if ! kubectl auth can-i "$verb" "$resource" -n "$ns" --as="$SA" 2>/dev/null \
-                     | grep -qx yes; then
+                # Captured, not piped: `kubectl auth can-i | grep -qx yes` under pipefail is
+                # the same SIGPIPE race - grep -q exits on the match, kubectl dies
+                # 141, and pipefail replaces grep's 0 with that 141, so the check
+                # reports the grant is missing when it is present.
+                answer="$(kubectl auth can-i "$verb" "$resource" -n "$ns" --as="$SA" 2>/dev/null || echo no)"
+                if [ "$answer" != "yes" ]; then
                   echo "::error::$SA cannot $verb $resource in $ns; the read-only path is broken"
                   exit 1
                 fi

@@ -9,6 +9,11 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: 3
+  # Recreate, not RollingUpdate. With a single replica the default
+  # RollingUpdate (maxUnavailable=0, maxSurge=1) starts the new pod before
+  # killing the old one, yielding a two-watcher window that double-emits.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: srek3s-sentinel

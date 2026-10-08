@@ -351,6 +351,15 @@ class ResourceLimits(_Strict):
     memory_working_set_bytes: int | None = Field(default=None, ge=0)
 
 
+#: Ceiling on IncidentPayload.cluster_events.
+#:
+#: Each ClusterEvent allows a 4096-char message, so an unbounded list is a
+#: request-size amplifier. The Sentinel's own event List is bounded by
+#: internal/k8s telemetry.go, and 64 is comfortably above the number of events
+#: Kubernetes attaches to a single failing container.
+CLUSTER_EVENTS_MAX: Final[int] = 64
+
+
 class ClusterEvent(_Strict):
     """A Kubernetes Event matching the incident (ARCH §4.1)."""
 
@@ -404,7 +413,12 @@ class IncidentPayload(_Strict):
     previous_reason: str | None = Field(default=None, max_length=256)
 
     scrubbed_logs: list[str] = Field(default_factory=list)
-    cluster_events: list[ClusterEvent] = Field(default_factory=list)
+    # Capped: every element is materialised, validated field-by-field, and then
+    # re-serialised, so an unbounded list is an unbounded-read DoS on a field the
+    # producer only ever populates with the events attached to one pod.
+    cluster_events: list[ClusterEvent] = Field(
+        default_factory=list, max_length=CLUSTER_EVENTS_MAX
+    )
     redaction_report: RedactionReport
 
     detection_latency_ms: int = Field(ge=0, le=2000)

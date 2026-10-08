@@ -348,16 +348,27 @@ class SandboxRunner:
                     f"sandbox produced non-JSON output: {completed.stdout[:120]!r}"
                 ) from exc
 
-        cgroup_ok = _try_cgroup(
-            "srek3s-agent/memory.max", str(self.policy.cgroup_memory_bytes)
-        ) and _try_cgroup(
-            "srek3s-agent/cpu.max", f"{self.policy.cgroup_cpu_weight * 1000} 100000"
-        )
+        # cgroup_enforced is reported, and it must never claim a limit that was
+        # never applied to this child.
+        #
+        # This used to write memory.max and cpu.max AFTER subprocess.run had
+        # already returned and reaped the child, into a cgroup the child was never
+        # a member of. It therefore bounded nothing, and could report
+        # cgroup_enforced=True for a constraint that constrained no one - exactly
+        # the "claiming the budget was enforced when it was not" outcome this
+        # module exists to prevent. The child must be moved into the cgroup
+        # BEFORE it execs for the write to mean anything, and this deployment has
+        # neither CAP_SYS_ADMIN nor a writable cgroup mount to do that with.
+        #
+        # So rather than report a fiction, cgroup_enforced is False
+        # unconditionally and rlimits_applied reflects what genuinely happened -
+        # the setrlimit pair installed by preexec_fn before exec.
+        rlimits_ok = resource_limits_supported() and preexec is not None
 
         return SandboxResult(
             payload=payload,
             latency_ms=int(elapsed * 1000),
-            rlimits_applied=resource_limits_supported(),
-            cgroup_enforced=cgroup_ok,
+            rlimits_applied=rlimits_ok,
+            cgroup_enforced=False,
             stdout_bytes=len(completed.stdout.encode("utf-8")),
         )

@@ -1310,11 +1310,58 @@ def _require_text(response: Any, diagnose: Any) -> str:
     all. Reading it unguarded would report every such case as a transport
     failure, and the causes are genuinely different, so the finish reason is
     consulted first.
+
+    THE getattr IS THE BUG, and it is exactly the shape this function's own
+    docstring warns against. ``getattr(obj, name, default)`` only suppresses
+    AttributeError; it does NOT suppress an exception raised *inside* the
+    property. google-genai's ``GenerateContentResponse.text`` is a property
+    that raises ValueError when no candidate carries a text part (safety
+    block, refusal, MAX_TOKENS truncation). So the ValueError propagated out of
+    this function untouched, _require_text and diagnose never ran, and the raw
+    SDK exception escaped ``complete()`` - bypassing triage._narrative_overlay's
+    catch of ModelOutputError and turning a documented graceful degradation into
+    a 500 analysis_failed.
+
+    The property is therefore never touched unguarded, and the text is read
+    structurally from the candidates/parts instead, which cannot raise.
     """
-    raw = getattr(response, "text", None)
+    raw = _read_gemini_text_structurally(response)
     if isinstance(raw, str) and raw.strip():
         return raw
+    # Fall back to the property ONLY inside an except, so its ValueError becomes
+    # the diagnosis rather than an escape.
+    try:
+        fallback = getattr(response, "text", None)
+    except Exception as exc:  # noqa: BLE001 - the property itself raises
+        fallback = None
+        logger.debug("gemini .text property raised: %s", exc)
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback
     raise ModelOutputError(str(diagnose(response)))
+
+
+def _read_gemini_text_structurally(response: Any) -> str | None:
+    """Concatenate the text parts of a GenerateContentResponse, or ``None``.
+
+    Structural access is used instead of the ``.text`` property because the
+    property raises when there is no text part - and the entire purpose of this
+    function is to handle exactly that case without raising. Returns None when
+    the shape is unrecognised, which the caller turns into a diagnosis.
+    """
+    candidates = getattr(response, "candidates", None)
+    if not isinstance(candidates, (list, tuple)):
+        return None
+    pieces: list[str] = []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None)
+        if not isinstance(parts, (list, tuple)):
+            continue
+        for part in parts:
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and text:
+                pieces.append(text)
+    return "".join(pieces) if pieces else None
 
 
 # ---------------------------------------------------------------------------
