@@ -83,7 +83,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True, help="manifest to patch")
     parser.add_argument(
         "--path",
-        default="deploy/payments/checkout-api.yaml",
+        # No default, for the same reason classifier.DEFAULT_TARGET_MANIFEST
+        # is empty: the target is a property of the deployment, so this tool
+        # will not invent one. It used to default to
+        # deploy/payments/checkout-api.yaml, a path that exists nowhere, which
+        # meant an invocation that forgot --path still produced a clean-looking
+        # verification against a file nobody could go and look at.
+        required=True,
         help="repo-relative path the diff will declare",
     )
     parser.add_argument("--container", default="checkout-api")

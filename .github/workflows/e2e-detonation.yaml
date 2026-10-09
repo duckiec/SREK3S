@@ -617,13 +617,13 @@ jobs:
           # required. SREK3S_MANIFEST_ROOT is where the GitOps checkout is;
           # without it the provider is `unreadable_manifest_provider()` and every
           # incident escalates under I-B2. SREK3S_TARGET_MANIFEST is *which*
-          # file inside that checkout the patch targets - the default,
-          # deploy/payments/checkout-api.yaml, does not exist in this repository,
-          # so without this the agent reads a missing file and escalates anyway.
+          # file inside that checkout the patch targets, and the agent ships no
+          # default for it — an unset value means no patch target at all, so the
+          # escalation reason names the missing variable rather than the file.
           #
           # Set here rather than by hardcoding a namespace->manifest map in
-          # triage.py: the routing belongs to the harness, and the production
-          # default is unchanged when the variable is absent.
+          # triage.py: the routing belongs to the harness, and the agent's
+          # behaviour when the variable is absent is to escalate.
           SREK3S_SANDBOX=1 \
           SREK3S_LOG_LEVEL=INFO \
           SREK3S_MANIFEST_ROOT="$PWD" \

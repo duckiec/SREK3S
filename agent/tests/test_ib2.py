@@ -213,9 +213,17 @@ class TestGitApplyCheck:
         diff = patch_engine.build_diff(
             manifest, target, "512Mi", triage.TARGET_MANIFEST
         )
+        # Corrupt whichever path the header actually carries. This used to
+        # replace the literal "deploy/payments", which was the old
+        # `DEFAULT_TARGET_MANIFEST`; once that stopped being the session target,
+        # the replacement matched nothing, the diff passed unmodified and the
+        # assertion below failed for the wrong reason. Deriving the corrupted
+        # path from the diff keeps the test measuring what it claims to.
+        corrupted = diff.replace(triage.TARGET_MANIFEST, "deploy/other/x.yaml")
+        assert corrupted != diff, "the diff header must name the target to corrupt it"
         ok, _ = patch_engine.git_apply_check(
             manifest,
-            diff.replace("deploy/payments", "deploy/other"),
+            corrupted,
             triage.TARGET_MANIFEST,
         )
         assert not ok
@@ -399,6 +407,43 @@ class TestIB2GatesEmission:
             if outcome.tier is BlastRadiusTier.TIER_2_ARCHITECTURAL:
                 assert outcome.response.remediation.git_patch == "", manifest[:40]
                 assert outcome.response.remediation.patch_validated is False
+
+
+class TestNoConfiguredTarget:
+    """Unset is not "the checkout is broken"; it is "there is nothing to read".
+
+    `classifier.DEFAULT_TARGET_MANIFEST` is empty, so a deployment that never
+    sets `SREK3S_TARGET_MANIFEST` has no patch target. The provider would answer
+    `None` for an empty path as well, so the tier is TIER-2 either way - but the
+    escalation reason is the only thing that distinguishes "populate the
+    checkout" from "name the file you own", and it has to say which.
+    """
+
+    def test_an_unset_target_escalates_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(triage, "TARGET_MANIFEST", "")
+        outcome = outcome_for(fixture_manifest())
+        assert outcome.tier is BlastRadiusTier.TIER_2_ARCHITECTURAL
+        assert any(
+            classifier.TARGET_MANIFEST_ENV in r for r in outcome.reasons
+        ), outcome.reasons
+
+    def test_an_unset_target_proposes_nothing_and_names_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The response asserts a target it does not have.
+
+        `Remediation.target_manifest` carried the old default on every Tier-2
+        response, so an escalation pointed an operator at a file that never
+        existed. Empty is the truthful encoding, and the schema admits it only
+        because an empty patch may not be paired with a named target.
+        """
+        monkeypatch.setattr(triage, "TARGET_MANIFEST", "")
+        remediation = outcome_for(fixture_manifest()).response.remediation
+        assert remediation.target_manifest == ""
+        assert remediation.git_patch == ""
+        assert remediation.patch_validated is False
 
 
 def test_git_is_available_where_the_image_needs_it() -> None:

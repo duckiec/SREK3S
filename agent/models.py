@@ -547,19 +547,36 @@ class Remediation(_Strict):
 
     summary: str = Field(min_length=1, max_length=1000)
     risk_level: RiskLevel
-    target_manifest: str = Field(min_length=5, max_length=512)
+    #: Empty is a legal value and means *this response targets no manifest*.
+    #: It is what an escalation carries when no target is configured - see
+    #: ``_a_patch_names_its_target`` for the coupling that keeps empty from
+    #: reaching a response that does carry a patch.
+    target_manifest: str = Field(max_length=512)
     git_patch: str = Field(default="", max_length=1_000_000)
     patch_validated: bool = False
 
     @field_validator("target_manifest")
     @classmethod
     def _manifest_is_repo_relative(cls, value: str) -> str:
-        """Require a repository-relative manifest path.
+        """Require a repository-relative manifest path, or nothing at all.
 
         Rejects absolute paths, parent-directory traversal, and non-manifest
         extensions. A patch target outside the GitOps repository would be
         unreviewable and un-revertable, which defeats the whole control.
+
+        ``""`` is admitted rather than refused, and this used to be
+        ``Field(min_length=5)``. The agent ships no default target manifest:
+        ``classifier.DEFAULT_TARGET_MANIFEST`` is empty, because the only
+        candidate this repository ever had named a path that exists nowhere, and
+        an escalation that could not name a file had to invent one. The field
+        previously had ``min_length=5`` precisely so that fiction could not be
+        expressed, and the Tier-2 path satisfied it by passing the fiction
+        through. An empty target on an empty patch is the truthful encoding of
+        "there is nothing to apply", so the constraint moved to the coupling
+        below rather than onto the field.
         """
+        if value == "":
+            return value
         if value.startswith(("/", "\\")) or ":" in value:
             raise ValueError("target_manifest must be repository-relative")
         if ".." in value.split("/"):
@@ -583,6 +600,33 @@ class Remediation(_Strict):
             raise ValueError(
                 "patch_validated is true but git_patch is empty; a Tier-2 "
                 "response must set patch_validated=false (I-B1)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _a_patch_names_its_target(self) -> Remediation:
+        """A diff may not travel without the file it applies to (I-B2).
+
+        This is the coupling that lets ``target_manifest`` be empty. Dropping
+        ``min_length=5`` without it would have widened the wire contract in both
+        directions at once: a Tier-1 response carrying ``git_patch`` and no
+        target would validate, and ``patch_validated=true`` over a diff with no
+        named file asserts that ``git apply --check`` was run against something
+        the reader cannot go and look at. That is the one direction the
+        relaxation must not reach.
+
+        The reverse is allowed and is what an escalation carries: a response with
+        no patch may still name the manifest an operator should edit, which is
+        what the escalation path does whenever a target is configured. Empty
+        target with empty patch means *nothing is configured and nothing is
+        proposed*, and `tests/e2e/runner.py` already requires a non-empty
+        ``target_manifest`` on the Tier-1 leg, so the empty case cannot reach a
+        patch claim.
+        """
+        if self.git_patch and not self.target_manifest:
+            raise ValueError(
+                "git_patch is non-empty but target_manifest is empty; a diff "
+                "must name the repository-relative manifest it applies to (I-B2)"
             )
         return self
 

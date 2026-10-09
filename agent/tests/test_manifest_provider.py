@@ -306,7 +306,7 @@ def test_a_symlink_within_the_root_is_allowed(
     ordinary GitOps practice. The check is on **where the link points**, not on
     its existence, and this is what proves the difference.
     """
-    real = checkout / "deploy" / "payments" / "checkout-api.yaml"
+    real = checkout / TARGET_MANIFEST
     alias = checkout / "deploy" / "alias.yaml"
     try:
         os.symlink(real, alias)
@@ -579,33 +579,35 @@ def test_the_default_provider_and_the_env_default_agree() -> None:
 # ---------------------------------------------------------------------------
 # Which file Tier-1 is allowed to patch (SREK3S_TARGET_MANIFEST)
 #
-# `classifier.TARGET_MANIFEST` pointed at deploy/payments/checkout-api.yaml,
-# which does not exist in this repository. With SREK3S_MANIFEST_ROOT set,
+# `classifier.TARGET_MANIFEST` used to point at deploy/payments/checkout-api.yaml,
+# which exists in no checkout of anything. With SREK3S_MANIFEST_ROOT set,
 # read_manifest returned None and every incident escalated under I-B2, so no
 # Tier-1 patch could ever be produced and ROADMAP 4.2.6 was unreachable on a
-# live cluster. The fix is to make the target configurable and default it to the
-# existing constant, so the harness points the engine at its own fixture and
-# the production default is unchanged.
+# live cluster. The variable is how a deployment says which file it owns; the
+# default is now empty, so the only way to have a target is to configure one.
 # ---------------------------------------------------------------------------
 
 
-def test_the_default_target_is_unchanged() -> None:
-    """The production behaviour is exactly what it was before the override.
+def test_there_is_no_shipped_default_target_manifest() -> None:
+    """The defect, as a standing property: no default can come back.
 
-    Asserted because "unchanged by default" is the entire claim that makes this
-    a configuration knob rather than a semantic change to a constant, and a
-    silent edit to the default would leave the shipped engine patching a
-    different file with nothing in the diff to say so.
+    There is no path that is correct for an arbitrary deployment. The value that
+    used to be here could not exist in any GitOps checkout, so it bought nothing
+    except a second, indistinguishable cause of "every incident escalates":
+    an empty mount and an unresolvable target present the same way, and the
+    escalation text named the filesystem rather than the missing variable.
+
+    `main` logs ERROR at startup when this is empty, and `_build_remediation_diff`
+    escalates naming `SREK3S_TARGET_MANIFEST`. Both are what an operator needs;
+    a fabricated default would make both unnecessary and wrong.
     """
-    assert DEFAULT_TARGET_MANIFEST == "deploy/payments/checkout-api.yaml"
-    assert resolve_target_manifest({}) == DEFAULT_TARGET_MANIFEST
-    assert resolve_target_manifest({TARGET_MANIFEST_ENV: ""}) == DEFAULT_TARGET_MANIFEST
-    assert resolve_target_manifest({TARGET_MANIFEST_ENV: "   "}) == (
-        DEFAULT_TARGET_MANIFEST
-    )
-    # And the module-level value the engine actually reads is that default,
-    # because nothing set the variable in this process.
-    assert TARGET_MANIFEST == DEFAULT_TARGET_MANIFEST
+    assert DEFAULT_TARGET_MANIFEST == ""
+    assert resolve_target_manifest({}) == ""
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: ""}) == ""
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: "   "}) == ""
+    # And the module-level value this process actually reads, which conftest.py
+    # has configured for the session, is not the empty default.
+    assert TARGET_MANIFEST != ""
 
 
 def test_the_override_is_honoured() -> None:
@@ -640,7 +642,7 @@ def test_the_override_is_honoured() -> None:
         "bare-name",
     ],
 )
-def test_control_a_malformed_override_falls_back_to_the_default(
+def test_control_a_malformed_override_yields_no_target(
     value: str,
 ) -> None:
     """The defect: a mistyped target silently becomes the patch target.
@@ -649,17 +651,14 @@ def test_control_a_malformed_override_falls_back_to_the_default(
     manifest. The two dangerous outcomes of accepting one are: (a) a target that
     cannot exist, which escalates every incident under I-B2 and presents as a
     healthy system that never patches; and (b) a target that resolves to some
-    other file, which patches the wrong thing. Falling back to the default is
-    safe precisely because the default fails closed too when no checkout is
-    mounted, so the failure is a loud escalation rather than a wrong write.
+    other file, which patches the wrong thing. A refusal leaves no target at
+    all, so the misconfiguration escalates rather than writing to something.
 
     This is the control that keeps the knob from being a way to smuggle a path
     past :meth:`FileManifestProvider._resolve`, which is the real security
     boundary and which re-checks on every read regardless.
     """
-    assert resolve_target_manifest({TARGET_MANIFEST_ENV: value}) == (
-        DEFAULT_TARGET_MANIFEST
-    )
+    assert resolve_target_manifest({TARGET_MANIFEST_ENV: value}) == ""
 
 
 def test_control_a_malformed_override_is_logged(
@@ -667,18 +666,17 @@ def test_control_a_malformed_override_is_logged(
 ) -> None:
     """A rejected override must be **named**, or it is a silent correction.
 
-    Falling back quietly is how a misconfigured deployment ends up patching a
-    file nobody chose: the engine works, the patch is valid, and nothing in any
-    log says the operator's value was discarded. The warning carries both the
-    rejected value and the one used instead.
+    Correcting the value quietly is how a misconfigured deployment ends up
+    escalating every incident for a reason nobody logged. The warning carries the
+    variable, the rejected value, and the fact that there is now no target - the
+    last of those being what an operator has to act on, and the part that used to
+    be a formatted `DEFAULT_TARGET_MANIFEST` that read as reassurance.
     """
     with caplog.at_level(logging.WARNING, logger="srek3s.agent"):
-        assert resolve_target_manifest({TARGET_MANIFEST_ENV: "/etc/passwd"}) == (
-            DEFAULT_TARGET_MANIFEST
-        )
+        assert resolve_target_manifest({TARGET_MANIFEST_ENV: "/etc/passwd"}) == ""
     assert TARGET_MANIFEST_ENV in caplog.text
     assert "/etc/passwd" in caplog.text
-    assert DEFAULT_TARGET_MANIFEST in caplog.text
+    assert "no patch target" in caplog.text
 
 
 def test_a_valid_override_is_not_logged_as_a_warning(
@@ -738,6 +736,37 @@ def test_the_startup_log_names_the_effective_target(
         asyncio.run(drive())
     assert "target_manifest=" in caplog.text
     assert TARGET_MANIFEST in caplog.text
+
+
+def test_the_startup_log_errors_when_no_target_is_configured(
+    checkout: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset target is a fault, and it says so at ERROR rather than INFO.
+
+    The two all-Tier-2 deployments are the empty mount and the unset target. The
+    escalation text names the filesystem, so without this line they are the same
+    incident from outside - and "the design is working" and "this deployment
+    cannot do the thing Tier-1 exists for" need opposite responses from whoever
+    is on call. `conftest.py` configures the target for the session, so the
+    unset case has to be induced; the constant is read through the module
+    attribute by `main`, which is what makes that faithful rather than a mock.
+    """
+    monkeypatch.setattr(classifier, "TARGET_MANIFEST", "")
+
+    async def drive() -> None:
+        async with _lifespan(
+            create_app(manifest_provider=FileManifestProvider(checkout))
+        ):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="srek3s.agent"):
+        asyncio.run(drive())
+    assert "target_manifest=(none)" in caplog.text
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors, "an unconfigured target must not be logged as routine startup"
+    assert TARGET_MANIFEST_ENV in errors[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

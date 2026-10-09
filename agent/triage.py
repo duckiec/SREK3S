@@ -530,6 +530,24 @@ def _build_remediation_diff(
     """
     reasons: list[str] = []
 
+    # No configured target, so there is nothing to read and nothing to diff
+    # against. Checked here rather than left to the provider: the provider would
+    # answer `None` for the empty path too, so both routes escalate, but only
+    # this one can say *why* in terms an operator can act on. "target manifest is
+    # unreadable" is the answer to a filesystem question, and the two look the
+    # same from outside while needing different fixes - populate the checkout,
+    # or set the variable.
+    if not TARGET_MANIFEST:
+        return (
+            None,
+            None,
+            [
+                "no patch target is configured: SREK3S_TARGET_MANIFEST is unset "
+                "or malformed and the agent ships no default, so there is no "
+                "manifest this process is permitted to patch (I-B2)"
+            ],
+        )
+
     memory_limit = payload.resource_limits.memory_limit
     if memory_limit is None:
         return (

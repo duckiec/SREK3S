@@ -22,12 +22,13 @@ agent:
   # Repository-relative path, inside the cloned GitOps checkout, of the manifest
   # this agent is allowed to patch.
   #
-  # Left empty by default, which means the agent falls back to
-  # classifier.DEFAULT_TARGET_MANIFEST. That default is
-  # "deploy/payments/checkout-api.yaml", which does not exist in this
-  # repository, so an unset value makes every incident escalate under I-B2 with
-  # the reason "target manifest is unreadable" - a message that reads like a
-  # broken checkout rather than a missing configuration key.
+  # There is no shipped default. `classifier.DEFAULT_TARGET_MANIFEST` is empty,
+  # because the value it used to carry ("deploy/payments/checkout-api.yaml")
+  # existed in no checkout of anything: leaving it unset then escalated every
+  # incident for a second reason, indistinguishable from a broken checkout,
+  # because the escalation said "target manifest is unreadable" rather than "no
+  # target is configured". The agent logs ERROR at startup while this is empty
+  # and escalates with the reason naming SREK3S_TARGET_MANIFEST.
   #
   # Set it whenever agent.gitops.repoUrl is set, e.g.
   #   --set agent.gitops.repoUrl=https://github.com/duckiec/SREK3S.git \
