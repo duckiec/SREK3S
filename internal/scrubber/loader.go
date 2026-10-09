@@ -1,7 +1,9 @@
 package scrubber
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 )
@@ -41,10 +43,47 @@ type ManifestFile struct {
 //
 // main.go also does not recover, so there is no path that turns this into a
 // partial install either way.
-func LoadManifestBytes(raw []byte) error {
+// decodeManifest parses the rule manifest, refusing anything the schema does not
+// describe.
+//
+// json.Unmarshal ignores unknown keys, so a ConfigMap edited to misspell `pattern`
+// as `regex` produced a rule whose Pattern was the empty string. The empty pattern
+// compiles, installs, and matches at every position - so one typo silently
+// disarmed one of the eleven rules while the report said the manifest had loaded.
+// Measured: rule "pem_private_key" compiled to an EMPTY pattern, and a planted
+// credential passed through unmasked.
+//
+// That contradicts the docstring above, which claims a schema violation returns an
+// error and that there is "no partial install, no skip-and-continue, and no degraded
+// scrubber". With the decoder strict, the claim is true of unknown fields too.
+//
+// DisallowUnknownFields is deliberately not paired with a trailing-comma or a
+// case-insensitive key fallback: the manifest is generated from a Go struct and
+// checked into deploy/scrubber-configmap.yaml, so there is no reason to accept a
+// spelling the code does not produce.
+func decodeManifest(raw []byte) (ManifestFile, error) {
 	var mf ManifestFile
-	if err := json.Unmarshal(raw, &mf); err != nil {
-		return fmt.Errorf("scrubber: parse manifest: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&mf); err != nil {
+		return ManifestFile{}, fmt.Errorf("scrubber: parse manifest: %w", err)
+	}
+	// A second document in the same stream is not part of the contract. Without
+	// this check the trailing bytes are ignored, so `{...}{...}` loads the first
+	// object and discards the rest - the same class of surprise as an unknown key.
+	if dec.More() {
+		return ManifestFile{}, errors.New(
+			"scrubber: manifest carries more than one JSON document; the loader " +
+				"accepts exactly one",
+		)
+	}
+	return mf, nil
+}
+
+func LoadManifestBytes(raw []byte) error {
+	mf, err := decodeManifest(raw)
+	if err != nil {
+		return err
 	}
 	if len(mf.Rules) == 0 {
 		return fmt.Errorf("scrubber: manifest has no rules")
