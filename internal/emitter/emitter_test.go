@@ -606,6 +606,71 @@ func (r *recorder) handler(status int, body string) http.HandlerFunc {
 	}
 }
 
+// verdictBody is a Contract B document for the given incident, which is what the
+// agent actually answers a 2xx with.
+//
+// The stubs these tests used to return - `{"verdict":"tier_1"}` - are not a shape
+// the agent can produce, and nothing noticed, because until now a 2xx was
+// accepted without the body ever being read. Every success case here therefore has
+// to look like the real thing, or the check would be testing a fiction.
+func verdictBody(incidentID string) string {
+	return `{"schema_version":"1.0.0","incident_id":"` + incidentID + `",` +
+		`"status":"TRIAGED","classification":"RESOURCE_EXHAUSTION","severity":"HIGH",` +
+		`"confidence":0.92,"blast_radius_tier":"TIER_2_ARCHITECTURAL",` +
+		`"root_cause":{"summary":"container exceeded its memory limit","evidence":[],"affected_scope":"container"},` +
+		`"remediation":{"summary":"No automatic change proposed.","risk_level":"HIGH",` +
+		`"target_manifest":"","git_patch":"","patch_validated":false},` +
+		`"verification_policy":{"slo_targets":[],"rollback_plan":"none"},` +
+		`"rca_markdown":"# RCA: memory","analysis_latency_ms":41,"agent_version":"0.1.0"}`
+}
+
+// sentIncidentID reads the incident_id out of a Contract A request body, which is
+// what the real agent echoes into its verdict.
+func sentIncidentID(body string) string {
+	var sent struct {
+		IncidentID string `json:"incident_id"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		return ""
+	}
+	return sent.IncidentID
+}
+
+// verdictHandler records the request and answers 200 with a Contract B verdict
+// echoing the incident id it was sent - which is what the agent does, and the
+// only reason the id can match, since Build mints a fresh one per incident.
+func (r *recorder) verdictHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		buf := make([]byte, 0, 4096)
+		chunk := make([]byte, 1024)
+		for {
+			n, err := req.Body.Read(chunk)
+			buf = append(buf, chunk[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		r.bodies = append(r.bodies, string(buf))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(verdictBody(sentIncidentID(string(buf)))))
+	}
+}
+
+// readAll drains a bounded request body.
+func readAll(req *http.Request) string {
+	buf := make([]byte, 0, 4096)
+	chunk := make([]byte, 1024)
+	for {
+		n, err := req.Body.Read(chunk)
+		buf = append(buf, chunk[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	return string(buf)
+}
+
 func newTestClient(t *testing.T, server *httptest.Server) *Client {
 	t.Helper()
 	client, err := New(Config{
@@ -646,9 +711,9 @@ func TestEmitterTimeoutExceedsAgentWorstCase(t *testing.T) {
 func TestInjectedClientWithNoTimeoutStillDelivers(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"TRIAGED"}`))
+		_, _ = w.Write([]byte(verdictBody(sentIncidentID(readAll(req)))))
 	}))
 	defer server.Close()
 
@@ -677,7 +742,7 @@ func TestInjectedClientWithNoTimeoutStillDelivers(t *testing.T) {
 
 func TestEmitPostsToTheCanonicalPath(t *testing.T) {
 	rec := &recorder{}
-	server := httptest.NewServer(rec.handler(http.StatusOK, `{"verdict":"tier_1"}`))
+	server := httptest.NewServer(rec.verdictHandler())
 	defer server.Close()
 
 	client := newTestClient(t, server)
@@ -760,7 +825,7 @@ func TestTooManyRequestsRecoversWhenTheAgentAccepts(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"verdict":"tier_1"}`))
+		_, _ = w.Write([]byte(verdictBody(sentIncidentID(readAll(req)))))
 	}))
 	defer server.Close()
 
