@@ -87,11 +87,14 @@ violated, and each is a property a reviewer cannot verify by reading a diff.
 ### 1. No cluster write authority, without a cluster
 
 The Sentinel runs under a namespaced `Role` enumerating exactly
-`["get","list","watch"]` on three rule groups, verbatim from `deploy/rbac.yaml`:
-`pods` + `pods/log` (core), `events` (core), and `deployments` + `replicasets`
-(`apps`). There is **no** `pods/status` — an earlier revision of this document
-omitted the `apps` rule and `docs/security-invariants.md` claimed `pods/status`;
-neither matched the file. `deploy/rbac.yaml` is the source of truth. There is no
+`["get","list","watch"]` on two rule groups, verbatim from `deploy/rbac.yaml`:
+`pods` + `pods/log` (core) and `events` (core). There is **no** `pods/status` — an
+earlier revision of this document omitted the `apps` rule and
+`docs/security-invariants.md` claimed `pods/status`; neither matched the file. The
+`apps` rule has since been removed for the same reason the drift was: nothing read
+`deployments` or `replicasets`, and `internal/k8s/readonly.go` exposes exactly
+`Pods` and `Events`. `deploy/rbac.yaml` is the source of truth, and it now carries
+a comment saying so at the point where the rule used to be. There is no
 `ClusterRole`, no `ClusterRoleBinding`, and no wildcard. The Agent has **no
 ServiceAccount token at all** (`automountServiceAccountToken: false`).
 

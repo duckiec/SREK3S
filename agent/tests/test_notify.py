@@ -9,7 +9,9 @@ normally rather than raising.
 from __future__ import annotations
 
 import json
+import pathlib
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -161,41 +163,55 @@ def test_pagerduty_500_does_not_raise() -> None:
     assert d.deliver(_INCIDENT, "SEV2", _MD)["pagerduty"] == "http_500"
 
 
-def test_telegram_full_flow_dynamic_chat_id() -> None:
+def test_telegram_without_chat_id_sends_nothing() -> None:
+    """No configured chat means no delivery, and no discovery either.
+
+    The `getUpdates` fallback chose the RECIPIENT of an incident report by asking
+    the bot who had messaged it most recently. Anyone able to message the bot could
+    therefore redirect reports carrying someone else's namespace, pod, container and
+    exit code. The old code logged a warning and sent anyway.
+
+    This asserts the absence of the whole exchange, not just the outcome: an
+    implementation that called `getUpdates` and then decided not to use the result
+    would still leak the incident's existence to whoever was watching the bot.
+    """
     import notify as n
 
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
-        if request.url.path.endswith("/getUpdates"):
-            return httpx.Response(
-                200,
-                json={
-                    "ok": True,
-                    "result": [
-                        {"update_id": 1, "message": {"chat": {"id": 111}}},
-                        {"update_id": 2, "message": {"chat": {"id": 222}}},
-                    ],
-                },
-            )
         return httpx.Response(200, json={"ok": True})
 
     d = _dispatcher_with_transport(handler, telegram=n.TelegramTarget("TOK123"))
     results = d.deliver(_INCIDENT, "SEV2", _MD)
-    assert results["telegram"] == "ok"
-    assert calls[0].endswith("/getUpdates")
-    assert calls[1].endswith("/sendMessage")
+    assert results["telegram"] == "chat_id_not_configured"
+    assert calls == [], f"no request may be made at all, got {calls}"
 
 
-def test_telegram_getupdates_401_is_quiet() -> None:
+def test_telegram_without_chat_id_logs_an_error_not_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The missing configuration is recorded as a failure, not a caveat.
+
+    The old behaviour emitted WARNING and delivered anyway. A security property
+    that is announced and not enforced is documentation, so the level matters: the
+    only thing that changed is that nothing is sent, and the log has to say so at a
+    level an operator actually filters on.
+    """
+    import logging as _logging
+
     import notify as n
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401)
+        return httpx.Response(200, json={"ok": True})
 
-    d = _dispatcher_with_transport(handler, telegram=n.TelegramTarget("BAD"))
-    assert d.deliver(_INCIDENT, "SEV2", _MD)["telegram"] == "http_401"
+    d = _dispatcher_with_transport(handler, telegram=n.TelegramTarget("TOK"))
+    with caplog.at_level(_logging.DEBUG, logger="srek3s.agent.notify"):
+        d.deliver(_INCIDENT, "SEV2", _MD)
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors, "a refused Telegram delivery must be logged at ERROR"
+    assert "chat_id_not_configured" in errors[0].getMessage()
 
 
 def test_telegram_chat_id_bypasses_getupdates() -> None:
@@ -214,29 +230,40 @@ def test_telegram_chat_id_bypasses_getupdates() -> None:
     assert calls == ["/botTOK/sendMessage"]
 
 
-def test_telegram_discovery_logs_insecure_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    import logging as _logging
-
+def test_telegram_sends_to_the_configured_chat_and_nobody_else() -> None:
+    """The recipient is the configured chat, whatever the bot's inbox says."""
     import notify as n
 
+    sent: list[dict[str, Any]] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/getUpdates"):
-            return httpx.Response(
-                200,
-                json={"ok": True, "result": [{"message": {"chat": {"id": 42}}}]},
-            )
+        if request.url.path.endswith("/sendMessage"):
+            sent.append(json.loads(request.content))
         return httpx.Response(200, json={"ok": True})
 
-    d = _dispatcher_with_transport(handler, telegram=n.TelegramTarget("TOK"))
-    with caplog.at_level(_logging.WARNING, logger="srek3s.agent.notify"):
-        d.deliver(_INCIDENT, "SEV2", _MD)
-    warning = next(r for r in caplog.records if r.levelname == "WARNING")
-    assert (
-        "TELEGRAM_CHAT_ID is unset. Dynamically resolved to 42." in warning.getMessage()
+    d = _dispatcher_with_transport(
+        handler, telegram=n.TelegramTarget("TOK", chat_id="-1009999")
     )
-    assert "TELEGRAM_CHAT_ID=42" in warning.getMessage()
+    assert d.deliver(_INCIDENT, "SEV2", _MD)["telegram"] == "ok"
+    assert [body["chat_id"] for body in sent] == ["-1009999"]
+
+
+def test_getupdates_helper_is_no_longer_reachable() -> None:
+    """The discovery helper is dead code, and that is deliberate.
+
+    `_latest_chat_id` only ever served the fallback that chose the recipient from
+    the bot's inbox. Nothing calls it now. The test exists so that wiring it back in
+    is a deliberate act with a failing test attached, rather than a refactor that
+    looks harmless.
+    """
+    import notify as n
+
+    source = pathlib.Path(n.__file__).read_text(encoding="utf-8")
+    body = source.split("def _latest_chat_id", 1)[1]
+    assert "_latest_chat_id(" not in body, (
+        "_latest_chat_id has a caller again; the Telegram recipient must stay "
+        "TELEGRAM_CHAT_ID and nothing else"
+    )
 
 
 def test_telegram_message_escapes_and_truncates() -> None:
@@ -296,3 +323,110 @@ def test_handler_dispatches_exactly_on_tier2() -> None:
     assert resp.status_code == 200
     assert len(recorder.calls) == 1
     assert recorder.calls[0][0] == fixture["incident_id"]
+
+
+def test_async_dispatch_uses_one_worker_not_one_thread_per_incident() -> None:
+    """Concurrency is bounded by the queue, not by how many incidents arrive.
+
+    The first implementation started a daemon thread per escalation, which meant
+    `DISPATCH_TIMEOUT_SECONDS` capped any ONE delivery and nothing capped how many
+    ran at once. A burst of incidents - exactly when a responder cannot absorb thread
+    exhaustion - spawned a burst, each holding an HTTP client and its pool.
+
+    The assertion is deliberately about thread names rather than timing, so it fails
+    on the old shape rather than merely being slow under it. The handler is held
+    open so every dispatch is still outstanding when the count is taken.
+    """
+    release = threading.Event()
+    delivered: list[str] = []
+    started = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        release.wait(timeout=5)
+        delivered.append(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    d = _dispatcher_with_transport(
+        handler, slack=SlackTarget("https://hooks.example/x")
+    )
+
+    # Count workers created BY THIS DISPATCHER, not process-wide. An earlier test
+    # leaves its own worker alive, and asserting on every thread named
+    # "notify-dispatch" made this test fail on ordering rather than on the property
+    # it exists to check.
+    def workers() -> set[int]:
+        ids: set[int] = set()
+        for t in threading.enumerate():
+            # `ident` is None for a thread that has not started yet, so the
+            # narrowing is real rather than a cast.
+            if t.name == "notify-dispatch" and t.ident is not None:
+                ids.add(t.ident)
+        return ids
+
+    before = workers()
+
+    burst = 12
+    for i in range(burst):
+        d.dispatch(f"inc_burst_{i}", "SEV2", _MD)
+
+    assert started.wait(timeout=5), "the worker never picked up the first delivery"
+
+    new_workers = workers() - before
+    assert (
+        len(new_workers) == 1
+    ), f"one dispatcher must add exactly one delivery worker, added {len(new_workers)}"
+    per_incident = [
+        t.name for t in threading.enumerate() if t.name.startswith("notify-inc_")
+    ]
+    assert not per_incident, (
+        "a thread was created per incident again: "
+        f"{per_incident}. Escalation "
+        "bursts must be bounded by NOTIFY_QUEUE_DEPTH, not by spawning."
+    )
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while len(delivered) < burst and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(delivered) == burst, f"only {len(delivered)}/{burst} were delivered"
+
+
+def test_queue_overflow_sheds_and_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Overflow is reported, not absorbed and not silently dropped.
+
+    The point of a bound is that exceeding it is visible. A queue that grows without
+    limit has moved the failure rather than prevented it; a queue that drops quietly
+    makes an operator believe an incident was paged when it was not.
+    """
+    import logging as _logging
+
+    import notify as n
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        release.wait(timeout=5)
+        return httpx.Response(200, json={"ok": True})
+
+    d = _dispatcher_with_transport(
+        handler, slack=SlackTarget("https://hooks.example/x")
+    )
+
+    total = n.NOTIFY_QUEUE_DEPTH + 5
+    with caplog.at_level(_logging.DEBUG, logger="srek3s.agent.notify"):
+        for i in range(total):
+            assert d.dispatch(f"inc_overflow_{i}", "SEV2", _MD) is None
+    assert started.wait(timeout=5)
+
+    shed = [r for r in caplog.records if "queue_full" in r.getMessage()]
+    assert shed, (
+        f"dispatching {total} with the worker held open must report shedding past "
+        f"NOTIFY_QUEUE_DEPTH={n.NOTIFY_QUEUE_DEPTH}"
+    )
+    assert any(r.levelname == "ERROR" for r in shed)
+    release.set()

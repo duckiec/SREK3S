@@ -110,11 +110,15 @@ def test_sentinel_role_covers_what_the_watcher_reads() -> None:
         assert required in granted, f"the Role does not grant {required}"
 
     apps = [rule for rule in role["rules"] if "apps" in rule.get("apiGroups", [])]
-    assert apps, "the Role does not read apps/"
     granted_apps: set[str] = set()
     for rule in apps:
         granted_apps.update(rule.get("resources", []))
-    assert {"deployments", "replicasets"} <= granted_apps
+    assert not granted_apps & {"deployments", "replicasets"}, (
+        "the Role grants apps/deployments and apps/replicasets again. Nothing reads "
+        "them - internal/k8s/readonly.go exposes exactly Pods and Events - so this "
+        "is a grant with no consumer, which is an invitation rather than a "
+        "capability. Add the reader first, observe it, then grant the verb."
+    )
 
 
 def test_no_cluster_scoped_binding_grants_the_sentinel_more() -> None:

@@ -16,9 +16,6 @@ the file of record, which is what this paragraph must be read against:
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["get", "list", "watch"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "replicasets"]
-  verbs: ["get", "list", "watch"]
 ```
 
 There is no `ClusterRole` and no `ClusterRoleBinding`. Note there is **no**
@@ -26,6 +23,13 @@ There is no `ClusterRole` and no `ClusterRoleBinding`. Note there is **no**
 and is exactly the drift this paragraph exists to prevent. `pods/log` is listed as
 a separate subresource: omitting it does not error, it makes every incident arrive
 without logs.
+
+There is also **no `apps` rule**, and its absence is now stated here rather than
+left to be discovered. This file used to grant `deployments` and `replicasets`
+"for attributing an incident to a workload". Nothing read them — see *Grants
+without a reader* below — and both this paragraph and four other documents
+restated the grant. `deploy/rbac.yaml` is the source of truth; these documents
+restate it and must be corrected when it changes, which is what happened here.
 
 Three documents used to state three different grants for this Role
 (`docs/security-invariants.md` claimed `pods/status`, `CONTRIBUTING.md` omitted
@@ -264,34 +268,60 @@ Each call is bounded by `DISPATCH_TIMEOUT_SECONDS = 4.0`. Queueing is shed, not
 buffered, for the same reason the sandbox sheds at `429`: converting a capacity
 limit into a latency problem produces a worse failure than saying no.
 
-**Two gaps, stated rather than smoothed over.** Neither has an invariant ID, and
-neither is enforced today:
+**Two properties were gaps and are now enforced.** Both were open items on
+`.ai/ROADMAP.md`; neither is a comment any more.
 
-1. **One unbounded thread per escalation.** `dispatch(wait=False)` starts a new
-   daemon thread for every incident with no pool and no cap. A burst of incidents
-   spawns a burst of threads, each holding an HTTP client for up to four seconds.
-   The timeout bounds each thread's lifetime; nothing bounds how many exist at once.
-2. **Telegram chat discovery is unauthenticated in effect.** When `chat_id` is not
-   configured, `_telegram_deliver` calls `getUpdates` and posts to whichever chat
-   most recently wrote to the bot. The bot token authenticates the *API call*, but
-   the *recipient* is chosen by anyone who messages the bot. That is acceptable for
-   a personal bot and is not acceptable for an incident channel; configure
-   `chat_id` explicitly.
+1. **The recipient is `TELEGRAM_CHAT_ID` and nothing else.** With it unset,
+   `_telegram_deliver` used to call `getUpdates` and post to whichever chat had
+   most recently written to the bot. The bot token authenticates the *API call*;
+   it says nothing about the *recipient*. So anyone who could message the bot could
+   redirect reports carrying someone else's namespace, pod, container and exit code
+   — and the code logged a `WARNING` and sent the message anyway, which is the
+   worst of both: the finding was recorded and the exfiltration proceeded. A
+   security property that is announced and not enforced is documentation. It now
+   returns `chat_id_not_configured`, logs at `ERROR`, and **makes no HTTP request at
+   all** — not even the discovery call, which would itself tell whoever was
+   watching the bot that an incident existed.
+2. **Concurrency is bounded.** `dispatch(wait=False)` started a daemon thread per
+   escalation. `DISPATCH_TIMEOUT_SECONDS` bounded any *one* delivery; nothing bounded
+   how many ran at once, so a burst spawned a burst, each holding an HTTP client and
+   its pool. Deliveries now go through one bounded queue (`NOTIFY_QUEUE_DEPTH = 32`)
+   drained by a single worker, started lazily. `put_nowait` cannot block, which
+   preserves the property that made it asynchronous. On overflow the report is
+   **shed and logged at `ERROR`**, not queued without limit and not dropped
+   silently — the same choice the sandbox makes at `429`, for the same reason.
 
-## Grants without a reader
+   The queue depth is a bound on *outstanding* deliveries. `DISPATCH_TIMEOUT_SECONDS`
+   remains the bound on any single one.
 
-`deploy/rbac.yaml` grants `get`/`list`/`watch` on `apps` `deployments` and
-`replicasets`. Nothing reads them. The client in `internal/k8s/readonly.go`
-exposes exactly two readers, `CoreV1().Pods` and `CoreV1().Events`, and a
-non-test grep for `Deployments(` or `ReplicaSets(` across `internal/` and `cmd/`
-returns nothing.
+## Grants without a reader are removed, not tolerated
 
-The grant is harmless — it is a read verb inside a namespace, and a namespaced Role
-cannot escalate itself — but it is a grant without a consumer, and every such
-grant is an invitation for the next reader to use it. It is kept rather than removed
-because `Role` rules are additive and cheap, and it is recorded here because a
-reader of this file should know it is not load-bearing. Two tests pin the current
-shape, so removing it is a deliberate change rather than a silent one.
+`deploy/rbac.yaml` granted `get`/`list`/`watch` on `apps` `deployments` and
+`replicasets`, "for attributing an incident to a workload rather than to a bare
+pod name". **Nothing read them.** The client in `internal/k8s/readonly.go` exposes
+exactly two readers — `CoreV1().Pods` and `CoreV1().Events` — and a non-test grep
+for `Deployments(` or `ReplicaSets(` across `internal/` and `cmd/` returns nothing.
+
+The grant is gone, and that is the substantive part. A grant without a reader is
+not merely redundant: the read-only verb set makes today's blast radius small, but
+the grant is an invitation to the next person to reach for it, and what it permits
+should be a decision rather than something that grows on its own. Two tests now
+assert the **absence** of `deployments` and `replicasets`, so reinstating it is a
+deliberate act with a failing test attached rather than a merge nobody reads.
+
+Attribution — the stated purpose — never needed it. An incident already carries
+the pod name and container name, and the owning Deployment's labels are on the pod
+object the watcher is already holding. Nothing required the extra read.
+
+The order matters if this ever comes back: **add the reader, observe it working,
+then grant the verb.** Not the reverse. The previous sequence was grant first, and
+the reader it was waiting for was never built.
+
+Five other documents restated the grant verbatim — `CONTRIBUTING.md`,
+`docs/runbook.md`, the Helm chart's Role template, the two chaos-namespace Roles,
+and this file — and were corrected with it. That is the drift this section exists
+to prevent, and the reason `deploy/rbac.yaml` carries the explanation at the point
+where the rule used to be rather than in a document that describes it.
 
 ## Not Wired
 

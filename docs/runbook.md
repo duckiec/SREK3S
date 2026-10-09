@@ -171,8 +171,6 @@ NS=payments   # the namespace you actually want to watch
 # 1. the GRANT — Role + RoleBinding in $NS, referring back to srek3s-system
 sudo kubectl -n "$NS" create role srek3s-sentinel \
   --verb=get,list,watch --resource=pods,pods/log,events
-sudo kubectl -n "$NS" create role srek3s-sentinel \
-  --verb=get,list,watch --api-group=apps --resource=deployments,replicasets
 sudo kubectl -n "$NS" create rolebinding srek3s-sentinel \
   --role=srek3s-sentinel \
   --serviceaccount=srek3s-system:srek3s-sentinel

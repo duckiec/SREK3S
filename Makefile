@@ -649,9 +649,6 @@ throwaway-detonate: throwaway-up ## Full live E2E: build, import, install, deton
 	@echo "===================== agent ========================"
 	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" logs deployment/srek3s-agent --tail=25
 	@echo
-	@echo "===================== agent ========================"
-	@KUBECONFIG=$(THROWAWAY_KUBECONFIG) $(KUBECTL) -n "$(SYSTEM_NAMESPACE)" logs deployment/srek3s-agent --tail=25
-	@echo
 	@echo "==> scratch cluster: 'make throwaway-down' when finished"
 
 # ---------------------------------------------------------------------------

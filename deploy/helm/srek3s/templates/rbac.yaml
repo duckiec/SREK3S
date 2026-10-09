@@ -13,9 +13,9 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "watch"]
+  # No `apps` rule. deploy/rbac.yaml is the file of record and its comment explains
+  # the removal; this template exists to match it byte for byte, and the parity gate
+  # fails if it does not. Kept in step deliberately rather than independently.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

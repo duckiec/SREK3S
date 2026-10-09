@@ -25,10 +25,22 @@ type ManifestFile struct {
 // LoadManifestBytes parses, compiles and installs a rule manifest exactly once.
 //
 // Fail-fast: a schema violation, an unknown rule ID, an out-of-order table, an
-// omitted canonical rule, or an invalid regex all return an error. The caller
-// panics on a non-nil error; there is no partial install, no skip-and-
-// continue, and no degraded scrubber. The file read happens in the caller so
-// this package stays free of os imports (ROADMAP 1.4.10).
+// omitted canonical rule, or an invalid regex all return an error. There is no
+// partial install, no skip-and-continue, and no degraded scrubber. The file read
+// happens in the caller so this package stays free of os imports (ROADMAP
+// 1.4.10).
+//
+// THE CALLER DOES NOT PANIC. This comment used to say it did, and it was wrong:
+// cmd/sentinel/main.go wraps the error and returns it, so the process exits 1
+// before the watcher starts. The distinction is load-bearing rather than
+// stylistic. A panic under a crash-looping supervisor is restarted into the same
+// failure and reported as an unstable crash loop, while exit 1 reads as the
+// configuration error it is - a malformed scrubber manifest, which is a
+// deployment mistake and not a defect to be retried. A reader who believed the
+// old comment would expect a stack trace and misread its absence as a bug.
+//
+// main.go also does not recover, so there is no path that turns this into a
+// partial install either way.
 func LoadManifestBytes(raw []byte) error {
 	var mf ManifestFile
 	if err := json.Unmarshal(raw, &mf); err != nil {
