@@ -10,121 +10,127 @@
 
 ## Secret-safe, read-only Kubernetes incident triage
 
-SREK3S watches for pod failures, scrubs credentials **in memory before anything
-leaves the node**, and produces a reviewable Git patch you can merge yourself. It
-holds a namespaced `get`/`list`/`watch` Role and nothing else — no ClusterRole, no
-write verb on either wire contract, and no ServiceAccount token mounted in the
-component that talks to the model.
+SREK3S watches for pod failures, masks credentials in memory before anything leaves
+the node, and hands you a Git patch to review. Its ServiceAccount binds a namespaced
+Role granting `get`, `list`, and `watch`. The Agent holds no ServiceAccount token at
+all.
 
-## See it in 60 seconds
-
-![SREK3S in-memory redaction and fail-closed triage](docs/assets/demo.gif)
+## See it run in 60 seconds
 
 ```bash
 git clone https://github.com/duckiec/SREK3S.git && cd SREK3S
 make demo
 ```
 
-`make demo` runs three steps, and prints what each one is before it happens:
+Three targets, in order:
 
-| Step | What it does |
+| Target | What it does |
 |---|---|
-| `throwaway-up` | Starts a disposable k3s cluster in Docker, on its own bridge network |
-| `throwaway-wait` | Blocks until the node is Ready **and** cluster DNS resolves |
-| `throwaway-detonate` | Builds both images, installs the chart, applies a real OOMKill fixture, waits for triage, then asserts |
+| `throwaway-up` | Starts a disposable k3s cluster in Docker on its own bridge network |
+| `throwaway-wait` | Blocks until the node is Ready and cluster DNS resolves |
+| `throwaway-detonate` | Builds both images, installs the chart, applies a real OOMKill fixture, waits for triage, asserts |
 
-**Your kubectl context is never switched.** Every command is pinned to
-`KUBECONFIG=/tmp/k3s-throwaway.yaml`, so a production kubeconfig you already have
-loaded stays loaded and stays untouched. Nothing is applied to any cluster except
-the throwaway, and no cluster-admin rights are needed anywhere in this repository.
+Each command pins `KUBECONFIG=/tmp/k3s-throwaway.yaml`. Nothing switches your current
+kubectl context, so a production kubeconfig you already have loaded stays loaded.
+Nothing gets applied to any cluster but the throwaway.
 
-It ends with assertions, not a screenshot:
+The run ends in assertions rather than a screenshot:
 
 ```
 ===================== ASSERTIONS ====================
   [ok] sentinel emitted 3 incident(s)
-  [ok] agent triaged (3 verdict(s))
-  [ok] GitOps checkout succeeded (3 Tier-1 verdict(s))
+  [ok] agent triaged (2 verdict(s))
+  [ok] GitOps checkout succeeded (2 Tier-1 verdict(s))
 ```
 
-Clean up with `make throwaway-down`.
+`make throwaway-down` removes the container.
 
-## Why SREK3S?
+## What the demo captures
 
-**It fails closed, and the failure is unrepresentable.** Tier selection, the patch,
-and every validation flag are computed deterministically *before* a model is
-consulted. A `TIER_2_ARCHITECTURAL` response carrying a patch raises rather than
-being discouraged (`I-B1`), so a hallucinated remedy has nowhere to land. A system
-that proposes a patch it cannot prove is worse than one that stays quiet.
+![SREK3S in-memory redaction and fail-closed triage](docs/assets/demo.gif)
 
-**The read-only claim is checkable, not rhetorical.** The Sentinel's Role grants
-exactly `["get", "list", "watch"]` on `pods`, `pods/log` and `events`. The Agent
-sets `automountServiceAccountToken: false` and mounts no token at all. Neither
-contract has a field capable of expressing a write verb (`I-B5`), so a patch
-cannot carry one through the model.
+The recording shows a pod leaking a credential to its logs, the Go Sentinel masking
+it before network egress, and the Python Agent declining a hallucinated remedy and
+escalating to human review.
 
-**Tier-1 and Tier-2 are deterministic, not a confidence score.** `TIER_1_TOIL` means
-the remedy was enumerated in advance — one manifest, one resource field, no code or
-image change — and then survived a YAML AST parse *and* `git apply --check`
-against the target's own bytes. Anything ambiguous is `TIER_2_ARCHITECTURAL`, which
-carries no patch at all.
+[`examples/oom-recalibration/`](examples/oom-recalibration/) holds one incident
+captured off the wire: the crashing pod's log with the credential intact, the payload
+that crossed, the Tier-1 decision, and the diff it produced.
 
-**Secrets are masked before egress, not after.** Eleven ordered rules run on the
-Go node in memory. Nothing unmasked reaches a queue, a disk, or a socket. Redaction
-is selective within the match, so `postgres://checkout:[REDACTED]@db-primary:5432/prod`
-keeps the host, port, database and user that the diagnosis depends on.
+## How it decides
 
-**A bad log message stops the Sentinel; a bad log level does not.** A scrubber that
-fails to load means the guarantees no longer hold, so boot refuses. An unparseable
-`LOG_LEVEL` degrades to `INFO` with a comment explaining why. The distinction is
-the product: fail closed where silence would be a security defect, degrade loudly
-everywhere else.
+**Tier selection happens before any model runs.** The Agent computes the tier, the
+patch, and each validation flag from the evidence, then consults a model for prose.
+A `TIER_2_ARCHITECTURAL` response carrying a patch raises rather than logging a
+warning, so the failure mode is unrepresentable instead of discouraged.
 
-## Visual evidence
+**Tier-1 requires an enumerated remedy.** One manifest, one resource field, no code or
+image change, decided in advance rather than inferred per incident. A patch earns the
+label by surviving a YAML AST parse and `git apply --check` against the bytes of the
+target file.
 
-[`examples/oom-recalibration/`](examples/oom-recalibration/) is one real incident,
-captured off the wire end to end: the crashing pod's log with a planted credential
-intact, the scrubbed payload that actually crossed, the Tier-1 decision, and the
-diff it produced — `memory: 64Mi` → `memory: 128Mi`, with `patch_validated: true`.
-Every byte is from a live run. Reproduce it with `make demo`.
+**The Go node masks secrets in memory, before egress.** Eleven ordered rules run
+ahead of any network call. Redaction keeps the parts a diagnosis needs:
 
-## Installation
+```
+postgres://checkout:[REDACTED]@db-primary:5432/prod
+```
+
+Host, port, database, and user survive. The password does not.
+
+**Read-only is checkable.** Neither wire contract has a field capable of expressing a
+write verb, so a patch cannot carry one through the model.
+
+**Boot fails closed where silence would be a security property.** A scrubber manifest
+that will not parse exits 1 before the watcher starts, because a Sentinel running
+with fewer rules than it claims is worse than one that never began. A malformed
+`LOG_LEVEL` degrades to `INFO` instead, and the comment beside it explains the
+asymmetry.
+
+**The Sentinel needs an explicit port rule to reach the API server on kube-router.**
+That CNI evaluates NetworkPolicy after kube-proxy rewrites the ClusterIP, so a policy
+allowing `<service CIDR>:443` denies the connections that matter. The shipped rule
+permits TCP 6443 by port, which survives a reboot.
+
+## Install
 
 ```bash
 kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/overlays/quickstart \
   | kubectl apply -f -
 ```
 
-The Agent runs with `automountServiceAccountToken: false` and holds no token; only
-the Sentinel mounts one, and only to read.
+`deploy/base/` is the kustomize base of record. It sits in its own directory because
+an overlay referencing `../..` trips kustomize's cycle detection, and a test fails if
+a second base appears beside it.
 
-The default install reaches `TIER_2_ARCHITECTURAL` for every incident. That is the
-designed safe state, not a misconfiguration — `agent.targetManifest` is the gate,
-and [`docs/security-invariants.md`](docs/security-invariants.md) explains why an
-empty target and a broken target look identical from the outside.
+The Agent runs with `automountServiceAccountToken: false`. Only the Sentinel mounts a
+token, and only to read.
+
+A default install routes each incident to `TIER_2_ARCHITECTURAL`. `agent.targetManifest`
+is empty, so no patch can pass verification, and that matches the designed resting
+state. Reach Tier-1 by setting it:
+
+```bash
+helm install srek3s deploy/helm/srek3s -n srek3s-system --create-namespace \
+  --set agent.gitops.repoUrl=https://github.com/duckiec/SREK3S.git \
+  --set agent.targetManifest=deploy/chaos/oom-leak.yaml
+```
 
 Prerequisites: `git`, `kubectl`, and a cluster you can write to.
 
 ## Documentation
 
-Start here:
-
 | Document | Contents |
 |---|---|
-| [`docs/security-invariants.md`](docs/security-invariants.md) | **The guarantees.** Fail-closed boot, scrubbing, Tier-1 verification, RBAC and network posture, the `I-A*`/`I-B*` invariant tables, and the gaps that are still open |
+| [`docs/security-invariants.md`](docs/security-invariants.md) | The guarantees, the `I-A*` and `I-B*` tables, and the gaps still open |
 | [`docs/runbook.md`](docs/runbook.md) | Deploy, observe, interpret, review |
 | [`examples/oom-recalibration/`](examples/oom-recalibration/) | One captured incident, payload to patch |
-
-Then:
-
-| Document | Contents |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Component topology, and the detection and emission path a scrubbed payload travels |
-| [`docs/models.md`](docs/models.md) | Nine providers across three protocols, credential mounting, and adapter behaviour |
-| [`docs/development.md`](docs/development.md) | Gates, build, deploy, publishing, silent-failure modes, verification without a cluster |
-| [`docs/hardening-and-ci.md`](docs/hardening-and-ci.md) | Test matrices, static analysis, repository rulesets, and where the enforcement is weaker than it looks |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Invariants, gates, and the normative masking specification |
-| [`docs/lessons-learned.md`](docs/lessons-learned.md) | Defects found, including negative controls that failed for the wrong reason |
+| [`docs/architecture.md`](docs/architecture.md) | Component topology and the emission path |
+| [`docs/models.md`](docs/models.md) | Nine providers across three protocols |
+| [`docs/development.md`](docs/development.md) | Gates, build, deploy, verification without a cluster |
+| [`docs/hardening-and-ci.md`](docs/hardening-and-ci.md) | Test matrices, static analysis, where enforcement is weaker than it looks |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Invariants, gates, the normative masking specification |
+| [`docs/lessons-learned.md`](docs/lessons-learned.md) | Defects found, including controls that failed for the wrong reason |
 | [`docs/offline-install.md`](docs/offline-install.md) | Installing images without a registry |
 | [`docs/ci-triage-protocol.md`](docs/ci-triage-protocol.md) | Reading a red CI run |
 
@@ -139,6 +145,12 @@ make test        # every gate: go vet, gofmt, -race, black, flake8, mypy, pytest
 make check       # gates, then images, then supply-chain checks
 make deploy      # apply deploy/base and wait for both rollouts
 ```
+
+Your Go toolchain decides what a local `govulncheck` covers. A distro build reports
+its version with a suffix, such as `go1.26.8-X:nodwarf5`, and the scanner drops the
+standard-library advisories when the version matches no release.
+`make check-supply-chain` prints the toolchain it is about to trust and warns when it
+is a patched build. CI pins `GO_VERSION` to an exact patch for the same reason.
 
 ## Project structure
 

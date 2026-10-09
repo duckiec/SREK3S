@@ -38,7 +38,8 @@ the old ReplicaSet keeps running. It does not silently half-deploy.
 
 ```sh
 kubectl -n srek3s-system delete deployment srek3s-sentinel
-kubectl apply -k deploy/
+kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl apply -f -
 ```
 
 The delete is safe. The Sentinel holds no state that is not either
@@ -91,7 +92,7 @@ It was also *accidentally* hiding the selector collision described above: with
 it. Removing the injection did not create that bug. It uncovered one that had
 been masked.
 
-Nothing here requires action if you apply with `kubectl apply -k deploy/`. The
+Nothing here requires action if you render the base and apply the output. The
 rendered selectors are now exactly what the files say.
 
 **The rule, now asserted by a test:** a selector never depends on a transform. If
