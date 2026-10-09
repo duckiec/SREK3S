@@ -61,6 +61,12 @@ const (
 	// MetricsInterval is the periodic stats log. Frequent enough to be useful in a
 	// short incident, sparse enough not to be noise in a long one.
 	MetricsInterval = 30 * time.Second
+
+	// telemetryHeadroom sits on top of emitter.DefaultTimeout to cover the
+	// telemetry phase, which shares the pool's per-incident context with the
+	// dispatch. The worker's own default for that phase was 2 * k8s.TelemetryTimeout
+	// = 6s, which bounded the telemetry fetch and the dispatch together.
+	telemetryHeadroom = 5 * time.Second
 )
 
 func main() {
@@ -78,6 +84,46 @@ func main() {
 		slog.Error("sentinel exited", "error", err)
 		os.Exit(1)
 	}
+}
+
+// newPool builds the worker pool exactly as the daemon does, so a test can assert
+// on the deadline production actually imposes rather than on a pool it assembled
+// itself.
+//
+// Extracted for one reason: a test that constructs its own pool passes whether or
+// not the daemon passes the same options. The first draft of the regression for D-6
+// did exactly that, and it survived the mutation that removed
+// WithPerIncidentTimeout from this call - a green test proving nothing, which is
+// the same shape as the defect it was written for. Production and test go through
+// one function, or the assertion is about the test.
+func newPool(
+	records <-chan *k8s.IncidentRecord,
+	telemetry worker.TelemetryFetcher,
+	sink worker.Sink,
+	size int,
+	log *slog.Logger,
+	metricsRegistry *metrics.Registry,
+) *worker.Pool {
+	// The pool imposes one deadline on the whole per-incident phase, and that
+	// deadline is what the emitter's own timeout is measured against. Left at the
+	// worker's default it is 2 * k8s.TelemetryTimeout = 6s, which abandons the POST
+	// long before emitter.DefaultTimeout (130s) could matter: the context handed to
+	// sink.Dispatch is already expired, so the emitter's contract is inert and a
+	// Tier-2 incident is discarded client-side while the agent still burns its
+	// 120s of LLM budget. That is the failure emitter.go's own comment describes as
+	// fixed; it was fixed in the constant, not in the deadline that bounds it.
+	//
+	// The headroom over DefaultTimeout covers the telemetry phase, which shares
+	// this context and is what the 6s default was sized for.
+	return worker.New(
+		records,
+		telemetry,
+		sink,
+		size,
+		worker.WithLogger(log),
+		worker.WithMetrics(metricsRegistry),
+		worker.WithPerIncidentTimeout(emitter.DefaultTimeout+telemetryHeadroom),
+	)
 }
 
 // run is main's body, parameterised on its two environmental inputs: a context
@@ -246,14 +292,7 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	// does not leave the process waiting on keep-alives to the old agent.
 	defer sink.Close()
 
-	pool := worker.New(
-		watcher.Events(),
-		telemetry,
-		sink,
-		*workers,
-		worker.WithLogger(log),
-		worker.WithMetrics(metricsRegistry),
-	)
+	pool := newPool(watcher.Events(), telemetry, sink, *workers, log, metricsRegistry)
 
 	// The metrics listener lives in its own goroutine on :9090, off the
 	// emitter path. A bind failure is logged, not fatal: losing telemetry
