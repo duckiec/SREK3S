@@ -58,7 +58,8 @@ Running the binary directly suffices for development:
 ## Deploy
 
 ```bash
-sudo kubectl apply -k deploy/base
+sudo kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl apply -f -
 ```
 
 `deploy/service.yaml` publishes the Agent on `srek3s-agent:8000`, which is the

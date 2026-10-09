@@ -10,7 +10,7 @@ and the part that could not be checked was the only part anybody looked at.
 
 So everything about the overlay that does not need a cluster is checked here:
 the manifests parse, their cross-references resolve, the hardening is
-present, the base is the real ``deploy/`` and not a copy, and every fixture is
+present, the base is the real ``deploy/base/`` and not a copy, and every fixture is
 marked as a fixture. What cannot be verified offline - that the pods schedule,
 that the NetworkPolicies admit the traffic, that ``srek3s-agent`` resolves - is
 asserted by the workflow steps and nowhere here, and the distinction is stated
@@ -251,9 +251,23 @@ def _kustomize_command() -> list[str]:
 
 
 def render(directory: pathlib.Path) -> list[dict[str, Any]]:
-    """Every object kustomize produces for `directory`."""
+    """Every object kustomize produces for `directory`.
+
+    `--load-restrictor LoadRestrictionsNone` is required, and it was not until the
+    fixture was repointed at `deploy/base/`. The base lists its manifests as
+    `../namespace.yaml` and friends, so it reaches above its own directory; the bare
+    `deploy/` directory this fixture used to reference listed them beside itself and
+    needed nothing. kustomize's default RootOnly restrictor refuses the upward
+    reference, so without the flag every render here fails with
+    `security; file '.../deploy/namespace.yaml' is not in or below '.../deploy/base'`.
+    """
     completed = subprocess.run(
-        [*_kustomize_command(), str(directory)],
+        [
+            *_kustomize_command(),
+            "--load-restrictor",
+            "LoadRestrictionsNone",
+            str(directory),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -683,13 +697,21 @@ def test_the_route_probe_verdict_is_waited_for_and_not_assumed() -> None:
 def test_the_overlay_bases_on_the_real_deploy_directory(
     kustomization: dict[str, Any],
 ) -> None:
-    """The overlay must reference deploy/, not a copy of it.
+    """The overlay must reference `deploy/base/`, not a copy of it.
 
     A vendored copy is free to drift from the manifests it claims to test, and a
     test of a copy proves nothing about the original. This is the entire reason
     the in-cluster leg exists, so the reference is checked rather than trusted -
     and it is checked by resolving the path, because a base entry that does not
     resolve produces a kustomize error at apply time, in CI, rather than here.
+
+    `deploy/base/`, not `deploy/`. This overlay pointed at the `deploy/` directory
+    until 2026-10-09, when that directory carried a second kustomization listing the
+    same six manifests without the `configMapGenerator` for
+    `ConfigMap/srek3s-target-manifest`. The in-cluster leg was therefore installing
+    an agent that could not resolve a target, and every Tier-1 assertion in it ran
+    against an agent structurally incapable of producing a patch. Green, and not
+    testing what it claims.
     """
     bases = [
         entry
@@ -697,14 +719,16 @@ def test_the_overlay_bases_on_the_real_deploy_directory(
         if not entry.endswith((".yaml", ".yml"))
     ]
     assert bases, (
-        "the overlay declares no directory base; it must reference deploy/ "
+        "the overlay declares no directory base; it must reference deploy/base "
         "relatively so the real manifests are what gets applied"
     )
     resolved = [(OVERLAY / base).resolve() for base in bases]
+    expected = (DEPLOY / "base").resolve()
     for path in resolved:
-        assert path == DEPLOY.resolve(), (
-            f"the overlay's base resolves to {path}, not {DEPLOY.resolve()}; a "
-            "vendored copy of deploy/ would be tested instead of deploy/"
+        assert path == expected, (
+            f"the overlay's base resolves to {path}, not {expected}; a vendored "
+            "copy would be tested instead of the shipped base, and the bare "
+            "deploy/ directory is not a kustomization at all since 2026-10-09"
         )
         assert path.is_dir(), f"the overlay's base {path} does not exist"
 

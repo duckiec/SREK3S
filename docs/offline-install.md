@@ -262,7 +262,8 @@ registry.internal/srek3s-sentinel:0.1.0 application/vnd.docker.distribution.mani
 ### Then prove it end to end, because a successful import is not a working pod
 
 ```bash
-sudo kubectl apply -k deploy/
+sudo kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl apply -f -
 sudo kubectl -n srek3s-system rollout status deployment/srek3s-agent --timeout=120s
 sudo kubectl -n srek3s-system exec deploy/srek3s-agent -- python -c \
   "import os,uid; print('uid', os.getuid())"        # expect: uid 10001
@@ -299,7 +300,8 @@ for A includes fixture pods *starting*, not merely the tag existing.
 # by hand rather than alphabetically. A Role applied before its Namespace exists
 # fails with "namespace not found".
 # `sudo` on a k3s-installed host: /etc/rancher/k3s/k3s.yaml is 0600 and root-owned.
-sudo kubectl apply -k deploy/
+sudo kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl apply -f -
 
 sudo kubectl -n srek3s-system rollout status deployment/srek3s-sentinel --timeout=120s
 sudo kubectl -n srek3s-system rollout status deployment/srek3s-agent    --timeout=120s
@@ -364,7 +366,8 @@ done
 # The Sentinel holds no cluster write authority, so rollback is a delete and a
 # re-apply. Nothing outside the namespace needs reverting, which is the property
 # that makes a rollback this cheap.
-sudo kubectl delete -k deploy/
+sudo kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl delete -f -
 
 # Confirm no state survives: the sentinel writes to /tmp only, and the emptyDir is
 # per-pod, so there is nothing to clean up on disk.

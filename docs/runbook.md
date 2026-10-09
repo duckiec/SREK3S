@@ -54,7 +54,8 @@ make deploy
 Equivalent by hand:
 
 ```bash
-sudo kubectl apply -k deploy/base
+sudo kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+  | kubectl apply -f -
 ```
 
 **Every `kubectl` in this runbook needs `sudo`** on a k3s-installed host. The

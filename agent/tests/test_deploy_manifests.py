@@ -446,8 +446,18 @@ def test_no_privileged_sidecar_or_init_container(manifest: str) -> None:
 
 
 def test_kustomization_lists_every_manifest() -> None:
-    kustomization = one(load("kustomization.yaml"), "Kustomization")
-    resources = kustomization["resources"]
+    """The base lists every manifest, in an order the API server will accept.
+
+    Read from `deploy/base/`, which is the only base of record. `deploy/` carried a
+    second kustomization until 2026-10-09 that listed the same files and omitted the
+    `configMapGenerator`, so `kubectl apply -k deploy/` installed 10 objects against
+    the base's 11 and produced an agent that could never resolve a target.
+    """
+    base = DEPLOY / "base"
+    kustomization = yaml.safe_load(
+        (base / "kustomization.yaml").read_text(encoding="utf-8")
+    )
+    resources = [r.replace("../", "") for r in kustomization["resources"]]
     for expected in (
         "namespace.yaml",
         "rbac.yaml",

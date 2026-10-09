@@ -23,8 +23,16 @@ kind: Kustomization
 
 resources:
   # The real deploy set, by relative path. Four levels up: fixtures/incluster ->
-  # fixtures -> e2e -> tests -> repo root.
-  - ../../../../deploy
+  # fixtures -> e2e -> tests -> repo root, then into the base.
+  #
+  # `../../../../deploy/base`, NOT `../../../../deploy`. This fixture pointed at the
+  # `deploy/` directory until 2026-10-09, when that directory carried a second
+  # kustomization listing the same six manifests but without the
+  # `configMapGenerator` for `ConfigMap/srek3s-target-manifest`. So the in-cluster
+  # E2E leg was installing a system whose agent could not resolve a target, and
+  # every Tier-1 assertion in that leg ran against an agent that structurally could
+  # not produce one. The leg was green and it was not testing the thing it claims.
+  - ../../../../deploy/base
   - extra-resources.yaml
 
 patches:

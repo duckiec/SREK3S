@@ -233,3 +233,80 @@ def test_the_chart_renders_no_namespace_object() -> None:
         "the namespace, and a chart-rendered Namespace makes helm install fail "
         "with either 'not found' or 'already exists'"
     )
+
+
+def test_exactly_one_kustomize_base_exists() -> None:
+    """Guard the gap the parity gate could not see.
+
+    `deploy/` and `deploy/base/` both carried a `kustomization.yaml`, both listed
+    the same six manifests, and a comment in the Makefile asserted they exposed
+    "the same set". They did not. `deploy/base/` also ran a `configMapGenerator`
+    producing `ConfigMap/srek3s-target-manifest`, so:
+
+        kubectl apply -k deploy/       -> 10 objects, no target manifest
+        kubectl apply -k deploy/base/  -> 11 objects, target manifest present
+
+    Both installs succeed. The one missing a target manifest has an agent that
+    cannot resolve anything, so every incident escalates to Tier-2 under I-B2,
+    which is also what a correct install does when `agent.targetManifest` is unset.
+    The degraded install is indistinguishable from the designed resting state.
+
+    The parity test could not catch it. It compares the CHART against
+    `deploy/base/`, the chart was correct, and nothing compared the two
+    kustomizations to each other. The defect lived entirely in the gap.
+
+    `deploy/base/` cannot be deleted to simplify this, and the reason is
+    structural rather than stylistic. An overlay at `deploy/overlays/<name>/`
+    referencing `../..` makes the base an ancestor of the overlay, and kustomize
+    refuses it:
+
+        cycle detected: candidate root '/.../deploy' contains visited root
+        '/.../deploy/overlays/quickstart'
+
+    The base therefore has to sit in a directory that does not contain the
+    overlays that consume it. The duplicate to keep out is the one at `deploy/`.
+    """
+    bases = sorted(
+        str(path.relative_to(REPO_ROOT))
+        for path in (REPO_ROOT / "deploy").rglob("kustomization.yaml")
+    )
+    assert "deploy/kustomization.yaml" not in bases, (
+        "a second kustomize base reappeared at deploy/kustomization.yaml. Two bases "
+        "of record is the defect that produced a silently degraded install path; "
+        f"currently: {bases}"
+    )
+    assert bases == [
+        "deploy/base/kustomization.yaml",
+        "deploy/overlays/local-live/kustomization.yaml",
+        "deploy/overlays/quickstart-live/kustomization.yaml",
+        "deploy/overlays/quickstart/kustomization.yaml",
+    ], f"the set of kustomizations under deploy/ changed: {bases}"
+
+
+@needs_helm_kubectl
+def test_every_install_path_renders_the_same_objects() -> None:
+    """The base and every overlay must carry the target manifest.
+
+    The overlay half is new. `deploy/base/` renders `ConfigMap/srek3s-target-manifest`
+    and an overlay that consumed a base without it would drop that object silently,
+    because the omission changes nothing about the objects that remain: they all
+    apply, and the agent simply cannot resolve a target.
+    """
+    for overlay in ("quickstart", "quickstart-live", "local-live"):
+        out = subprocess.run(
+            [
+                kubectl or "kubectl",
+                "kustomize",
+                "--load-restrictor=LoadRestrictionsNone",
+                str(REPO_ROOT / "deploy" / "overlays" / overlay),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        docs = [d for d in yaml.safe_load_all(out) if d]
+        names = {(d.get("kind"), d.get("metadata", {}).get("name")) for d in docs}
+        assert ("ConfigMap", "srek3s-target-manifest") in names, (
+            f"the {overlay} overlay does not render srek3s-target-manifest, so an "
+            "install through it cannot reach Tier-1 and nothing reports an error"
+        )
