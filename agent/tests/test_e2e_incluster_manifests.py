@@ -1106,8 +1106,8 @@ def test_the_patch_supplies_exactly_what_the_manifest_provider_reads(
     target = env.get("SREK3S_TARGET_MANIFEST", "")
     assert target.endswith((".yaml", ".yml", ".json")), (
         f"SREK3S_TARGET_MANIFEST={target!r} is not a manifest extension; "
-        "classifier.py would reject it at startup and fall back to a default "
-        "that does not exist in this repository"
+        "classifier.py would refuse it at startup and this process would have "
+        "no patch target at all, so every incident would escalate"
     )
     assert (
         not target.startswith("/") and ":" not in target
