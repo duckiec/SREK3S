@@ -339,10 +339,14 @@ decides this, and the difference is easy to miss because both produce Tier-2.
   escalates under **I-B2** and no patch is proposed. That is the intended safe
   state, and it is indistinguishable from a working installation if you only look
   at the tier label.
-- Neither install path sets `SREK3S_TARGET_MANIFEST`, and the agent ships no
-  default for it. Both do set `SREK3S_GITOPS_REPO_URL` (the chart's
-  `agent.gitops.repoUrl` defaults to the same repository), so the Agent clones a
-  real checkout at startup and still has nothing to point at.
+- The agent ships no default for `SREK3S_TARGET_MANIFEST`, so whether one exists
+  depends on the install path, and the two shipped paths disagree:
+  `deploy/overlays/local-live` sets it (`patch-agent-manifests.yaml:38`), and a
+  default `helm install` does not — `values.yaml` ships `targetManifest: ""` and
+  `templates/deployment-agent.yaml` renders the variable only when it is non-empty.
+  Both do set `SREK3S_GITOPS_REPO_URL` (the chart's `agent.gitops.repoUrl` defaults
+  to the same repository), so a default chart install clones a real checkout at
+  startup and still has nothing to point at.
   `classifier.DEFAULT_TARGET_MANIFEST` is empty, and that empty string is the
   whole gate: with no target configured there is nothing to read, so every
   incident escalates and `remediation.target_manifest` is `""` — which the schema
