@@ -636,6 +636,11 @@ def _build_remediation_diff(
         TARGET_MANIFEST,
         container_name=payload.container_name,
         expected_old=memory_limit,
+        # Binds the applicability check to the file the agent actually read. With a
+        # checkout present, `git apply --check` runs against the bytes on disk and
+        # refuses if they are not the bytes `manifest_text` came from; a diff that
+        # applies to a truncated read is no longer reported as `patch_validated`.
+        checkout_root=classifier.checkout_root_of(provider),
     )
     if not verification.ok:
         return (
