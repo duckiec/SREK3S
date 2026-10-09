@@ -72,7 +72,24 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.26"
+  # EXACT PATCH, NOT A FLOATING MINOR. `1.26` resolves through setup-go's
+  # versions manifest, and that manifest lags the actual release channel: on
+  # 2026-10-08 `go-version: 1.26` with `check-latest: true` resolved to
+  # **1.26.8** while go1.26.9 — the release carrying the fix for all nine
+  # net/http / crypto/tls / net/textproto advisories — had already shipped.
+  #
+  # The result was a G7 failure that looked exactly like the previous one:
+  # nine reachable standard-library vulnerabilities, `Found in:
+  # net/http@go1.26.8`, `Fixed in: net/http@go1.26.9`. Nothing had regressed.
+  # The gate was reading a toolchain that was a patch behind the fix it was
+  # checking for.
+  #
+  # A floating minor plus `check-latest` means the answer depends on a manifest
+  # snapshot this repository does not control, for the one tool where being a
+  # patch behind turns a clean result into a red one. Pin the patch. Bumping it
+  # is a Dependabot-shaped edit, and the comment above the scanner pin says why
+  # the same reasoning applies there.
+  GO_VERSION: "1.26.9"
   PYTHON_VERSION: "3.11"
   # Known-blocked tests. See the skip policy above; do not raise this number to
   # make a build pass — raise it only after establishing what the new skip is.

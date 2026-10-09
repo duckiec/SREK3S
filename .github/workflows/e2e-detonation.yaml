@@ -79,7 +79,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.26"
+  # Exact patch, deliberately identical to ci.yaml. This leg does not run G7, but
+  # it COMPILES the Go binary the detonation then runs, so a toolchain a patch
+  # behind is a different artifact under test. `1.26` resolved to 1.26.8 here via
+  # setup-go's lagging versions manifest while 1.26.9 was already published; see
+  # ci.yaml for the full account.
+  GO_VERSION: "1.26.9"
   PYTHON_VERSION: "3.11"
   # Overridable per run because the honest floor is a property of the kubelet's
   # backoff, not a taste: the first failure restarts immediately (no backoff entry

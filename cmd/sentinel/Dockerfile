@@ -49,21 +49,35 @@
 # image and the manifest could disagree while both looked correct.
 
 # ---------------------------------------------------------------------------
-# Build stage. Pinned to the minor version go.mod requires (1.26) rather than
-# `latest`: a build that silently changes Go version can change what a build tag
-# means, and a tag like `ignore` or `osusergo` is exactly the kind of thing that
-# differs between releases.
+# Build stage. Pinned to the EXACT PATCH go.mod's minor requires, not `latest` and
+# not a floating minor.
+#
+# The original pin was `golang:1.25-bookworm` on the reasoning that a build which
+# silently changes Go version can change what a build tag means — true, and it is
+# why this is not `golang:latest`. But a floating MINOR is the same failure one
+# notch coarser, and on 2026-10-08 it cost a day: `go-version: 1.26` in CI resolved
+# through setup-go's versions manifest to **1.26.8** while go1.26.9, which carries
+# the fix for all nine net/http / crypto/tls / net/textproto advisories, had
+# already shipped. G7 failed on `net/http@go1.26.8` with nothing having regressed —
+# the gate was reading a toolchain a patch behind the fix it was checking for.
+#
+# `golang:1.26-bookworm` happened to be already on 1.26.9 (verified by running
+# `go version` in both tags) because the registry rebuilt faster than setup-go's
+# manifest updated. That is luck, not a guarantee, and it is the wrong property to
+# rely on for the artifact that actually ships.
+#
+# EXACT PATCH, in both workflows and here, so the gate and the binary are built from
+# the same toolchain by construction rather than by coincidence. Bumping it is a
+# single-token edit next to the release that requires it.
 #
 # 1.26 IS NOT COSMETIC, AND THIS LINE IS THE REASON. Go 1.25's net/http and
-# crypto/tls carry nine reachable advisories (GO-2026-6603 through GO-2026-6617,
-# and GO-2026-6605/6607/6608/6613) that the project's own G7 gate reports and that
-# are only patched in 1.26. An image built `FROM golang:1.25-bookworm` would ship a
-# statically linked binary carrying them while CI went green on a different
-# toolchain — the scanner would clear the tree it was pointed at and miss the
-# binary it was shipping. Bumping this line is what makes the gate and the artifact
-# the same question.
+# crypto/tls carry nine reachable advisories that this project's own G7 gate
+# reports, and they are patched only in 1.26. An image built
+# `FROM golang:1.25-bookworm` would ship a statically linked binary carrying them
+# while CI went green on a different toolchain — the scanner clearing the tree it
+# was pointed at while missing the binary it was shipping.
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.9-bookworm AS build
 
 WORKDIR /src
 
