@@ -559,6 +559,66 @@ class TestRemediationTargetManifest:
                 }
             )
 
+    def test_an_unconfigured_target_is_admitted_with_no_patch(self) -> None:
+        """`target_manifest` no longer carries `min_length=5`.
+
+        The constraint existed so the shipped default - a path that existed in no
+        checkout - could not be encoded as an honest value. It could always be
+        *written*, though: the Tier-2 path passed it through on every response,
+        so every escalation pointed an operator at a file that was never there.
+        Empty is what "nothing is configured and nothing is proposed" looks like
+        on the wire, and refusing it would only push the invention somewhere less
+        visible.
+        """
+        remediation = Remediation.model_validate(
+            {
+                "summary": "s",
+                "risk_level": "HIGH",
+                "target_manifest": "",
+                "git_patch": "",
+                "patch_validated": False,
+            }
+        )
+        assert remediation.target_manifest == ""
+
+    def test_a_patch_without_a_target_is_rejected(self) -> None:
+        """The direction the relaxation must not reach (I-B2).
+
+        `patch_validated: true` over a diff that names no file asserts that
+        `git apply --check` was run against something a reader cannot go and
+        look at. Dropping the field constraint without this coupling would have
+        made that response valid.
+        """
+        with pytest.raises(ValidationError, match="target_manifest is empty"):
+            Remediation.model_validate(
+                {
+                    "summary": "s",
+                    "risk_level": "LOW",
+                    "target_manifest": "",
+                    "git_patch": VALID_PATCH,
+                    "patch_validated": True,
+                }
+            )
+
+    def test_a_named_target_with_no_patch_is_still_admitted(self) -> None:
+        """The escalation case: a file to edit, and nothing edited yet.
+
+        This is the coupling's asymmetry, and it is deliberate. Only the
+        patch-without-target direction is refused; an operator reading an
+        escalation is better served by being told which manifest the agent would
+        have touched than by being told nothing at all.
+        """
+        remediation = Remediation.model_validate(
+            {
+                "summary": "s",
+                "risk_level": "HIGH",
+                "target_manifest": "deploy/chaos/oom-leak.yaml",
+                "git_patch": "",
+                "patch_validated": False,
+            }
+        )
+        assert remediation.target_manifest == "deploy/chaos/oom-leak.yaml"
+
 
 # ---------------------------------------------------------------------------
 # Contract B — acceptance and invariant I-B1

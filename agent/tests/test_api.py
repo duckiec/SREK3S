@@ -215,7 +215,7 @@ class TestSuccessfulTriage:
         assert response.remediation.patch_validated is True
 
         patch = response.remediation.git_patch
-        assert patch.startswith("--- a/deploy/payments/checkout-api.yaml")
+        assert patch.startswith(f"--- a/{triage.TARGET_MANIFEST}")
         # 256Mi doubled is 512Mi, per the default policy.
         assert _memory_line(patch, added=True) == 'memory: "512Mi"'
         assert _memory_line(patch, added=False) == 'memory: "256Mi"'

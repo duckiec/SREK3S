@@ -158,10 +158,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         "target_manifest=%s job_budget=%s max_active_jobs=%s",
         triage.AGENT_VERSION,
         type(provider).__name__ if provider is not None else "unset",
-        classifier.TARGET_MANIFEST,
+        classifier.TARGET_MANIFEST or "(none)",
         "configured" if provider is not None else "unconfigured",
         getattr(budget, "max_active", "unknown"),
     )
+    # Unset target and no checkout are different faults with the same symptom -
+    # every incident escalates - so the log has to say which one this is. This is
+    # the only place the distinction can be made: by the time an incident is
+    # triaged, an unreadable target is a filesystem verdict with no record of
+    # whether a target was ever asked for.
+    #
+    # It is ERROR rather than INFO because the state is not the designed resting
+    # state. An empty mount with a target configured is fail-closed by design
+    # (docs/security-invariants.md, "Not Wired"); an unset target is a
+    # deployment that cannot do the one thing Tier-1 exists for, and it reads
+    # identically to the design working if the level is left alone.
+    if not classifier.TARGET_MANIFEST:
+        logger.error(
+            "%s is unset or malformed, and the agent ships no default target "
+            "manifest, so no incident can be resolved to Tier-1. Every incident "
+            "will escalate under I-B2 with the reason 'no patch target is "
+            "configured'. Set it to a repository-relative path that exists in the "
+            "GitOps checkout, e.g. deploy/chaos/oom-leak.yaml.",
+            classifier.TARGET_MANIFEST_ENV,
+        )
     yield
     logger.info("srek3s agent shutting down")
 

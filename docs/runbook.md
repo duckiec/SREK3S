@@ -85,7 +85,7 @@ cluster.
 | | Committed state | What you see |
 |---|---|---|
 | **Watch scope vs grant** | `sentinel.yaml` ships `WATCH_NAMESPACE: srek3s-system`, which is the namespace `rbac.yaml` grants — **the two agree as committed.** They did not always: an earlier revision shipped `""` (all namespaces) against a namespaced Role, which produced a cluster-wide `LIST` the apiserver refused forever, with **no incidents and no error**. If you widen the scope, widen the grant in the same commit. | Nothing, if you leave them alone. **Silence if you break the pairing** — indistinguishable from a healthy cluster watching nothing. Asserted by `test_the_watch_scope_is_inside_the_granted_namespace`. |
-| **Agent manifest root** | `agent.yaml` mounts `/manifests` as an `emptyDir`, and the default target `deploy/payments/checkout-api.yaml` does not exist in this repository | Every incident escalates to `TIER_2_ARCHITECTURAL` with `git_patch == ""`. **That is the design working** (invariant I-B2), not a fault — see [The agent's manifest root ships empty](#the-agents-manifest-root-ships-empty). |
+| **Agent manifest root** | `agent.yaml` mounts `/manifests` as an `emptyDir`, and `SREK3S_TARGET_MANIFEST` is set by no shipped install path — the agent has no default target | Every incident escalates to `TIER_2_ARCHITECTURAL` with `git_patch == ""`. **With an empty mount that is the design working** (invariant I-B2), not a fault — see [The agent's manifest root ships empty](#the-agents-manifest-root-ships-empty). With a populated mount it is a missing configuration key, and the startup log says `ERROR` for exactly that case. |
 
 The honest summary: **an in-cluster run of `deploy/` demonstrates the Tier-2
 war-room path and the no-mutation guarantee. It cannot demonstrate a Tier-1 patch.**
@@ -219,11 +219,17 @@ That is the intended safe state — invariant **I-B2** failing closed — and **
 fault. But it looks exactly like a working setup**, which is why the manifest and
 this runbook both say so in those words.
 
-**There is a second, independent way to land in the same state.** The default
-target is `deploy/payments/checkout-api.yaml`, and that file **does not exist in
-this repository**. So a populated `/manifests` with `SREK3S_TARGET_MANIFEST` left
-unset produces byte-identical behaviour: 100% Tier-2. Fixing the volume alone does
-not enable Tier-1.
+**There is a second, independent way to land in the same state, and it is the one
+to check first.** The agent ships **no default target manifest**, so a populated
+`/manifests` with `SREK3S_TARGET_MANIFEST` left unset also produces 100% Tier-2.
+Fixing the volume alone does not enable Tier-1.
+
+The two are distinguishable from outside, which is the whole point:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `target_manifest=(none)` at startup, then `ERROR ... SREK3S_TARGET_MANIFEST is unset or malformed` | No target configured. Nothing was ever asked for. | Set the variable to a repo-relative path in the checkout. |
+| `target_manifest=<path>` at startup, `ERROR` absent, escalation reason `target manifest is unreadable (I-B2)` | A target *is* configured and the checkout cannot supply it — empty mount, failed clone, or a path that is not in the repository. | Populate the checkout, or correct the path. |
 
 To get Tier-1 patches, do both: replace the `manifests` volume with the GitOps
 checkout your pipeline actually applies (a PVC, or an init container that clones
@@ -853,7 +859,7 @@ Two limitations worth knowing rather than discovering:
 | **Sentinel running, no incidents, no errors, nothing happening anywhere** | The watch scope and the grant disagree. Compare `WATCH_NAMESPACE` in `deploy/sentinel.yaml` against the namespaces in `deploy/rbac.yaml` — `srek3s-system` and `srek3s-system` as shipped. If you widened one, widen the other: [§1](#rbac-is-namespace-scoped-and-that-is-deliberate) |
 | Sentinel running, no incidents, pod visibly crash-looping | `dedup_suppressed` in the stats line — [§2](#2-observing-the-logs) |
 | `dispatch failed … agent unreachable` | The agent pod; then `-agent-url` for a doubled path |
-| Every incident is Tier-2 with `no manifest provider` | `SREK3S_MANIFEST_ROOT` is unset or empty, **or** the `/manifests` volume is still an `emptyDir` — [§1](#the-agents-manifest-root-ships-empty). If you *have* wired a checkout, also check `SREK3S_TARGET_MANIFEST`: its default, `deploy/payments/checkout-api.yaml`, does not exist in this repository |
+| Every incident is Tier-2 with `no manifest provider` | `SREK3S_MANIFEST_ROOT` is unset or empty, **or** the `/manifests` volume is still an `emptyDir` — [§1](#the-agents-manifest-root-ships-empty). If you *have* wired a checkout, also check `SREK3S_TARGET_MANIFEST`: the agent ships no default, so an unset value means no patch target at all and the startup log carries `target_manifest=(none)` plus an `ERROR` naming the variable |
 | Sentinel watching the wrong namespaces | The `watch_namespace` startup field, [§1](#1-deploying-the-sentinel) |
 | `watcher_dropped` above zero | The egress queue overflowed and **an incident was lost** |
 | Pods `ImagePullBackOff` on a local host | Image not built for `linux/arm64`, or not registered in `k8s.io` under the exact `registry.internal/...` name — [`docs/offline-install.md`](offline-install.md) |

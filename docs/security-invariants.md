@@ -339,10 +339,17 @@ decides this, and the difference is easy to miss because both produce Tier-2.
   escalates under **I-B2** and no patch is proposed. That is the intended safe
   state, and it is indistinguishable from a working installation if you only look
   at the tier label.
-- The chart ships a default `agent.gitops.repoUrl`, so the Agent clones a
-  repository at startup instead. `agent.targetManifest` still defaults to empty,
-  and **an empty target manifest is the whole gate**: with it unset every incident
-  still escalates. Set it and Tier-1 becomes reachable:
+- Neither install path sets `SREK3S_TARGET_MANIFEST`, and the agent ships no
+  default for it. Both do set `SREK3S_GITOPS_REPO_URL` (the chart's
+  `agent.gitops.repoUrl` defaults to the same repository), so the Agent clones a
+  real checkout at startup and still has nothing to point at.
+  `classifier.DEFAULT_TARGET_MANIFEST` is empty, and that empty string is the
+  whole gate: with no target configured there is nothing to read, so every
+  incident escalates and `remediation.target_manifest` is `""` — which the schema
+  admits only because an empty `git_patch` may not be paired with a named target.
+  `main` logs `ERROR` naming the variable at startup while it is unset, so "the
+  design is working" and "this deployment is not configured" stop looking the
+  same from outside. Set both and Tier-1 becomes reachable:
 
   ```bash
   helm install srek3s deploy/helm/srek3s -n srek3s-system --create-namespace \

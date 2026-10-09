@@ -85,8 +85,26 @@ logger = logging.getLogger("srek3s.agent")
 #: incident-supplied data would let a payload choose which file this system is
 #: willing to propose a change to. The *resolved* value this engine uses is
 #: :data:`TARGET_MANIFEST`, declared further down beside the environment
-#: handling it depends on; this is the shipped default.
-DEFAULT_TARGET_MANIFEST: Final[str] = "deploy/payments/checkout-api.yaml"
+#: handling it depends on.
+#:
+#: **Empty, and that is the point.** This constant used to be
+#: ``"deploy/payments/checkout-api.yaml"``, a path that exists nowhere in this
+#: repository and, because :data:`MANIFEST_ROOT_ENV` resolves it inside the
+#: cloned GitOps checkout, could not exist in any checkout either. A shipped
+#: default that provably cannot resolve buys nothing: with no checkout mounted
+#: the agent escalates under I-B2 for one reason, and with a checkout mounted it
+#: escalated for a second, unrelated one - the file was never going to be there.
+#: The two causes are indistinguishable from the outside, because the failure
+#: text ("target manifest is unreadable") reads like a broken checkout.
+#:
+#: There is no path here that is correct for somebody. The target is a property
+#: of the deployment, not of this engine, so there is nothing to ship. Empty
+#: means *no patch target is configured*: every incident escalates under I-B2
+#: with a reason that names :data:`TARGET_MANIFEST_ENV`, which is a
+#: configuration answer rather than a filesystem one. Set the variable and the
+#: constant is unused; `test_manifest_provider.py` pins that a non-empty
+#: default cannot come back.
+DEFAULT_TARGET_MANIFEST: Final[str] = ""
 
 #: Cluster events indicating node-level rather than container-level pressure.
 #:
@@ -195,9 +213,10 @@ _MANIFEST_SUFFIXES: Final[tuple[str, ...]] = (".yaml", ".yml", ".json")
 #: propose a change to, and routing on ``incident.namespace`` would hand exactly
 #: that power to whatever wrote the payload.
 #:
-#: Unset means :data:`DEFAULT_TARGET_MANIFEST`, so the production default and
-#: the fail-closed path (no :data:`MANIFEST_ROOT_ENV`, hence no readable
-#: manifest, hence Tier-2 under I-B2) are both exactly as they were.
+#: Unset means :data:`DEFAULT_TARGET_MANIFEST`, which is empty, so the
+#: fail-closed path (no :data:`MANIFEST_ROOT_ENV`, hence no readable manifest,
+#: hence Tier-2 under I-B2) and the unconfigured path (no target to read at all)
+#: both escalate for a reason their log line names.
 TARGET_MANIFEST_ENV: Final[str] = "SREK3S_TARGET_MANIFEST"
 
 
@@ -225,14 +244,18 @@ def resolve_target_manifest(env: Mapping[str, str] | None = None) -> str:
 
     Three outcomes, mirroring :func:`manifest_provider_from_env`:
 
-    * unset or blank -> :data:`DEFAULT_TARGET_MANIFEST`, so an operator who has
-      never heard of this variable gets the shipped behaviour.
+    * unset or blank -> :data:`DEFAULT_TARGET_MANIFEST`, which is empty. An
+      operator who has never heard of this variable gets no patch target and
+      every incident escalates under I-B2. `main` logs the consequence once at
+      startup; this function stays silent on the unset case because it is also
+      called with an explicit mapping by tests, where a startup complaint would
+      be noise about a value nobody set.
     * set to a well-formed repo-relative manifest path -> that path.
-    * set to something that could never be a manifest -> a logged warning and
-      the default. A typo must not become a target. Falling back is safe here
-      precisely because the default fails closed too when no checkout is
-      mounted, so a mis-set variable escalates rather than patching some other
-      file - which is the outcome that would be unrecoverable.
+    * set to something that could never be a manifest -> a logged warning and no
+      target. A typo must not become a target, and with no default to fall back
+      to the refusal is the whole outcome: a mistyped variable leaves the agent
+      with nothing to patch rather than quietly aiming it somewhere else, which
+      is the outcome that would be unrecoverable.
 
     A mapping may be passed so this is testable without mutating the process
     environment; the production call reads ``os.environ``.
@@ -244,12 +267,14 @@ def resolve_target_manifest(env: Mapping[str, str] | None = None) -> str:
     if _target_manifest_is_wellformed(raw):
         return raw
     logger.warning(
-        "%s=%r is not a repo-relative manifest path, so the default %r is used "
-        "instead. A target that cannot exist would escalate every incident under "
-        "I-B2, and a target that resolves to something else would be worse.",
+        "%s=%r is not a repo-relative manifest path, so it is refused and this "
+        "process has no patch target. Every incident will escalate under I-B2 "
+        "until %s names a manifest that exists in the GitOps checkout. A target "
+        "that cannot exist would escalate every incident anyway, and a target "
+        "that resolves to something else would be worse.",
         TARGET_MANIFEST_ENV,
         raw,
-        DEFAULT_TARGET_MANIFEST,
+        TARGET_MANIFEST_ENV,
     )
     return DEFAULT_TARGET_MANIFEST
 

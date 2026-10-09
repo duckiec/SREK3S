@@ -21,12 +21,14 @@ spec:
             #
             # This is a repo-RELATIVE path resolved under SREK3S_MANIFEST_ROOT.
             #
-            # The shipped default is `deploy/payments/checkout-api.yaml`, which
-            # **does not exist in this repository** — verified, not assumed. Leaving
-            # it unset therefore produces deterministic Tier-2 escalation for a reason
-            # that has nothing to do with the fail-closed design working: the provider
-            # cannot find the file. Two independent causes of all-Tier-2 exist
-            # (empty mount, wrong target), and fixing only the first changes nothing.
+            # The agent ships **no** default. It used to default to
+            # `deploy/payments/checkout-api.yaml`, a path that existed in no
+            # checkout of anything — verified, not assumed — so leaving it unset
+            # produced deterministic Tier-2 escalation for a reason that had
+            # nothing to do with the fail-closed design working: the provider
+            # could not find the file. Two independent causes of all-Tier-2
+            # existed (empty mount, no target), and fixing only the first
+            # changed nothing.
             #
             # `deploy/chaos/oom-leak.yaml` is chosen because it is the fixture the
             # incident is generated from, so the proposed diff is falsifiable: raising
