@@ -40,12 +40,24 @@ func ScrubString(ctx context.Context, s string) string {
 	return scrub(s).text
 }
 
-// ScrubLines masks each line, then performs the cross-line safety pass required
-// by CONTRIBUTING.md §5.1 M3: the masked lines are joined, the full manifest is
-// re-scanned once to catch secrets assembled across a line boundary, and the
-// result is redistributed.
+// ScrubLines masks the payload in three ordered stages, and the order is
+// load-bearing rather than incidental.
 //
-// The returned report covers both passes. Nil input yields nil output and a
+//  1. Stage 1, [crossLinePass]: rules whose pattern genuinely spans a newline.
+//     First, because D-3 found that a single-line rule would otherwise shred a PEM
+//     block before the rule that owns it had a chance to see it whole.
+//  2. The per-line pass. Every line goes through the full manifest with its
+//     templates, so each secret is masked by the rule that recognises its syntax.
+//  3. Stage 2, [collapseAndRedact]: whatever survived, re-examined as one
+//     separator-free projection.
+//
+// Stage 2 runs LAST on purpose. It was originally placed before the per-line pass,
+// which masked the fixture's own secrets with a cross-boundary span and left only
+// three of the eleven rules firing - over-redacting the neighbours of a split
+// secret, and hiding the very rules the per-line pass exists to apply. Running it
+// last means it sees only residue, so it is both narrower and cheaper.
+//
+// The returned report covers all three stages. Nil input yields nil output and a
 // zero report.
 //
 // # Cancellation
@@ -66,15 +78,12 @@ func ScrubLines(ctx context.Context, lines []string) ([]string, RedactionReport)
 
 	acc := newRedactor()
 
-	// D-3: the cross-line pass runs first, on the raw lines, so that a
-	// multi-line rule such as pem_private_key sees an intact BEGIN…END block
-	// before any single-line fallback can red part of it.
 	crossed, crossAcc := crossLinePass(lines)
 	acc.merge(crossAcc.report())
 
-	// Then the per-line pass over the redistributed text. Every line is masked
-	// to completion or not returned; see scrub for why cancellation is observed
-	// at line granularity only.
+	// The per-line pass over the redistributed text. Every line is masked to
+	// completion or not returned; see scrub for why cancellation is observed at
+	// line granularity only.
 	out := make([]string, len(crossed))
 	for i, line := range crossed {
 		if ctx.Err() != nil {
@@ -84,27 +93,22 @@ func ScrubLines(ctx context.Context, lines []string) ([]string, RedactionReport)
 		out[i] = res.text
 		acc.merge(res.report)
 	}
-	return out, acc.report()
+
+	// D-6, last: by now each line has been masked by the rule that recognises it,
+	// so what is left that a line's own quotes betray is a value that ran past the
+	// end of its line.
+	continued, continueReport := continueSplitValues(out, acc)
+	acc.merge(continueReport)
+	return continued, acc.report()
 }
 
-// crossLinePass joins the masked lines, re-scans with the multi-line rules only,
-// and redistributes.
+// crossLinePass catches what a per-line scan cannot see, in two stages, and
+// redistributes the result.
 //
-// Two changes from the original implementation, both ratified:
-//
-//   - Defect D-3: this pass now runs BEFORE the per-line pass, not after. That
-//     ordering is what fixes the PEM-body leak. Previously the per-line pass ran
-//     rule 11 private_key_pem_body first, which redacted the BEGIN marker; by
-//     the time rule 1 pem_private_key saw the joined text there was no BEGIN…END
-//     pair left, so the base64 key body survived verbatim. Running the multi-line
-//     rules first means rule 1 gets an intact block to match, and rule 11 then
-//     finds nothing left to shred.
-//   - Defect D-5: only rules with MultiLine == true are applied, so this is two
-//     patterns over the batch rather than eleven. The others provably cannot
-//     match across a newline, so they would contribute nothing.
-//
-// A second pass over already-masked text produces no new matches, so every
-// redaction counted here is a genuine cross-boundary finding.
+// Defect D-3 fixed the PEM-body leak by moving this pass ahead of the per-line
+// pass. Defect D-5 restricted it to rules with MultiLine == true. Defect D-6 is
+// that D-5's justification did not hold and the leak it left was total. Each
+// stage is described where it is implemented.
 func crossLinePass(lines []string) ([]string, *redactor) {
 	acc := newRedactor()
 	if len(lines) < 2 {
@@ -112,14 +116,102 @@ func crossLinePass(lines []string) ([]string, *redactor) {
 		return lines, acc
 	}
 
+	// Stage 1 only. The separator-free projection is stage 2, and it runs last -
+	// see [ScrubLines] for why the ordering is what it is.
 	joined := strings.Join(lines, "\n")
 	text := applyRules(multiLineManifest(), joined, acc)
-
-	if text == joined {
-		// Nothing matched; avoid the split allocation on the common path.
-		return lines, acc
+	if text != joined {
+		lines = strings.Split(text, "\n")
 	}
-	return strings.Split(text, "\n"), acc
+	return lines, acc
+}
+
+// continueSplitValues is stage 2. A credential whose halves land on different
+// lines leaves a tell: the line carrying the first half opens a quote it never
+// closes, because the value ran to end-of-line. Stage 2 masks the rest.
+//
+// This replaced a separator-free projection of the whole batch, which found the
+// same secrets and destroyed unrelated diagnostics doing it. Removing the newline
+// between two lines also removes the boundary that keeps a greedy value class
+// inside its line: generic_secret_kv matches `[^"',;}\\n]{4,}`, so in a
+// projection it ran on from an already-masked `auth=` through the sentinel and
+// into the next line's `ts=... msg=`, masking a credential that was already
+// masked and a timestamp that was not one. Two diagnostics gone to hide nothing.
+// The golden fixture in internal/emitter drifted by exactly that much.
+//
+// Quote parity is a syntactic fact about the payload rather than a heuristic
+// about the manifest, so it needs no new rule flag and no change to
+// CONTRIBUTING.md's normative table: if a line opens a quote it does not close,
+// the value it was carrying is incomplete on that line.
+//
+// The residual is stated rather than hidden. A split credential with NO quoting
+// around it has no such tell, because there is no delimiter whose absence marks
+// the continuation. That shape is left unmasked by this stage and is recorded in
+// splitline_test.go as a known limit rather than papered over.
+func continueSplitValues(lines []string, acc *redactor) ([]string, RedactionReport) {
+	if len(lines) < 2 {
+		return lines, RedactionReport{}
+	}
+
+	acc2 := newRedactor()
+	out := make([]string, len(lines))
+	copy(out, lines)
+
+	for i := 0; i < len(lines)-1; i++ {
+		open := unclosedQuoteAt(out[i])
+		if open < 0 {
+			continue
+		}
+		// Both halves. The head on this line is the fragment the per-line pass
+		// could not mask, because a value shorter than generic_secret_kv's four
+		// character minimum is below every rule's threshold - `aws_secret_access_key
+		// = "a` then `bbbb…"` left one real character on the wire. The tail on the
+		// next line is the rest of the same credential.
+		out[i] = out[i][:open+1] + RedactionSentinel
+
+		next := out[i+1]
+		stop := len(next)
+		if at := firstQuote(next); at >= 0 {
+			// Through the closing quote: it belongs to the value, and leaving it
+			// behind would put the payload back into odd parity.
+			stop = at + 1
+		}
+		out[i+1] = RedactionSentinel + next[stop:]
+		acc2.record(RuleGenericSecretKV, 1)
+	}
+	return out, acc2.report()
+}
+
+// unclosedQuoteAt returns the index of the quote character this line opens and
+// never closes, or -1 when every quote on the line is paired.
+func unclosedQuoteAt(line string) int {
+	for _, q := range []string{`"`, `'`} {
+		var open int
+		seen := false
+		for i := 0; ; {
+			at := strings.Index(line[i:], q)
+			if at < 0 {
+				break
+			}
+			i += at
+			if seen {
+				open = -1
+			} else {
+				open = i
+			}
+			seen = !seen
+			i += len(q)
+		}
+		if seen {
+			return open
+		}
+	}
+	return -1
+}
+
+func firstQuote(s string) int {
+	at := strings.IndexAny(s, `"'`)
+	return at
 }
 
 // scrubResult bundles the masked text with its accounting.
