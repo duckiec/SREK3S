@@ -51,13 +51,11 @@ rules:
     resources: ["events"]
     verbs: ["get", "list", "watch"]
 
-  # Deployments and ReplicaSets: read-only, for attributing an incident to a
-  # workload rather than to a bare pod name. Present but read-only, and visible in
-  # review — if the Sentinel ever needs more, this file changes and the change is
-  # diffable.
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "watch"]
+  # No `apps` rule here either. This is the chaos-namespace grant, and it existed to
+  # mirror deploy/rbac.yaml; when the file of record dropped `deployments` and
+  # `replicasets` because nothing read them, a mirror that kept granting them would
+  # have re-introduced the same unread grant in the one namespace the Sentinel is
+  # pointed at during a demo.
 
   # ---------------------------------------------------------------------------
   # DELIBERATELY ABSENT, and the absence is the guarantee:

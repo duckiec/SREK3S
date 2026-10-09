@@ -78,10 +78,22 @@ func TestSentinelRoleGrantsWhatTheWatcherReads(t *testing.T) {
 			granted[resource] = true
 		}
 	}
-	for _, required := range []string{"pods", "pods/log", "events", "deployments", "replicasets"} {
+	for _, required := range []string{"pods", "pods/log", "events"} {
 		if !granted[required] {
 			t.Errorf("the Role does not grant %q; the watcher's log fetch reads the "+
 				"pods/log subresource, which a rule on pods alone does not cover", required)
+		}
+	}
+
+	// Assert the ABSENCE of apps/deployments and apps/replicasets rather than their
+	// presence. The file granted them "for attributing an incident to a workload",
+	// and nothing has ever read them: readonly.go exposes exactly CoreV1().Pods and
+	// CoreV1().Events. Asserting absence is what makes the grant a decision rather
+	// than an oversight, and it fails loudly if it is reinstated.
+	for _, unused := range []string{"deployments", "replicasets"} {
+		if granted[unused] {
+			t.Errorf("the Role grants %q again, with no reader for it; add the "+
+				"reader, observe it working, and only then grant the verb", unused)
 		}
 	}
 }

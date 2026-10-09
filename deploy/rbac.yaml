@@ -48,16 +48,26 @@ rules:
     resources: ["events"]
     verbs: ["get", "list", "watch"]
 
-  # Deployments and ReplicaSets: read-only, for attributing an incident to a
-  # workload rather than to a bare pod name.
+  # THERE IS NO `apps` RULE, AND ITS ABSENCE IS THE POINT.
   #
-  # Deliberately read-only and deliberately present. A namespace-scoped Role
-  # cannot be given a wildcard that would cover future write verbs by accident,
-  # because the verbs are enumerated - which is the other half of why the
-  # allow-list form is used here rather than a deny-list of writes.
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
-    verbs: ["get", "list", "watch"]
+  # This file used to grant get/list/watch on `apps` `deployments` and
+  # `replicasets`, "for attributing an incident to a workload rather than to a bare
+  # pod name". Nothing ever read them. `internal/k8s/readonly.go` exposes exactly
+  # two readers - CoreV1().Pods and CoreV1().Events - and a non-test grep for
+  # `Deployments(` or `ReplicaSets(` across internal/ and cmd/ returns nothing.
+  #
+  # A grant without a reader is not free. It is an invitation to the next person to
+  # reach for it, and it widens what the component can reach on the day someone
+  # does. The read-only verb set means the blast radius today is small; the point
+  # is that it does not grow on its own.
+  #
+  # The stated purpose was attribution, and attribution is already covered: an
+  # incident carries the pod name, the container name and the owning Deployment's
+  # labels are already in the pod object the watcher holds. Nothing needed the
+  # read.
+  #
+  # If workload-level attribution is ever needed, the honest order is: add the
+  # reader, observe it working, then grant the verb. Not the reverse.
 
 ---
 # The Sentinel's ServiceAccount.
