@@ -236,6 +236,33 @@ checkout your pipeline actually applies (a PVC, or an init container that clones
 the repository) **and** set `SREK3S_TARGET_MANIFEST` to a repo-relative path that
 exists inside it. Until then, 100% Tier-2 is the design working.
 
+#### Where the checkout lands, and why the size differs
+
+The two volumes in `deploy/agent.yaml` look interchangeable and are not.
+
+| Volume | Backend | Limit | Backed by |
+|---|---|---|---|
+| `/tmp` | `emptyDir` with `medium: Memory` | `64Mi` | node RAM |
+| `/manifests` | `emptyDir`, no medium | `256Mi` | node disk |
+
+The agent's GitOps checkout is created with `tempfile.mkdtemp`, which honours
+`TMPDIR`, and `agent/Dockerfile` sets `TMPDIR=/tmp`. So **the checkout lands on the
+64Mi memory-backed `/tmp`, not on `/manifests`.** `/manifests` is the mount the
+manifest *provider* reads from, and it stays empty unless an operator fills it.
+
+Three consequences worth knowing before sizing a checkout:
+
+1. **The 64Mi limit applies to a worktree plus its `.git` directory.** The checkout
+   also registers an `atexit` handler that removes it, but that runs on an orderly
+   exit — a SIGKILL leaves it to the container filesystem.
+2. **Memory-backed space counts against the container's memory limit.** A checkout
+   large enough to matter can OOM the agent. That is precisely why `/manifests`
+   deliberately does *not* use `medium: Memory`, and the comment in
+   `deploy/agent.yaml` says so in those words.
+3. **`/tmp` is the only writable path** (the root filesystem is read-only), so
+   there is nowhere else to point it. Raising the limit means raising the `tmp`
+   volume's `sizeLimit` and accounting for it in the container's memory request.
+
 ### Configuration
 
 The Sentinel takes six flags, each also settable by environment variable:

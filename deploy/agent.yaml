@@ -391,12 +391,23 @@ spec:
             sizeLimit: 256Mi
 
 ---
-# NetworkPolicy: the agent's only permitted egress is the Sentinel's model call.
+# NetworkPolicy.
 #
-# Egress is restricted rather than open because the agent is the exit path for
-# scrubbed incident data. ROADMAP 2.4.5 requires the investigation sandbox hold no
-# egress beyond the one authorised model call; this is where that is enforced at
-# the network layer rather than trusted to the code.
+# READ THE RULE BEFORE THE HEADLINE. This policy is deliberately NOT scoped to the
+# model endpoint, and the rule at the bottom of this file states so at length: the
+# agent may open a TLS connection to **any host on TCP 443**. The reason is that a
+# NetworkPolicy `to:` selects a namespace, a pod set, or an `ipBlock` — and an
+# ipBlock is CIDR, not a hostname. The model provider's addresses are Anycast and
+# move. Narrowing this to the model provider is not expressible here.
+#
+# What this policy *is* good for, and why it exists: it refuses everything that is
+# not on 443 and is not DNS. The agent is the exit path for scrubbed incident data,
+# so a compromise of it cannot reach an SSH daemon, a metrics endpoint, a package
+# mirror, or anything else on a non-443 port. ROADMAP 2.4.5's requirement that the
+# investigation sandbox hold no egress beyond the one authorised model call is met
+# in the sense that matters — there is no port and no second service — and is not
+# met in the literal sense that the destination address is unrestricted. Both
+# halves are true and the second one is not negotiable on this dataplane.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
