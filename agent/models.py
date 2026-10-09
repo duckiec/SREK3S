@@ -115,7 +115,19 @@ _PATCH_HUNK_RE: Final[re.Pattern[str]] = re.compile(
 _MD_FENCE_RE: Final[re.Pattern[str]] = re.compile(r"```|~~~")
 
 #: A repository-relative path that must not escape the repository.
-_MANIFEST_PATH_RE: Final[re.Pattern[str]] = re.compile(r"^[\w./-]+\.(ya?ml|json)$")
+#: A repository-relative manifest path, and nothing else.
+#:
+#: Anchored with \A and \Z rather than ^...$ because ``re.match`` with a trailing
+#: ``$`` accepts a string with a trailing newline: ``$`` matches before a final
+#: \n, so ``deploy/oom-leak.yaml\n`` passed. That value reaches
+#: ``main.py``'s Tier-1 log line, and ``logging`` renders a newline as a record
+#: separator - so the response named one manifest and the log line became two
+#: records, the second carrying whatever followed the newline. ``\A``/``\Z`` also
+#: refuse a trailing newline, where ``$`` would not.
+#:
+#: ``fullmatch`` at the call site is belt-and-braces on top of these anchors and
+#: states the intent: the whole value must be a manifest path.
+_MANIFEST_PATH_RE: Final[re.Pattern[str]] = re.compile(r"\A[\w./-]+\.(ya?ml|json)\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +593,7 @@ class Remediation(_Strict):
             raise ValueError("target_manifest must be repository-relative")
         if ".." in value.split("/"):
             raise ValueError("target_manifest must not traverse outside the repository")
-        if not _MANIFEST_PATH_RE.match(value):
+        if _MANIFEST_PATH_RE.fullmatch(value) is None:
             raise ValueError(
                 "target_manifest must be a .yaml, .yml or .json path, got " f"{value!r}"
             )
