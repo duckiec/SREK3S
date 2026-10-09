@@ -60,6 +60,7 @@ from collections.abc import Mapping
 from typing import Any, Final, NamedTuple
 
 from llm import (
+    attempt_timeout_seconds,
     GEMINI_MAX_ATTEMPTS,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_RETRY_BACKOFF_SECONDS,
@@ -67,6 +68,7 @@ from llm import (
     LLM_MODEL_ENV,
     LLM_PROVIDER_ENV,
     LLM_TIMEOUT_SECONDS,
+    model_call_budget_seconds,
     NARRATIVE_FIELDS,
     OPENAI_API_KEY_ENV,
     SYSTEM_INSTRUCTION,
@@ -644,8 +646,13 @@ class GeminiProvider:
         # exhausted quota, and reporting that as load-shedding sends an operator
         # to the wrong system.
         response: Any
-        deadline = time.perf_counter() + self._timeout
+        call_budget = min(self._timeout, model_call_budget_seconds())
+        deadline = time.perf_counter() + call_budget
         for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            # Cap THIS attempt by what is left of the call's budget. The
+            # deadline check below only refuses a further retry; without this
+            # line a single attempt could outlast the whole budget.
+            remaining = attempt_timeout_seconds(deadline)
             try:
                 response = client.models.generate_content(
                     model=self.model_name,
@@ -658,6 +665,18 @@ class GeminiProvider:
                         response_schema=gemini_response_schema(),
                         temperature=0.0,
                         max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                        # The per-attempt timeout has to be a REQUEST option, not a
+                        # client option. genai.Client copies http_options into the
+                        # api client's own copy at construction
+                        # (`self._http_options = patch_http_options(...)`) and
+                        # builds its httpx client from that copy, so assigning to
+                        # the object passed in afterwards changes nothing - it was
+                        # measured doing exactly that and the timeout did not move.
+                        # generate_content forwards config.http_options into
+                        # request(), which merges it per call, so this is the
+                        # supported way to shrink the timeout as the budget is
+                        # spent. base_url still comes from the client options.
+                        http_options=types.HttpOptions(timeout=int(remaining * 1000)),
                         # Thinking is off, and that is measured rather than
                         # assumed: 3.x Flash models reason before answering and
                         # charge the reasoning against max_output_tokens, which
@@ -695,7 +714,7 @@ class GeminiProvider:
                 if time.perf_counter() >= deadline:
                     raise ModelOutputError(
                         f"the Gemini call failed ({type(exc).__name__}) and the "
-                        f"{self._timeout}s total budget is spent. The caller must "
+                        f"{call_budget:g}s call budget is spent. The caller must "
                         "escalate (I-B4)."
                     ) from None
                 time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
@@ -895,10 +914,16 @@ class OpenAIProvider:
             max_retries=0,
         )
 
-        deadline = time.perf_counter() + self._timeout
+        call_budget = min(self._timeout, model_call_budget_seconds())
+        deadline = time.perf_counter() + call_budget
         for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            # Cap THIS attempt by what is left of the call's budget. The
+            # deadline check below only refuses a further retry; without this
+            # line a single attempt could outlast the whole budget.
+            remaining = attempt_timeout_seconds(deadline)
             try:
                 completion = client.chat.completions.create(
+                    timeout=remaining,
                     model=model,
                     messages=[
                         # THE SEPARATION, in this protocol's dialect: the rules
@@ -939,7 +964,7 @@ class OpenAIProvider:
                 if time.perf_counter() >= deadline:
                     raise ModelOutputError(
                         f"the OpenAI-protocol call failed ({type(exc).__name__}) "
-                        f"and the {self._timeout}s total budget is spent. The "
+                        f"and the {call_budget:g}s call budget is spent. The "
                         "caller must escalate (I-B4)."
                     ) from None
                 time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
@@ -1110,8 +1135,14 @@ class AnthropicProvider:
             }
         ]
 
-        deadline = time.perf_counter() + self._timeout
+        call_budget = min(self._timeout, model_call_budget_seconds())
+        deadline = time.perf_counter() + call_budget
         for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            # Cap THIS attempt by what is left of the call's budget. The
+            # deadline check below only refuses a further retry; without this
+            # line a single attempt could outlast the whole budget.
+            remaining = attempt_timeout_seconds(deadline)
+            client = client.with_options(timeout=remaining)
             try:
                 message = client.messages.create(
                     model=self.model_name,
@@ -1166,7 +1197,7 @@ class AnthropicProvider:
                 if time.perf_counter() >= deadline:
                     raise ModelOutputError(
                         f"the Anthropic call failed ({type(exc).__name__}) and the "
-                        f"{self._timeout}s total budget is spent. The caller must "
+                        f"{call_budget:g}s call budget is spent. The caller must "
                         "escalate (I-B4)."
                     ) from None
                 time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
