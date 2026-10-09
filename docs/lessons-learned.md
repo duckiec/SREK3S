@@ -2254,6 +2254,56 @@ crashed, exited non-zero, and emitted a Python traceback — so any assertion ab
   silent. The precheck ordering still protects the DB half, and
   `TestReachableCveGate` still guards the gate's four ways of becoming a no-op.
 
+- **The fix was verified locally, and the verification was wrong. CI proved it in one
+  run.** All three changes above landed with `govulncheck ./...` reporting *No
+  vulnerabilities found*, and with `GO_VERSION: "1.26"` — which looked like the
+  resolution of exactly the problem being fixed. G7 then failed again with the same
+  nine advisories:
+
+      Vulnerability #1: GO-2026-6617
+        Found in: net/http@go1.26.8
+        Fixed in: net/http@go1.26.9
+
+  `go1.26.9` had been published and was on `go.dev/dl`. `go-version: 1.26` resolves
+  through **setup-go's versions manifest**, not the release channel, and that
+  manifest lagged: the runner asked for "1.26" and was handed 1.26.8. A floating
+  minor plus `check-latest` means the toolchain protecting a security gate is chosen
+  by a snapshot this repository does not control. `GO_VERSION` is now the exact
+  patch `1.26.9`, in both workflows, and the Dockerfile base is
+  `golang:1.26.9-bookworm` for the same reason: the gate and the shipped binary
+  must be built from the same toolchain by construction, not by coincidence.
+  (`golang:1.26-bookworm` did already ship 1.26.9 — verified by running `go version`
+  in both tags — because the registry rebuilt faster than setup-go's manifest
+  updated. That was luck.)
+
+- **And the local toolchain could not have caught it, which is the part worth
+  keeping.** The machine this was developed on runs a **patched Go build**:
+
+      $ go version
+      go version go1.26.8-X:nodwarf5 linux/arm64
+
+  `-X:nodwarf5` is a distro/vendor suffix, not a released version. govulncheck
+  matches standard-library advisories by comparing the toolchain version against
+  the advisory's affected range, and an unrecognised version string matches
+  nothing — so **every stdlib advisory is silently skipped on this machine.** Same
+  tree, same scanner, same advisory database, the only variable being which Go ran:
+
+      genuine go1.26.8          -> exit 3, 9 vulnerabilities
+      go1.26.8-X:nodwarf5       -> exit 0, "No vulnerabilities found"
+      genuine go1.26.9          -> exit 0, "No vulnerabilities found"
+
+  The local scan was a false clean, and it was false in the most expensive
+  direction: it reported the tree was safe from exactly the class of vulnerability
+  the tree was being fixed for. Re-running under `GOTOOLCHAIN=go1.26.9` produced
+  the honest answer.
+
+  The generalisable rule: **a reachability scan is only as good as the toolchain
+  that runs it, and a patched toolchain silently reduces a scan's coverage to
+  whatever the scanner can still match.** Any local claim of "no vulnerabilities"
+  that covers the standard library should name the toolchain it was produced on.
+  This is post-mortem 34 and 25 again — a check reading its own documentation — in
+  a new place: the documentation being read is the toolchain, not the script.
+
 ## 39. Deferred To v0.1.1 — What Is Not Covered Yet (v1.1.0)
 
 Recorded so that "not covered" is a decision with an owner and a cycle attached,

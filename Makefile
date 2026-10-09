@@ -386,6 +386,42 @@ check-supply-chain: ## helm lint, chart/base parity, govulncheck, workflow audit
 	@"$(PYTHON)" -m pytest "$(PYTEST_DIR)/test_helm_chart.py::test_render_matches_kustomize_base" -q
 
 	@echo "==> govulncheck"
+	@# READ THIS BEFORE TRUSTING A LOCAL CLEAN RESULT.
+	@#
+	@# govulncheck matches STANDARD LIBRARY advisories by comparing the running
+	@# toolchain's version against each advisory's affected range. A toolchain that
+	@# is not a plain upstream release - a distro or vendor build, anything carrying
+	@# a suffix like `go1.26.8-X:nodwarf5` - matches nothing, and every stdlib
+	@# advisory is silently skipped. The scan still runs, still reads the database,
+	@# and still reports "No vulnerabilities found".
+	@#
+	@# Measured on this repository, same tree, same scanner, same database, the only
+	@# variable being which Go executed it:
+	@#
+	@#   genuine go1.26.8     -> exit 3, 9 vulnerabilities
+	@#   go1.26.8-X:nodwarf5  -> exit 0, "No vulnerabilities found"
+	@#   genuine go1.26.9     -> exit 0, "No vulnerabilities found"
+	@#
+	@# So a local "clean" is only evidence about the standard library if you know
+	@# which Go produced it. Check with `go version` first:
+	@#
+	@#   GOTOOLCHAIN=go1.26.9 $(GOBIN)/govulncheck ./...
+	@#
+	@# CI is the authority here, and it pins GO_VERSION to an exact patch precisely so
+	@# this ambiguity cannot decide a gate. Locally, treat a clean stdlib scan from a
+	@# suffixed toolchain as unverified and say so rather than reporting it.
+	@echo "    toolchain: $$(go version 2>/dev/null || echo unknown)"
+	@if go version 2>/dev/null | grep -qE '^go version go[0-9]+\.[0-9]+\.[0-9]+ '; then \
+		echo "    (upstream release build - standard library IS in scope)"; \
+	else \
+		echo "    WARNING: not a plain upstream release. Standard-library advisories" >&2; \
+		echo "    may be silently out of scope; see the comment above. Re-run with" >&2; \
+		echo "    GOTOOLCHAIN=go1.26.9 to cover them, or trust CI." >&2; \
+	fi
+	@# Assignment and use must stay in ONE shell. A `@`-prefixed recipe line is its
+	@# own `bash -c`, so splitting them left `$$GOVULNCHECK` unbound on the line that
+	@# needed it - the same trap that made the first draft of the detonation
+	@# assertions pass vacuously.
 	@GOVULNCHECK="$$(command -v govulncheck || echo '$(GOBIN)/govulncheck')"; \
 	if [ ! -x "$$GOVULNCHECK" ]; then \
 		echo "FATAL: govulncheck not found." >&2; \
