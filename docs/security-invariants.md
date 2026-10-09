@@ -90,9 +90,26 @@ Every `TIER_1` patch passes two independent verifications before it is labelled 
 1. **Structural** — YAML AST parse of the patched manifest. Markdown-fenced output is
    rejected outright (**I-B4**); a model that wraps its answer in ` ```diff ` has
    produced a string, not a patch.
-2. **Empirical** — `git apply --check` against the target manifest's own bytes, in a
-   throwaway repository (**I-B2**). This is the only layer that knows whether the patch
-   applies to this file with this context.
+2. **Empirical** — `git apply --check` against the bytes the agent actually
+   observed (**I-B2**). This is the only layer that knows whether the patch applies
+   to this file with this context.
+
+**What layer 2 attests to.** It runs against the file in the GitOps checkout, read
+from disk at verification time, and refuses if those bytes are not the bytes the
+agent read. That binding is the invariant: `patch_validated: true` means the diff
+applies to the manifest the agent observed, which is the manifest a GitOps pipeline
+will apply.
+
+Validating against the string the manifest provider *returned* is a weaker claim
+that the earlier implementation made. Nothing ties that string to a real file, so a
+provider returning a truncated read produced a diff with a shrunken trailing context
+that applied perfectly to the truncated bytes and not at all to the manifest it
+named — and the response reported I-B2 satisfied.
+
+Drift between the agent's read and the file on disk is a race for ArgoCD or the
+merge queue to settle; this agent does not arbitrate it. What it will not do is
+validate against a third version of the file that is neither what it read nor what
+is deployed.
 
 Layer 2 asserts the *effect* — that the target file in the scratch tree changed — not
 `git apply`'s exit status, because an earlier harness verified a copy in the wrong
@@ -383,7 +400,7 @@ chart.
 | ID | Invariant |
 |---|---|
 | `I-B1` | `TIER_2_ARCHITECTURAL` implies `git_patch == ""` and `patch_validated == false` |
-| `I-B2` | `patch_validated == true` implies `git apply --check` exited 0 against the target |
+| `I-B2` | `patch_validated == true` implies `git apply --check` exited 0 against the file the agent observed in the GitOps checkout |
 | `I-B3` | `incident_id` round-trips unchanged from Contract A |
 | `I-B4` | Non-JSON model output is a fatal failure; no partial acceptance |
 | `I-B5` | Neither contract has any field capable of expressing a cluster write verb |

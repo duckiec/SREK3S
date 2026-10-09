@@ -155,6 +155,27 @@ class ManifestProvider(Protocol):
         ...
 
 
+def checkout_root_of(provider: ManifestProvider | None) -> str | None:
+    """The filesystem root backing ``provider``, or ``None`` if it has none.
+
+    I-B2's applicability check has to know whether the bytes it validates against
+    are the bytes a file on disk holds, or only the bytes a provider happened to
+    return. Only a provider that reads a real checkout can answer that, so this is
+    a capability probe rather than a cast: it reads the ``root`` property when the
+    provider has one and answers ``None`` otherwise.
+
+    Returning ``None`` is not a weaker guarantee for every provider. A
+    :class:`StaticManifestProvider` holds exactly the manifest text it is asked
+    for, so there is no second source that could disagree. The distinction that
+    matters is a provider whose returned text can diverge from the file it claims
+    to describe, which is precisely what a truncated read is.
+    """
+    root = getattr(provider, "root", None)
+    if root is None:
+        return None
+    return str(root)
+
+
 def unreadable_manifest_provider() -> ManifestProvider:
     """A provider that reports every manifest as unreadable.
 

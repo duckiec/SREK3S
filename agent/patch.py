@@ -473,23 +473,81 @@ class VerificationResult:
         return "; ".join(self.failures) if self.failures else "verified"
 
 
+def _observed_bytes(
+    manifest_text: str, path: str, checkout_root: str | None
+) -> tuple[str | None, str]:
+    """The bytes the applicability check must run against.
+
+    Returns ``(source, note)``, where ``source`` is ``None`` when the state
+    cannot be established - in which case ``note`` is the reason to fail with.
+    ``note`` is otherwise the description of which source was used, so the caller's
+    own report can say what was attested to rather than implying it.
+    """
+    if checkout_root is None:
+        return manifest_text, "the bytes the manifest provider returned"
+
+    on_disk = Path(checkout_root) / path
+    try:
+        text = on_disk.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        # A missing or unreadable target is a Tier-2 outcome, not a 500: the
+        # whole point of the check is that it fails closed.
+        return None, (
+            f"the checkout at {checkout_root!r} cannot supply {path!r} ({exc}), "
+            f"so the patch cannot be checked against the state the agent observed"
+        )
+
+    if text != manifest_text:
+        # The agent read one thing and the checkout holds another. Which is
+        # authoritative is a race for ArgoCD or the merge queue to settle, but a
+        # patch validated against neither is not `patch_validated`.
+        return None, (
+            f"the file at {path!r} in the checkout no longer matches the bytes the "
+            f"agent read; a diff validated against a manifest that is not the one "
+            f"on disk is not `patch_validated` (I-B2)"
+        )
+    return text, "the file in the GitOps checkout"
+
+
 def git_apply_check(
     manifest_text: str,
     diff: str,
     path: str,
     timeout_seconds: float = GIT_APPLY_TIMEOUT_SECONDS,
+    checkout_root: str | None = None,
 ) -> tuple[bool, str]:
-    """Run ``git apply --check`` against ``manifest_text`` placed at ``path``.
+    """Run ``git apply --check`` against the manifest the agent actually observed.
 
-    The manifest is materialised into a throwaway repository so the check runs
-    against the exact bytes the patch was derived from, with no dependency on a
-    GitOps checkout being present. That matters: I-B2 requires the patch to be
-    known to apply *to this manifest*, and validating against some other copy of
-    the repository would prove nothing about the file being patched.
+    ## What this attests to
+
+    I-B2 is that ``patch_validated: true`` means the diff applies to the file it
+    claims. Which file it applies to is the whole question, and there are two
+    candidates:
+
+    * ``manifest_text`` - the bytes :class:`ManifestProvider` handed back.
+    * the file in the GitOps checkout - the bytes on disk.
+
+    Validating against the first certifies **self-consistency**: the diff applies
+    to the string it was derived from. That is necessary and it is not sufficient,
+    because nothing ties the string to a real file. A provider that returns a
+    truncated read yields a diff with a shrunken trailing context, the diff applies
+    perfectly to the truncated bytes, and the response reports I-B2 satisfied for a
+    patch that does not apply to the manifest it names.
+
+    When ``checkout_root`` is given, the bytes staged for the check are read from
+    disk at ``<checkout_root>/<path>``, and ``manifest_text`` is used only to
+    confirm the agent read that same file. The attestation then binds to the state
+    the agent observed, which is what a GitOps pipeline will apply.
+
+    Without a root - a :class:`StaticManifestProvider` in a test, where the held
+    text *is* the state - the staged bytes are ``manifest_text`` and the
+    attestation is the weaker self-consistency one. That asymmetry is stated
+    rather than hidden: the two are the same property on different sources, and a
+    static provider has no separate source to disagree with.
 
     Returns ``(passed, reason)``. Fails closed in every uncertain case - git
-    absent, git unable to initialise, a timeout - because an unverified patch
-    must never be presented as ``patch_validated``.
+    absent, git unable to initialise, a timeout, an unreadable target - because an
+    unverified patch must never be presented as ``patch_validated``.
     """
     if path.startswith("/") or ":" in path:
         return False, f"patch path must be repo-relative, got {path!r}"
@@ -498,16 +556,23 @@ def git_apply_check(
     if git is None:
         return False, "git is not available, so `git apply --check` cannot run"
 
+    # The bytes the check runs against. Read from the checkout when there is one,
+    # so the attestation binds to the state the agent observed rather than to the
+    # string it happened to receive.
+    source, source_note = _observed_bytes(manifest_text, path, checkout_root)
+    if source is None:
+        return False, source_note
+
     with tempfile.TemporaryDirectory(prefix="srek3s-ib2-") as tmp:
         root = Path(tmp)
         target = root / path
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            # newline="" so the bytes on disk match the manifest exactly. A
+            # newline="" so the bytes on disk match the source exactly. A
             # platform newline translation would make the context lines differ
             # from those in the diff for reasons unrelated to the patch, and the
             # check would fail spuriously on Windows.
-            target.write_text(manifest_text, encoding="utf-8", newline="")
+            target.write_text(source, encoding="utf-8", newline="")
             patch_file = root / "candidate.patch"
             # The diff is written **exactly as given**. No normalisation, no
             # repair, no "helpful" trailing newline.
@@ -585,6 +650,7 @@ def verify_patch(
     container_name: str,
     expected_old: str,
     git_checker: bool = True,
+    checkout_root: str | None = None,
 ) -> VerificationResult:
     """Full I-B2 verification: structural round-trip **and** ``git apply --check``.
 
@@ -594,6 +660,10 @@ def verify_patch(
     this manifest. Neither subsumes the other - the first would not notice a
     malformed hunk header if the line arithmetic happened to work out, and the
     second cannot tell a correct patch from one aimed at the wrong field.
+
+    ``checkout_root`` decides what the second check attests to; see
+    :func:`git_apply_check`. With it, the check runs against the bytes on disk in
+    the GitOps checkout and refuses if they are not the bytes the agent read.
 
     ``git_checker`` exists so the fail-closed path can be exercised on a host
     with no git binary. It is not a production escape hatch: callers leave it on.
@@ -620,7 +690,9 @@ def verify_patch(
 
     git_ok = False
     if git_checker:
-        git_ok, git_reason = git_apply_check(original, diff, path)
+        git_ok, git_reason = git_apply_check(
+            original, diff, path, checkout_root=checkout_root
+        )
         if not git_ok:
             failures.append(git_reason)
     else:
