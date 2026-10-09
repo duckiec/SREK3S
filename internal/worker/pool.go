@@ -387,6 +387,17 @@ func splitLines(blob string) []string {
 }
 
 // Stats returns a point-in-time snapshot.
+// PerIncidentTimeout reports the deadline this pool imposes on one incident's
+// telemetry-and-dispatch phase.
+//
+// Exposed because the deadline is chosen by the caller, not by the pool: the
+// worker's default (2 * k8s.TelemetryTimeout) is sized for telemetry, and a caller
+// whose sink talks to something slow must raise it. Without an accessor the only
+// way to observe the value is a timing test, which is how this went unnoticed -
+// cmd/sentinel's emitter budget was unreachable while every timeout constant in
+// the tree agreed with every other.
+func (p *Pool) PerIncidentTimeout() time.Duration { return p.perIncidentTimeout }
+
 func (p *Pool) Stats() Stats {
 	return Stats{
 		Processed: p.processed.Load(),
