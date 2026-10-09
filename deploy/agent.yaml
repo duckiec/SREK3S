@@ -245,12 +245,17 @@ spec:
             # Token and the URL look equally sensitive when only one is. The token
             # stays in `srek3s-secrets` below.
             #
-            # It defaults to this project's own public repository so that a fresh
-            # `kubectl apply -k deploy/` can actually reach Tier-1 instead of
-            # booting with a manifest path that does not exist and escalating every
-            # incident under I-B2 with the misleading reason "target manifest is
-            # unreadable" (which reads like a broken checkout, not a missing
-            # configuration key).
+            # It defaults to this project's own public repository so that a fresh install
+            # of the base of record can actually reach Tier-1 instead of booting with
+            # a manifest path that does not exist and escalating every incident under
+            # I-B2 with the misleading reason "target manifest is unreadable" (which
+            # reads like a broken checkout, not a missing configuration key).
+            #
+            # A fresh install of the base means:
+            #   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/base \
+            #     | kubectl apply -f -
+            # `deploy/kustomization.yaml` existed until 2026-10-09 and is gone; it was
+            # a second base that rendered 10 objects against the base's 11.
             #
             # Empty still means: SREK3S_MANIFEST_ROOT if mounted, otherwise every
             # incident escalates. A failed clone degrades the same way; it never

@@ -36,6 +36,21 @@ func manifestPath(t *testing.T, name string) string {
 	return path
 }
 
+// baseManifestPath reads a file from the base of record, deploy/base/.
+//
+// Separate from manifestPath because the kustomization lives one level below the
+// manifests it lists. It sat at deploy/kustomization.yaml until 2026-10-09, when
+// that duplicate was deleted; tests that kept naming the old path failed with
+// `cannot stat ../../deploy/kustomization.yaml`.
+func baseManifestPath(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "deploy", "base", name)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("cannot stat %s: %v", path, err)
+	}
+	return path
+}
+
 func readManifest(t *testing.T, name string) string {
 	t.Helper()
 	data, err := os.ReadFile(manifestPath(t, name))
@@ -96,7 +111,7 @@ func TestYamlIsOnlyImportedFromTests(t *testing.T) {
 // every other assertion vacuous rather than failing.
 func TestManifestsAreValidYAML(t *testing.T) {
 	for _, name := range []string{
-		"namespace.yaml", "rbac.yaml", "sentinel.yaml", "agent.yaml", "kustomization.yaml",
+		"namespace.yaml", "rbac.yaml", "sentinel.yaml", "agent.yaml",
 	} {
 		documents, err := decodeAll(readManifest(t, name))
 		if err != nil {
@@ -106,5 +121,26 @@ func TestManifestsAreValidYAML(t *testing.T) {
 		if len(documents) == 0 {
 			t.Errorf("%s parsed to zero documents; the checks below would pass vacuously", name)
 		}
+	}
+}
+
+// TestBaseKustomizationIsValidYAML keeps the base of record loadable.
+//
+// Its own test rather than one more entry in the loop above, because the file lives
+// at a different path. Leaving "kustomization.yaml" in that loop after the duplicate
+// was deleted made `make test-go` report
+// `cannot stat ../../deploy/kustomization.yaml`, which is a confusing way to learn
+// that a path moved.
+func TestBaseKustomizationIsValidYAML(t *testing.T) {
+	data, err := os.ReadFile(baseManifestPath(t, "kustomization.yaml"))
+	if err != nil {
+		t.Fatalf("read base kustomization: %v", err)
+	}
+	documents, err := decodeAll(string(data))
+	if err != nil {
+		t.Fatalf("deploy/base/kustomization.yaml: %v", err)
+	}
+	if len(documents) == 0 {
+		t.Fatal("deploy/base/kustomization.yaml parsed to zero documents")
 	}
 }
