@@ -92,7 +92,9 @@ func TestA2xxThatIsJSONButNotAVerdictIsAFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("a body with no verdict fields must not count as delivered")
 	}
-	if !strings.Contains(err.Error(), "carries no verdict") {
+	// The wording names the missing fields without quoting their values: this
+	// error is logged, and the body is untrusted. See verifyVerdict.
+	if !strings.Contains(err.Error(), "is missing") {
 		t.Errorf("reason should name the missing fields, got %v", err)
 	}
 }
