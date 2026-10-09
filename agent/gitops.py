@@ -12,13 +12,14 @@ Tier-2 incident, never a crashed process.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Literal
 
 from classifier import (
     MANIFEST_ROOT_ENV,
@@ -59,6 +60,58 @@ def _resolve_timeout(raw: str) -> float:
     return min(value, MAX_TIMEOUT_SECONDS)
 
 
+def _discard_credential(config_path: str | None) -> None:
+    """Erase a staged git credential, loudly if it cannot be erased.
+
+    The old cleanup sat in a ``finally`` attached to the *subprocess* block, so
+    every failure during staging returned before ever reaching it: a full disk at
+    the ``chmod`` left a file containing ``Authorization: Bearer <token>`` on disk
+    with no log line saying so. Two rejections now - one at staging, one at
+    teardown - and the whole staging-through-clone span is wrapped once, so there
+    is no path out of this function that skips it.
+
+    A credential that cannot be erased is reported rather than swallowed. Silently
+    passing is what made the residue invisible in the first place.
+    """
+    if config_path is None:
+        return
+    try:
+        os.unlink(config_path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.error(
+            "could not remove the staged GitOps credential at %s (%s); it holds a "
+            "bearer token and must be erased by hand",
+            config_path,
+            exc,
+        )
+
+
+def _stage_credential(token: str) -> str | Literal[False]:
+    """Write the Authorization header to a private file.
+
+    Returns the path on success, or ``False`` if it could not be staged and must
+    not be referenced. ``False`` rather than ``None`` because ``None`` already
+    means "no credential, nothing to clean up", and conflating the two is how a
+    partial file ends up referenced.
+    """
+    fd, config_path = tempfile.mkstemp(prefix="srek3s-gitops-cred-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                "[http]\n\textraHeader = Authorization: Bearer " + token + "\n"
+            )
+        os.chmod(config_path, 0o600)
+    except OSError as exc:
+        logger.error("could not stage the GitOps credential: %s", exc)
+        # The file may already exist holding a partial token, so it is erased here
+        # rather than left for a cleanup that this failure path skips.
+        _discard_credential(config_path)
+        return False
+    return config_path
+
+
 def _clone(url: str, token: str, ref: str, dest: str, timeout: float) -> str | None:
     """Clone url into dest. Returns None on success, a reason on failure.
 
@@ -71,54 +124,52 @@ def _clone(url: str, token: str, ref: str, dest: str, timeout: float) -> str | N
     git = shutil.which("git")
     if git is None:
         return "git is not available"
+
     config_path: str | None = None
-    if token:
-        fd, config_path = tempfile.mkstemp(prefix="srek3s-gitops-cred-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(
-                    "[http]\n\textraHeader = Authorization: Bearer " + token + "\n"
-                )
-            os.chmod(config_path, 0o600)
-        except OSError as exc:
-            return f"could not stage git credential: {exc}"
-    env = dict(os.environ)
-    if config_path is not None:
-        env["GIT_CONFIG_GLOBAL"] = config_path
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        completed = subprocess.run(
-            [
-                git,
-                "-c",
-                "safe.directory=*",
-                "clone",
-                "--depth",
-                "1",
-                "--single-branch",
-                "--branch",
-                ref,
-                "--",
-                url,
-                dest,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return f"git clone exceeded {timeout:g}s"
-    except OSError as exc:
-        return f"git clone could not be executed: {exc}"
-    finally:
+        if token:
+            staged = _stage_credential(token)
+            if staged is False:
+                return "could not stage git credential"
+            config_path = staged
+
+        env = dict(os.environ)
         if config_path is not None:
-            try:
-                os.unlink(config_path)
-            except OSError:
-                pass
+            env["GIT_CONFIG_GLOBAL"] = config_path
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        try:
+            completed = subprocess.run(
+                [
+                    git,
+                    "-c",
+                    "safe.directory=*",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "--branch",
+                    ref,
+                    "--",
+                    url,
+                    dest,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return f"git clone exceeded {timeout:g}s"
+        except OSError as exc:
+            return f"git clone could not be executed: {exc}"
+    finally:
+        # One span, no early return above it, so the credential is erased on every
+        # outcome: success, clone failure, timeout, exec failure, and a staging
+        # failure partway through writing it.
+        _discard_credential(config_path)
+
     if completed.returncode != 0:
         diagnostic = (
             completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
@@ -222,6 +273,15 @@ def materialise_manifest_root(env: Mapping[str, str] | None = None) -> ManifestP
         dest,
         MANIFEST_ROOT_ENV,
     )
+    # The checkout outlives this call - it is the manifest root the provider reads
+    # from, so removing it here would make Tier-1 permanently unreachable. What it
+    # must not do is outlive the *process*: /manifests is a memory-backed tmpfs, so
+    # a worktree plus its .git stays resident for the pod's lifetime and is
+    # reclaimed by the kernel only after SIGKILL. atexit runs on a normal exit and
+    # on SIGTERM's handler, which covers every orderly path; a SIGKILL leaves the
+    # directory to the container filesystem, which is the same guarantee the
+    # emptyDir's sizeLimit already relies on.
+    atexit.register(_rmtree, dest)
     return provider
 
 
