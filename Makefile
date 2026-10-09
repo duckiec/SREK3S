@@ -279,6 +279,13 @@ test-go: ## Go: vet, gofmt, build tags, and the race-enabled suite
 	@echo "==> go vet -tags race"
 	@cd "$(ROOT)" && go vet -tags race ./...
 	@echo "==> go test -race"
+	@# The EXIT STATUS is the gate. Do not summarise this as a count of `ok` lines.
+	@# A failing package prints no `ok` line, so `grep -c '^ok'` returns the passing
+	@# remainder and a red suite reads as a smaller green number. That is exactly what
+	@# happened on 2026-10-09: "6 packages ok" was reported for a run where
+	@# internal/deploy had failed, because 6 of 7 succeeded and the failure left no
+	@# line to count. A tally that improves when something breaks reads as evidence,
+	@# and it is not.
 	@cd "$(ROOT)" && go test -race -count=1 -timeout 120s ./...
 
 .PHONY: test-python

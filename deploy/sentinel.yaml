@@ -127,9 +127,9 @@ spec:
               value: /etc/srek3s/scrubber.json
             # Defaults to THIS namespace, which is the namespace deploy/rbac.yaml
             # actually grants. Secure-by-default: the shipped manifest's watch scope
-            # and its read authority now AGREE, so a straight `kubectl apply -k
-            # deploy/` produces a working, authorised watcher with no errors in its
-            # log — see "WHY THIS IS NOT EMPTY" below for what that changes.
+            # and its read authority now AGREE, so installing the base of record
+            # produces a working, authorised watcher with no errors in its
+            # log - see "WHY THIS IS NOT EMPTY" below for what that changes.
             #
             # WHY THIS IS NOT EMPTY, and what it costs.
             #

@@ -1520,13 +1520,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          # -k, so the base is deploy/ itself rather than a copy. The overlay
-          # adds the capture proxy, the chaos-namespace Role and the routing
-          # probe; it changes nothing in deploy/. tests/e2e/fixtures/incluster/
-          # asserts that relationship, and asserts the base path resolves to the
-          # real directory, so a rename breaks the build rather than quietly
-          # detaching the base.
-          kubectl apply -k tests/e2e/fixtures/incluster
+          # RENDER-THEN-APPLY, because the base now sits one level below the
+          # manifests it lists. `deploy/base/kustomization.yaml` names them
+          # `../namespace.yaml` and friends, so kustomize's default RootOnly load
+          # restrictor refuses the upward reference, and `kubectl apply -k` cannot
+          # take `--load-restrictor`. Without the flag this step died with
+          #
+          #   security; file '/.../deploy/namespace.yaml' is not in or below
+          #   '/.../deploy/base'
+          #
+          # The base here is deploy/base, not a copy of it. The overlay adds
+          # the capture proxy, the chaos-namespace Role and the routing probe; it
+          # changes nothing in deploy/. tests/e2e/fixtures/incluster/ asserts that
+          # relationship and asserts the base path resolves to the real directory, so
+          # a rename breaks the build rather than quietly detaching the base.
+          #
+          # The bare `deploy/` directory this overlay used to reference listed its
+          # manifests beside itself and needed no flag, which is why the line worked
+          # until 2026-10-09. Same reason `make deploy` and `make undeploy` pipe.
+          kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+            tests/e2e/fixtures/incluster | kubectl apply -f -
 
           # Every object the deploy set declares must exist afterwards. Asserted
           # by name, because "kubectl apply exited 0" is not evidence that any

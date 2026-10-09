@@ -7,7 +7,7 @@
 # ---------------------------------------------------------------------------
 # `deploy/sentinel.yaml` ships `WATCH_NAMESPACE: srek3s-system` alongside a Role
 # that grants read verbs in exactly that namespace, so the base is already
-# coherent: scope and authority agree, and a straight `kubectl apply -k deploy/`
+# coherent: scope and authority agree, and installing the base of record
 # produces an authorised watcher with nothing in its error log.
 #
 # An earlier revision of this overlay set the scope to `sentinel-chaos` and
