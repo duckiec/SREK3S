@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Final
@@ -90,6 +91,48 @@ _RETRY_AFTER_SECONDS: Final[int] = 2
 _ERROR_ANALYSIS_FAILED: Final[str] = "analysis_failed"
 _ERROR_NOT_FOUND: Final[str] = "not_found"
 _ERROR_METHOD_NOT_ALLOWED: Final[str] = "method_not_allowed"
+
+#: Hard cap on an incident identifier as it appears in a log line.
+#:
+#: A ULID is 26 characters. 128 leaves room for a future identifier scheme
+#: without letting a caller choose how many bytes the agent writes per incident.
+_MAX_LOGGED_ID_LEN: Final[int] = 128
+
+#: Control characters, replaced rather than dropped, so a forged record stays
+#: readable as evidence of what was sent.
+#:
+#: Logback and the Go slog handler both render a raw newline as a line break, so
+#: an unfiltered newline in a log field is the difference between one record and
+#: two - and the second one is attacker-shaped, carrying whatever they chose to
+#: put on it. Dropping the character instead would hide the attempt; replacing it
+#: with `?` keeps the shape of the value without the structure.
+_CONTROL_CHARS_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitise_for_log(value: object, limit: int = _MAX_LOGGED_ID_LEN) -> str:
+    """Render an untrusted value for one log line, bounded and inert.
+
+    Three properties, each of which was a way to write arbitrary bytes into the
+    agent's logs:
+
+    * **Bounded.** A caller-supplied string reaches this function before the
+      schema has seen it, so its length is the caller's choice. Unbounded, a
+      single 256 KiB body could write 256 KiB into one log line.
+    * **Inert.** Control characters, including the newline that
+      :data:`logging` renders as a record separator, are replaced. The
+      ``%s``-style format means a newline here does not merely look wrong; it
+      starts a new log record that no operator will attribute to this incident.
+    * **Always a string.** ``None``, an int, or a dict all render rather than
+      raising, because the call site is already handling a malformed request and
+      must not fail while describing it.
+
+    The cap is applied after the character replacement, so the returned value is
+    never longer than `limit` bytes.
+    """
+    text = _CONTROL_CHARS_RE.sub("?", str(value))
+    if len(text) > limit:
+        return text[:limit] + "...(truncated)"
+    return text
 
 
 #: Canonical Contract A -> B endpoint (ARCH 4; ROADMAP 2.2.2 and 3.4.4).
@@ -498,7 +541,10 @@ def create_app(
             # diverged, and hiding that would conceal a build defect.
             logger.warning(
                 "contract violation incident_id=%s request_id=%s fields=%s",
-                body.get("incident_id", "<absent>"),
+                # Read out of the raw body, so it has not been through the ULID
+                # validator and may carry anything the caller put there. See
+                # sanitise_for_log for what "anything" costs without this.
+                sanitise_for_log(body.get("incident_id", "<absent>")),
                 request_id,
                 [str(err["loc"]) for err in exc.errors()],
             )
