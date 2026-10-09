@@ -318,8 +318,13 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 		// from the pool's per-incident timeout still propagates and the retry loop
 		// cannot outlive its worker.
 		attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
-		status, detail, err := c.post(attemptCtx, body)
+		status, response, err := c.post(attemptCtx, body)
 		cancel()
+		// `detail` is a bounded excerpt for error messages and Retry-After
+		// parsing; `response` is the full bounded body, which is what the 2xx
+		// branch has to parse. Truncating to 512 before parsing would reject
+		// every real Contract B document.
+		detail := truncate(string(response), 512)
 
 		switch {
 		case err != nil:
@@ -331,6 +336,18 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 			last = &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: err}
 
 		case status >= 200 && status < 300:
+			// A 2xx is a claim about transport, not about triage. The body has
+			// to be a Contract B document before "delivered" means anything:
+			// a captive portal, an auth proxy and a wrong backend all answer
+			// 200, and the earlier version counted every one of them as a
+			// delivered verdict with srek3s_sentinel_emitter_failures_total
+			// sitting at zero - a monitoring green light over total loss.
+			if err := verifyVerdict(response, payload); err != nil {
+				return &EmitError{
+					Outcome: OutcomeEscalate, StatusCode: status, Detail: detail,
+					Attempts: attempt, Err: err,
+				}
+			}
 			return nil
 
 		case status == http.StatusTooManyRequests:
@@ -361,18 +378,22 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 	return last
 }
 
-// post performs one attempt and reports the status and a bounded body excerpt.
-func (c *Client) post(ctx context.Context, body []byte) (int, string, error) {
+// post performs one attempt and returns the status and the bounded response body.
+//
+// The body is capped at MaxResponseBody rather than trusted: a 100 MiB
+// text/plain error page from a misrouted request must not become a memory event
+// inside the Sentinel.
+func (c *Client) post(ctx context.Context, body []byte) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.incidentsURL, bytes.NewReader(body))
 	if err != nil {
-		return 0, "", fmt.Errorf("build request: %w", err)
+		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, "", err
+		return 0, nil, err
 	}
 	defer func() {
 		// Drain a bounded amount so the connection can be reused, then close. A
@@ -382,8 +403,66 @@ func (c *Client) post(ctx context.Context, body []byte) (int, string, error) {
 		_ = resp.Body.Close()
 	}()
 
-	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
-	return resp.StatusCode, truncate(string(excerpt), 512), nil
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBody))
+	return resp.StatusCode, payload, nil
+}
+
+// verdictEnvelope is the part of Contract B the Sentinel must be able to read.
+//
+// Deliberately not the whole TriageResponse: the Sentinel has no business
+// asserting fields it does not use, and a struct that mirrors all of it would
+// turn every additive change to Contract B into a Sentinel change. These are the
+// fields whose absence would mean no triage happened.
+//
+// json.Decoder without DisallowUnknownFields here on purpose - unknown keys in a
+// *response* are the agent's business, not a contract violation, and a version
+// skew must not fail an otherwise valid verdict.
+type verdictEnvelope struct {
+	IncidentID       string `json:"incident_id"`
+	SchemaVersion    string `json:"schema_version"`
+	Status           string `json:"status"`
+	BlastRadiusTier  string `json:"blast_radius_tier"`
+	AgentVersion     string `json:"agent_version"`
+	AnalysisLatencyM int64  `json:"analysis_latency_ms"`
+}
+
+// verifyVerdict checks that a 2xx body is a Contract B verdict for *this*
+// incident.
+//
+// What this buys, in the order it was worth discovering:
+//
+//   - A 2xx from a captive portal, an auth proxy or a wrong backend is not a
+//     triage verdict. Before this, every one of them counted as delivered.
+//   - The verdict is for this incident. An interceptor that answers 200 with a
+//     canned body would otherwise be recorded as a triage of every incident,
+//     which is how a stub can make a broken pipeline look healthy.
+//   - The tier is one this Sentinel knows. An unrecognised value means the two
+//     sides have drifted, and reporting it as delivered hides exactly that.
+func verifyVerdict(body []byte, sent *IncidentPayload) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("%w: the agent returned %d with an empty body, which is not a triage verdict",
+			ErrEscalate, http.StatusOK)
+	}
+	var v verdictEnvelope
+	if err := json.Unmarshal(body, &v); err != nil {
+		return fmt.Errorf("%w: the agent's 2xx body is not JSON (%v); a 2xx from a proxy or portal is not a triage verdict",
+			ErrEscalate, truncate(err.Error(), 120))
+	}
+	if v.IncidentID == "" || v.Status == "" || v.BlastRadiusTier == "" {
+		return fmt.Errorf("%w: the agent's 2xx body parsed as JSON but carries no verdict "+
+			"(incident_id=%q status=%q blast_radius_tier=%q)", ErrEscalate, v.IncidentID, v.Status, v.BlastRadiusTier)
+	}
+	if sent != nil && v.IncidentID != sent.IncidentID {
+		return fmt.Errorf("%w: the agent's verdict is for incident %q, not the %q that was sent",
+			ErrEscalate, v.IncidentID, sent.IncidentID)
+	}
+	switch v.BlastRadiusTier {
+	case "TIER_1_TOIL", "TIER_2_ARCHITECTURAL":
+	default:
+		return fmt.Errorf("%w: the agent returned unrecognised blast_radius_tier %q, so the two sides have drifted",
+			ErrEscalate, truncate(v.BlastRadiusTier, 40))
+	}
+	return nil
 }
 
 // wait sleeps for the retry backoff, honouring Retry-After when the agent sent it.
