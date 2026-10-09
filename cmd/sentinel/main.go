@@ -8,12 +8,19 @@
 // # Shutdown
 //
 // The shutdown path is the part of this file worth reading. On SIGINT or SIGTERM
-// the root context is cancelled, which stops the informer and the worker pool, and
-// then main *waits* for the pool's WaitGroup to drain before returning. Without
-// that wait, `os.Exit` would abandon goroutines mid-request: a container that
-// OOM-killed at the moment of the signal would be classified, scrubbed, and then
-// dropped on the floor with no record that it happened. For a reliability tool the
-// incidents during its own restart are exactly the ones worth having.
+// the root context is cancelled, which stops the informer and stops the worker pool
+// from taking on new work, and then main *waits* for the pool's WaitGroup to drain
+// before returning. Without that wait, `os.Exit` would abandon goroutines
+// mid-request: a container that OOM-killed at the moment of the signal would be
+// classified, scrubbed, and then dropped on the floor with no record that it
+// happened. For a reliability tool the incidents during its own restart are exactly
+// the ones worth having.
+//
+// Note what "stops the pool" does and does not mean. It stops workers *taking*
+// records. It deliberately does not cancel the incidents already inside them -
+// Pool.handle derives each incident's context from context.WithoutCancel, so
+// cancellation cannot reach work in progress. Getting that backwards is what made
+// [ShutdownGrace] a decoration: the drain below had nothing left to wait for.
 //
 // The drain is bounded by [ShutdownGrace]. Kubernetes sends SIGTERM and then waits
 // `terminationGracePeriodSeconds` before SIGKILL, so a graceful shutdown that
@@ -344,6 +351,7 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	log.Info("shutdown signal received; draining in-flight telemetry",
 		"grace", ShutdownGrace,
 		"in_flight", pool.Stats().InFlight,
+		"queued_unclaimed", pool.Stats().Dropped,
 	)
 
 	// Order matters, and it is the reverse of the startup order.
@@ -354,15 +362,23 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	close(stopInformer)
 	informerDone.Wait()
 
-	// 2. Then wait for the pool, bounded. ctx is already cancelled, so in-flight
-	//    telemetry fetches are cut short by their own per-call deadlines - which is
-	//    the reason those deadlines exist and are short. The pool's workers see the
-	//    cancellation between records and exit promptly.
+	// 2. Then wait for the pool, bounded. Workers have already stopped taking new
+	//    records - loop selects on ctx, which is cancelled - but the incidents they
+	//    had already started are NOT tied to that context: Pool.handle strips it
+	//    before applying the per-incident deadline, so a container that died at the
+	//    moment of the signal still gets classified, scrubbed and emitted.
+	//
+	//    So the wait below is a real wait, and it can genuinely fail: an incident
+	//    slower than ShutdownGrace is still lost, and Kubernetes SIGKILLs at
+	//    terminationGracePeriodSeconds regardless of what we log. That case returns
+	//    an error and exits non-zero on purpose, because a Sentinel that silently
+	//    dropped incidents during its own restart is the failure mode this whole
+	//    path exists to prevent.
 	drained := waitFor(stopped, ShutdownGrace)
 	if !drained {
 		log.Error("drain did not complete within the grace period; "+
 			"some in-flight telemetry was lost. Raise terminationGracePeriodSeconds "+
-			"to match, or lower the per-incident telemetry timeout",
+			"to match ShutdownGrace, or lower the per-incident telemetry timeout",
 			"grace", ShutdownGrace,
 			"in_flight", pool.Stats().InFlight,
 		)
@@ -373,6 +389,7 @@ func runWithFlags(ctx context.Context, flags *flag.FlagSet, args []string) error
 	log.Info("sentinel stopped cleanly",
 		"processed", pool.Stats().Processed,
 		"failed", pool.Stats().Failed,
+		"dropped", pool.Stats().Dropped,
 	)
 	return nil
 }
