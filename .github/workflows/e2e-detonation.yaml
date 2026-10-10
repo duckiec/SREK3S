@@ -2012,16 +2012,25 @@ jobs:
 
           # And the agent must hold nothing at all, which is a stronger form of
           # the same property.
-          AGENT_SA=system:serviceaccount:srek3s-system:srek3s-agent
+          #
+          # `--as` a ServiceAccount that does not exist answers "no" for every
+          # verb, so an assertion against a name nothing uses passes vacuously -
+          # and srek3s-agent is such a name: no manifest creates it (the only
+          # SA in the tree is srek3s-sentinel), so this loop could never have
+          # caught a grant. The agent pod sets no serviceAccountName and mounts
+          # no token, so its identity is the namespace `default` SA. Assert
+          # against that real identity: a future binding that grants it access
+          # now fails here.
+          AGENT_SA=system:serviceaccount:srek3s-system:default
           for verb in get list watch create patch delete; do
             answer="$(kubectl auth can-i "$verb" pods -n srek3s-system \
               --as="$AGENT_SA" 2>/dev/null || echo no)"
             if [ "$answer" = "yes" ]; then
-              echo "::error::the agent ServiceAccount is granted $verb on pods; it is meant to hold no cluster credential"
+              echo "::error::the agent identity ($AGENT_SA) is granted $verb on pods; it is meant to hold no cluster credential"
               exit 1
             fi
           done
-          echo "  ok: the agent's ServiceAccount holds no cluster access at all"
+          echo "  ok: the agent's identity ($AGENT_SA) holds no cluster access at all"
 
       - name: "E2E-IN: assert the hardening holds on the running agent"
         timeout-minutes: 5

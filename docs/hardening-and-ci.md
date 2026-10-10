@@ -11,22 +11,23 @@ unverified rather than asserted.
 
 ### Python
 
-1,090 tests are collected by `pytest agent/tests/`. The default run reports:
+1,146 tests are collected by `pytest agent/tests/`. The default run reports:
 
 ```
-1087 passed, 3 skipped
+1145 passed, 1 skipped
 ```
 
-The three skips are a blocked dependency, not a pass. Two in
-`test_verification_e2e.py` need a reachable apiserver and create a disposable
-`srek3s-verify-chaos` namespace; one in `test_audit_workflow_tool.py` needs a
-case-folding filesystem and cannot run on Linux at all. That file reports
-`39 passed, 2 skipped` by default and `41 passed` under `SREK3S_LIVE_E2E=1` with a
-reachable cluster, so the opt-in run reports `1089 passed, 1 skipped`.
+The single skip is a blocked dependency, not a pass. `test_audit_workflow_tool.py`
+probes the Windows Subsystem for Linux launcher stub, which only exists on Windows
+(`os.name == "nt"`), so that test runs on Windows and skips on every other host,
+including ubuntu-latest and this WSL development box. The two cluster-dependent
+skips that `test_verification_e2e.py` used to hold left with that file when it was
+deleted alongside `agent/verify.py`.
 
-CI holds the skip count at a recorded baseline of 3. The count may fall and the
-ratchet notes the improvement; a rise fails the build with an instruction to
-establish what the new skip is rather than to raise the baseline.
+CI holds the skip count at a recorded baseline of 1 (`EXPECTED_SKIPS` in
+`ci.yaml`). The count may fall and the ratchet notes the improvement; a rise fails
+the build with an instruction to establish what the new skip is rather than to
+raise the baseline.
 
 ### Go
 

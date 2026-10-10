@@ -37,7 +37,8 @@ name: ci
 #      quietly deleted test.
 #
 # Each current skip is a BLOCKED DEPENDENCY with a named reason, not a pass:
-# three need a reachable cluster, and one needs a filesystem that folds case.
+# one is a platform probe that only runs on Windows (os.name == "nt"), so it
+# skips on every non-Windows host including ubuntu-latest.
 #
 # ---------------------------------------------------------------------------
 # ACTION VERSIONS
@@ -94,13 +95,15 @@ env:
   # Known-blocked tests. See the skip policy above; do not raise this number to
   # make a build pass — raise it only after establishing what the new skip is.
   #
-  # Lowered 4 -> 3 on 2026-10-01 when the scaffolding quarantine removed
-  # agent/tests/test_architecture_layout.py. That file held the case-conditional
-  # skip the host probe step below exists to explain. The probe is retained: it
-  # costs one `python` invocation and it is what makes an unexplained skip
-  # legible. The ratchet permits a falling count and then asks for exactly this
-  # edit, so leaving the number high would teach people to ignore it.
-  EXPECTED_SKIPS: "3"
+  # Lowered 3 -> 1 on 2026-10-10. agent/tests/test_verification_e2e.py, which
+  # held two cluster-dependent skips, was deleted with agent/verify.py; that is
+  # where three became one. The single remaining skip is
+  # test_audit_workflow_tool.py's WindowsApps probe, which runs only when
+  # os.name == "nt" and so skips on ubuntu-latest - and on this WSL host, which
+  # is why a local `make test-python` reports the same count of 1. The ratchet
+  # permits a falling count and then asks for exactly this edit, so leaving the
+  # number high would teach people to ignore it.
+  EXPECTED_SKIPS: "1"
 
 jobs:
   # -------------------------------------------------------------------------
