@@ -261,6 +261,64 @@ OPENAI_API_KEY_ENV: Final[str] = "OPENAI_API_KEY"
 #: provider cannot cost the triage path more than a slow model already does.
 LLM_TIMEOUT_SECONDS: Final[int] = 60
 
+#: Absolute ceiling on **all** model time for one incident.
+#:
+#: This exists because the per-call ceiling above was not enough on its own. The
+#: Tier-2 path calls the model twice — `_model_summary` and `_model_rca_section`,
+#: each through `_narrative_overlay` — and each call could retry up to
+#: ``GEMINI_MAX_ATTEMPTS`` times with a fresh per-attempt timeout. Measured on a
+#: live pass: a provider slow enough to fail once produced ~117s for a single
+#: narrative call, so one incident could spend ~235s of model time.
+#:
+#: The Sentinel bounds the other end. ``perIncidentTimeout`` is 135s, and a POST
+#: abandoned at that point leaves the agent still holding a job slot. The observed
+#: result was four POSTs arriving unanswered, the pool saturating at
+#: ``max_active=4``, and a further nine requests refused with 429 — a slow provider
+#: on one pod degrading the whole service.
+#:
+#: 110s leaves 25s of the Sentinel's 135s for telemetry, serialisation and the
+#: response. It is a ceiling on model time only; everything the agent does
+#: deterministically is outside it and is unaffected.
+INCIDENT_MODEL_BUDGET_SECONDS: Final[int] = 110
+
+#: How many model calls one incident may make.
+#:
+#: Declared rather than assumed, because the whole budget rests on it: if a third
+#: call appeared, ``INCIDENT_MODEL_BUDGET_SECONDS / 2`` would stop being a bound.
+#: `test_the_call_count_matches_the_budget_divisor` fails if the call sites and
+#: this number disagree.
+MODEL_CALLS_PER_INCIDENT: Final[int] = 2
+
+
+def model_call_budget_seconds() -> float:
+    """The wall-clock ceiling for one model call on one incident.
+
+    The smaller of the provider-neutral per-call budget and an equal share of the
+    per-incident one. With the shipped constants that is 55s rather than 60s, so
+    two calls sum to 110s and an incident cannot exceed
+    :data:`INCIDENT_MODEL_BUDGET_SECONDS` by construction rather than by hope.
+    """
+    return float(
+        min(
+            LLM_TIMEOUT_SECONDS,
+            INCIDENT_MODEL_BUDGET_SECONDS / MODEL_CALLS_PER_INCIDENT,
+        )
+    )
+
+
+def attempt_timeout_seconds(deadline: float) -> float:
+    """Per-attempt timeout, capped by what is left of the call's budget.
+
+    This is the defect the budget was missing. Each attempt used to be handed the
+    full per-call timeout, so a call could spend ``attempts * timeout`` and the
+    deadline check further down only stopped a *further* retry — it could not
+    shorten the attempt already in flight. Capping the attempt by the remaining
+    budget is what makes the ceiling real.
+    """
+    remaining = deadline - time.perf_counter()
+    return max(0.1, min(float(LLM_TIMEOUT_SECONDS), remaining))
+
+
 #: The complete set of fields a model is permitted to return.
 #:
 #: This tuple is the single declaration of the boundary, and both provider
