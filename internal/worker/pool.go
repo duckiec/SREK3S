@@ -103,8 +103,13 @@ type Incident struct {
 type Stats struct {
 	Processed uint64
 	Failed    uint64
-	Dropped   uint64
-	InFlight  int64
+	// Dropped counts records this pool refused: a full channel at send time, and
+	// queued work still unclaimed when a shutdown signal arrived. It was a field
+	// that always read zero before, which is the same failure shape as a
+	// ShutdownGrace that was never waited on - a number an operator reasonably
+	// assumes is measuring something.
+	Dropped  uint64
+	InFlight int64
 }
 
 // Pool is a fixed set of workers draining the watcher's channel.
@@ -125,6 +130,7 @@ type Pool struct {
 
 	processed atomic.Uint64
 	failed    atomic.Uint64
+	dropped   atomic.Uint64
 	inFlight  atomic.Int64
 }
 
@@ -215,10 +221,33 @@ func (p *Pool) Wait() {
 // The channel receive is select-ed against ctx.Done(): an unconditional receive
 // would keep a worker alive after shutdown and prevent the daemon from exiting,
 // which is the goroutine leak ROADMAP 3.5.4 tests for.
+//
+// The run context is honoured here and only here. That is what makes it the right
+// seam: cancelling it stops workers taking new work, while work already inside
+// handle is protected by handle itself. See handle for why the incident context
+// cannot descend from this one.
 func (p *Pool) loop(ctx context.Context, id int) {
 	for {
+		// Checked BEFORE the select, not after it. A select with two ready arms
+		// picks between them at random, so a worker that finished an incident into
+		// a non-empty queue would take one more about half the time - and that one
+		// extra would be protected by handle's stripped context, so the shutdown
+		// grace would silently become however long the backlog took. Checking first
+		// is what makes "stops taking new work at the signal" a fact rather than a
+		// coin toss.
+		if ctx.Err() != nil {
+			p.refuseBuffered(id)
+			p.log.Info("worker stopping", "worker", id, "reason", ctx.Err())
+			return
+		}
 		select {
 		case <-ctx.Done():
+			// Reachable only when the worker was parked on the channel when the
+			// signal arrived. The buffer is empty by construction here, but
+			// refuseBuffered runs anyway: it is the same decision, and a future
+			// change to what "parked" means should not silently change whether the
+			// refusal is accounted.
+			p.refuseBuffered(id)
 			p.log.Info("worker stopping", "worker", id, "reason", ctx.Err())
 			return
 		case record, ok := <-p.records:
@@ -234,12 +263,84 @@ func (p *Pool) loop(ctx context.Context, id int) {
 	}
 }
 
+// refuseBuffered counts and discards whatever is already in the channel, then
+// returns. It never blocks: records not yet sent are not this pool's to refuse,
+// and draining past the buffer would deadlock a worker on a live channel.
+//
+// Counting them matters. A container failure dropped at shutdown leaves no trace
+// anywhere - not in the incident log, not in a counter, not in an event. Before
+// this existed the same shape was possible in two places at once (the select
+// coin toss, and a closed channel hiding a non-empty buffer) and neither left a
+// number. "Refused at shutdown" is the one outcome of a drain an operator cannot
+// infer from anything else, so it is recorded rather than allowed to pass as a
+// normal exit.
+func (p *Pool) refuseBuffered(id int) {
+	for {
+		select {
+		case record, ok := <-p.records:
+			if !ok {
+				// Closed and drained. Every worker is leaving and nothing else
+				// will read what was in here, so the buffer is genuinely gone.
+				p.log.Info("channel closed with work unclaimed at shutdown",
+					"worker", id,
+					"refused_total", p.dropped.Load(),
+				)
+				return
+			}
+			if record == nil {
+				continue
+			}
+			p.dropped.Add(1)
+			p.log.Info("refusing queued work after shutdown",
+				"worker", id,
+				"incident", record.Namespace+"/"+record.PodName+":"+record.ContainerName,
+				"refused_total", p.dropped.Load(),
+			)
+		default:
+			return
+		}
+	}
+}
+
 // handle fetches, scrubs and dispatches one incident.
+// handle fetches, scrubs and dispatches one incident.
+//
+// # Why the run context is stripped before the deadline is applied
+//
+// The incident's context must NOT descend from the run context. It used to, and
+// that made [cmd/sentinel.ShutdownGrace] decorative: SIGTERM cancels the run
+// context, the cancellation propagated into every in-flight incident, and each
+// aborted mid-flight on the next apiserver call. Measured on the pass that found
+// it - a pool with seven queued incidents exited 56ms after the signal against a
+// 20s grace, reporting processed:0, failed:7. Seven incidents classified,
+// scrubbed and emitted into a log nobody will read, then gone. The drain main
+// waits for had nothing left to wait on.
+//
+// context.WithoutCancel keeps the values (trace and deadline metadata, if any are
+// ever attached) and drops the cancellation. The bound that replaces it is not
+// weaker, it is different in kind:
+//
+//   - [Pool.perIncidentTimeout] still caps one incident absolutely. A hung
+//     apiserver or a hung agent still ends at 135s.
+//   - [Pool.loop] still stops workers *taking* new work the moment the signal
+//     arrives. Only work already started is protected.
+//
+// So "graceful" means: work already begun gets to finish, up to its own budget.
+// New work is refused immediately. That is the ordinary meaning, and the one
+// main.go's comment has always claimed.
+//
+// The residual is real and is not papered over: an incident needing more than
+// ShutdownGrace still loses, because Kubernetes SIGKILLs at
+// terminationGracePeriodSeconds. When that happens main logs an error and exits
+// non-zero, which is the signal an operator needs. Widening ShutdownGrace past the
+// per-incident timeout would mean an incident can never be lost to a drain, but it
+// would also mean the pod's own grace period has to exceed the incident budget -
+// a deployment decision, recorded as such.
 func (p *Pool) handle(parent context.Context, record *k8s.IncidentRecord) {
 	p.inFlight.Add(1)
 	defer p.inFlight.Add(-1)
 
-	ctx, cancel := context.WithTimeout(parent, p.perIncidentTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), p.perIncidentTimeout)
 	defer cancel()
 
 	incident := &Incident{
@@ -402,6 +503,7 @@ func (p *Pool) Stats() Stats {
 	return Stats{
 		Processed: p.processed.Load(),
 		Failed:    p.failed.Load(),
+		Dropped:   p.dropped.Load(),
 		InFlight:  p.inFlight.Load(),
 	}
 }
