@@ -54,6 +54,7 @@ from classifier import (
 from warroom import WarRoomDispatch
 from models import (
     SCHEMA_VERSION,
+    AffectedScope,
     BlastRadiusTier,
     Classification,
     IncidentPayload,
@@ -240,6 +241,40 @@ def _rescanned_rca(
     return cleaned[0]
 
 
+def _rescanned_root_cause(
+    summary: str,
+    evidence: list[str],
+    affected_scope: AffectedScope,
+) -> RootCause:
+    """Build the ``root_cause`` block with both prose fields re-scanned.
+
+    I-B6 says *every* response string passes the re-scan, and until this
+    function existed that was true of ``rca_markdown`` and of the war-room
+    dispatch but false of ``root_cause`` — a separate field of the same
+    response, returned untouched by :func:`main`. A credential planted in
+    ``previous_reason`` reached ``root_cause.summary`` and one
+    ``root_cause.evidence`` line while the document next to it was clean, which
+    is the worst shape for a backstop: it looks scrubbed.
+
+    Prose is REDACTED, never refused, for the reason :mod:`rescan` gives: losing
+    a character from a sentence costs a human nothing, and refusing the whole
+    response would turn a masking guarantee into an availability one.
+
+    ``affected_scope`` is deliberately not re-scanned. Its strings are
+    ``Dns1123Name``-constrained, and rule 8/9 would happily rewrite a pod name
+    that happens to look like a UUID or an IPv4 literal into ``[REDACTED]``,
+    which the schema then rejects — a redaction that turns a valid response
+    into a 500. The field carries no free-form text.
+    """
+    cleaned_summary, _summary_report = rescan.redact(summary)
+    cleaned_evidence, _evidence_report = rescan.redact(*evidence)
+    return RootCause(
+        summary=cleaned_summary[0],
+        evidence=list(cleaned_evidence),
+        affected_scope=affected_scope,
+    )
+
+
 def _narrative_overlay(
     payload: IncidentPayload,
 ) -> llm.ModelNarrative | None:
@@ -399,10 +434,13 @@ def _tier2_response(
         severity=severity,
         confidence=confidence,
         blast_radius_tier=BlastRadiusTier.TIER_2_ARCHITECTURAL,
-        root_cause=RootCause(
-            summary=summary,
-            evidence=evidence,
-            affected_scope=classifier.affected_scope(payload),
+        # I-B6: both prose fields are re-scanned at construction. `rca_markdown`
+        # below is scrubbed separately and independently, because a secret can be
+        # assembled from two fields that are each individually innocent.
+        root_cause=_rescanned_root_cause(
+            summary,
+            evidence,
+            classifier.affected_scope(payload),
         ),
         # RiskLevel.HIGH is required, not chosen for emphasis: ARCH §5.1 states
         # HIGH forces Tier-2, so any lower value would contradict the routing
@@ -737,10 +775,15 @@ def triage_payload(
         severity=severity,
         confidence=active_policy.tier1_confidence,
         blast_radius_tier=BlastRadiusTier.TIER_1_TOIL,
-        root_cause=RootCause(
-            summary=result.rationale,
-            evidence=evidence,
-            affected_scope=classifier.affected_scope(payload),
+        # I-B6, same construction as the Tier-2 path above. Tier-1 never asks a
+        # model for its summary, so `result.rationale` is purely deterministic —
+        # and therefore purely a function of Contract A, which is attacker-
+        # influenced. A Tier-1 response that carried a credential would be the
+        # worst case of all, because it is the one a GitOps pipeline consumes.
+        root_cause=_rescanned_root_cause(
+            result.rationale,
+            evidence,
+            classifier.affected_scope(payload),
         ),
         remediation=Remediation(
             summary=(

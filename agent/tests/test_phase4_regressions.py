@@ -277,6 +277,19 @@ class TestRequestBodyCap:
             response = client.post(TRIAGE_PATH, json=body)
         assert response.status_code == 200, response.text
 
+    def test_cluster_events_cap_is_pinned_to_the_documented_value(self) -> None:
+        """64 is a two-sided contract: it must match the Sentinel's Go constant.
+
+        internal/k8s.ClusterEventsMax is the Limit the Sentinel passes when it
+        fetches a pod's events, and this field's max_length rejects anything above
+        the cap with a 422 - the incident is discarded as invalid. Before the
+        Sentinel bounded its fetch, a crash-looping pod with a long event history
+        produced hundreds of events and every one took the whole payload down.
+        The Go side pins the same value (TestClusterEventsMaxMatchesTheAgentContract).
+        If either side changes, change both.
+        """
+        assert CLUSTER_EVENTS_MAX == 64
+
 
 def _read_capped_bytes(request: Any) -> Any:
     """Call the handler's own capped reader (imported lazily to keep the

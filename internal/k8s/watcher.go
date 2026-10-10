@@ -435,14 +435,29 @@ func (w *PodWatcher) Events() <-chan *IncidentRecord { return w.events }
 // the channel is closed, so a consumer ranging over Events sees the channel end
 // rather than blocking forever. AGENTS.md §3.2: bounded and cancellable.
 func (w *PodWatcher) Run(stop <-chan struct{}) {
+	// Defer order is load-bearing, and it is LIFO. close(w.events) is registered
+	// first so it runs LAST; factory.Shutdown() is registered second so it runs
+	// FIRST. Shutdown synchronously waits - client-go v0.31:
+	// sharedInformerFactory.Shutdown calls wg.Wait(), over sharedIndexInformer.Run's
+	// deferred wg.Wait() over processor.run, which itself p.wg.Wait()s over the
+	// listener goroutines that invoke our handlers - until every handler has
+	// returned. Only then does close(w.events) run, so no handler can execute its
+	// select-send on the closed channel. Without this the handler goroutines
+	// outlive Run's return: a handler dispatched in the window after stop closes
+	// hits `select { case w.events <- record: ... }` with a closed channel, which
+	// is "ready", so the send is chosen and panics.
 	defer close(w.events)
+	defer w.factory.Shutdown()
 	w.factory.Start(stop)
 	if !cache.WaitForCacheSync(stop, w.informer.HasSynced) {
 		w.log.Error("pod informer cache did not sync before shutdown")
 		return
 	}
 	w.log.Info("pod watcher started",
-		"resync", DefaultResyncPeriod,
+		// The APPLIED period, not the DefaultResyncPeriod constant. WithResyncPeriod
+		// changes w.resync, and logging the constant while running a different value
+		// is how an operator deduces the wrong resync cadence from the log.
+		"resync", w.resync,
 		"dedup_ttl", DedupTTL.String(),
 		"egress_capacity", EgressChannelCapacity,
 	)

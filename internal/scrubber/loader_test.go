@@ -20,7 +20,31 @@ func writeTemp(t *testing.T, body string) string { // legacy helper
 // TestLoadManifestFromFileLoads the normative fixture and verifies it reproduces
 // the embedded default ruleset: same IDs, same order, same templates. This is
 // the corpus-gate bridge - a bad fixture fails here before the corpus runs.
+// captureGlobals snapshots the package-global rule tables and returns a
+// function that restores them.
+//
+// LoadManifestBytes installs into package-global state, so a test that loads a
+// manifest leaves Manifest and ruleTemplates pointing at whatever it loaded.
+// Without a restore, every later test in the package - including the t.Parallel
+// corpus tests, which run after all the sequential loader tests - validates
+// whatever the LAST load happened to install. That is not a theoretical
+// hazard: the corpus tests pass against a disarmed manifest today only because
+// TestTheShippedManifestStillLoads runs afterwards and reloads the pristine
+// ConfigMap. Reorder the files, rename that test, or run with -run and the
+// corpus silently validates the wrong ruleset.
+//
+//nolint:gochecknoglobals // Test helper for package-global state.
+func captureGlobals() func() {
+	manifest := Manifest
+	templates := ruleTemplates
+	return func() {
+		Manifest = manifest
+		ruleTemplates = templates
+	}
+}
+
 func TestLoadManifestFromFileLoads(t *testing.T) {
+	t.Cleanup(captureGlobals())
 	before := Manifest
 	raw, err := os.ReadFile("testdata/scrubber.json")
 	if err != nil {
@@ -60,6 +84,7 @@ func ruleByIDOrBust(t *testing.T, id RuleID) Rule {
 // TestLoadManifestFromFileFailsClosed proves a malformed manifest panics the
 // scrubber rather than booting with a bypassed one. Each case must error.
 func TestLoadManifestFromFileFailsClosed(t *testing.T) {
+	t.Cleanup(captureGlobals())
 	cases := map[string]string{
 		"missing file":      "\n",
 		"not json":          "this is not json\n",

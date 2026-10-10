@@ -121,8 +121,8 @@ spec:
               value: http://srek3s-agent:8000
             # Dynamic scrubber manifest. The ConfigMap is mounted at
             # /etc/srek3s; if the file is missing, malformed, or contains an
-            # invalid regex the Sentinel panics at boot - a degraded scrubber
-            # must never reach a running pod.
+            # invalid regex the Sentinel logs the error and exits non-zero at
+            # boot - a degraded scrubber must never reach a running pod.
             - name: SREK3S_SCRUBBER_MANIFEST
               value: /etc/srek3s/scrubber.json
             # Defaults to THIS namespace, which is the namespace deploy/rbac.yaml

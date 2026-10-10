@@ -235,18 +235,29 @@ if err := scrubber.LoadManifestBytes(raw); err != nil {
 ```
 
 `LoadManifestBytes` rejects a schema violation, an unknown rule ID, a duplicate ID,
-an out-of-order table, an omitted canonical rule, and an invalid regex. There is no
-partial install and no skip-and-continue, because a silently skipped rule is a
-security defect wearing a successful exit code.
+an out-of-order table, an omitted canonical rule, an invalid regex, and any rule
+whose `pattern`, `multiLine`, or `template` deviates from the compiled table in
+`manifest.go`. There is no partial install and no skip-and-continue, because a
+silently skipped rule is a security defect wearing a successful exit code.
+
+The last rejection is the one that turns a claim into a control. Every check before
+it proves the manifest is *well-formed*; none proves it is the manifest this engine
+was built to run. A `multiLine: false`, a `pattern` that compiles but matches
+nothing, or a `template` of `${1}${2}${3}` that substitutes the captured groups
+back each passes every structural check while disarming a rule, so the loader
+refuses a rule that is not byte-for-byte the compiled one. `internal/scrubber/strength_test.go`
+blocks each weakened form, and `manifest_parity_test.go` pins all five shipped
+copies to `manifest.go`.
 
 Two things about this are worth stating precisely rather than as a slogan:
 
-- **It is an exit 1, not a panic.** `internal/scrubber/loader.go` still documents
-  "the caller panics on a non-nil error", which is stale: the caller returns, and
-  the process exits non-zero. The distinction matters because a panic under a
+- **It is an exit 1, not a panic.** The caller of `LoadManifestBytes` returns the
+  error and `main` exits non-zero. The distinction matters because a panic under a
   recovering supervisor reads as a crash-loop and may be restarted into the same
-  failure, whereas exit 1 reads as a configuration error. The comment is wrong and
-  should be corrected when that file is next touched.
+  failure, whereas exit 1 reads as a configuration error. `loader.go`'s docstring
+  already says "return an error"; `deploy/sentinel.yaml` said "panics at boot"
+  until 2026-10-10 and was corrected to match. An earlier revision of this bullet
+  claimed the loader docstring was the stale one; it was the deploy comment.
 - **It is not uniform, on purpose.** An unparseable `LOG_LEVEL` does *not* stop
   boot; it falls back to `INFO`, with the reasoning in `newLogger`:
 
@@ -426,7 +437,11 @@ The manifest compiles once at package init and panics on a malformed pattern rat
 than skipping a rule; a silently skipped rule is a security defect.
 
 Every rule emits the same unconfigurable sentinel. There is no configuration that
-disables a rule, redacts nothing, or substitutes a different placeholder.
+disables a rule, redacts nothing, or substitutes a different placeholder. The loader
+enforces that claim rather than stating it: a rule that differs from the compiled
+table in `pattern`, `multiLine`, or `template` fails to load and the process exits
+1, and a test pins each of the five shipped copies to `manifest.go`, so a ConfigMap
+that weakens a rule cannot reach the running engine.
 
 Only rules flagged `MultiLine` take part in the cross-line re-scan.
 `TestMultiLineFlagMatchesCapability` probes each compiled pattern with inputs whose

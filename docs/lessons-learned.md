@@ -2533,3 +2533,112 @@ document set is now verified by a gate rather than by reading it.
   link checker's control assert over captured output. Written down as a list rather
   than done, because a lesson recorded and not enforced is the same category of
   claim as the three false sentences above.
+
+## 42. Controls That Checked Shape, Not Strength (Phase 5 audit, 2026-10-10)
+
+A full-tree assurance audit (branch `audit/b71a420`, uncommitted) reproduced and
+fixed six defect areas. Two of them are the §1 / §21 pattern in new clothes, and
+the audit's own method is the third thing worth recording.
+
+### The loader checked that a manifest was well-formed, never that it was this engine's manifest
+
+- **What happened:** `internal/scrubber.LoadManifestBytes` validated schema, rule
+  order, uniqueness, presence of all eleven rules, and that each pattern compiled.
+  It never compared a rule against the compiled table. Three edits sailed through
+  every one of those checks and installed cleanly while the loader reported
+  success: `multiLine: false` on `pem_private_key`, which pulls it out of the M3
+  cross-line pass so rule 11 redacts only the `-----BEGIN` marker and the base64
+  body survives; a `pattern:"x"` that compiles and never fires; and
+  `template:"${1}${2}${3}"`, which makes `ExpandString` substitute the captured
+  groups back so the output is byte-identical to the input while the report still
+  counts a hit. Each one disarms a rule while the redaction report says it worked.
+- **Why it is a problem:** `docs/security-invariants.md` claims "there is no
+  configuration that disables a rule, redacts nothing, or substitutes a different
+  placeholder." Until the fix that was documentation, not a control, which is §1's
+  "a check that cannot fail" wearing a different hat: the loader's checks were all
+  real, and none was about the strength of the rule. This is the §23 / §28 / §33
+  family, a suite of per-file assertions with a blind spot exactly the width of the
+  space between the shipped ConfigMap and the compiled table.
+- **How we fixed it:** `LoadManifestBytes` now rejects any rule whose `pattern`,
+  `multiLine`, or `template` deviates from `rulePatterns` / `multiLineRules` /
+  `canonicalTemplates` in `manifest.go`. All five shipped copies
+  (`default_manifest.json`, `testdata/scrubber.json`, `deploy/scrubber.json`, the
+  chart's `files/scrubber.json`, and the embedded `scrubber-configmap.yaml`) were
+  verified to agree with the table first, so refusing a divergence costs nothing
+  that ships. `internal/scrubber/strength_test.go` blocks each weakened form, and
+  `manifest_parity_test.go` pins the five copies to the compiled table.
+
+### The re-scan missed two response fields, and the tests missed them with it
+
+- **What happened:** I-B6 says every response string passes the agent-side
+  defensive re-scan. It did for `rca_markdown` and the war-room dispatch, not for
+  `root_cause.summary` or `root_cause.evidence`. A secret planted in
+  `previous_reason` reached the Contract B wire body through those fields while the
+  rendered document beside it stayed clean. The existing tests planted the same
+  credential but asserted only on `rca_markdown`, so the gap passed for two
+  reasons: the control was scoped to a different field, and the escape lived in a
+  field the control never read.
+- **How we fixed it:** `triage._rescanned_root_cause` builds `root_cause` through
+  `rescan.redact` at both construction sites; `agent/tests/test_ib6_response_strings.py`
+  covers it and failed on the pristine tree. `affected_scope` stays unscanned by
+  design: its fields are `Dns1123Name`-constrained, so a secret cannot survive the
+  schema, and re-scanning there would rewrite a pod name that resembles a UUID or
+  an IPv4 and turn a valid response into a 500. That reasoning now lives in the
+  code, not just in a test.
+
+### The corpus passed because of test order, and that is not a pass
+
+- **What happened:** the scrubber loader tests install into package-global
+  `Manifest` and `ruleTemplates` and never restored them. The corpus tests run
+  after every sequential test, so they validated whatever the last loader test had
+  installed. They saw the correct ruleset only because one loader test happened to
+  run last and reload the pristine ConfigMap. Rename that test, reorder the files,
+  or run with a `-run` filter and the corpus silently validates a different set of
+  rules. Confirmed by reverting the loader fix under `make test`: a disarmed
+  `multiLine` survived in the fixture, and the corpus stayed green.
+- **How we fixed it:** a `captureGlobals` helper snapshots the globals and a
+  `t.Cleanup` restores them on every loader test, so the corpus no longer depends
+  on execution order.
+
+### Shutdown closed a channel a handler could still send on
+
+- **What happened:** `PodWatcher.Run` did `defer close(w.events)` and started the
+  informer with `factory.Start(stop)`, but never waited for it. A handler dispatched
+  in the window after `stop` closed hit `select { case w.events <- record: ... }`
+  with a closed channel; a send on a closed channel is "ready", so the send case is
+  chosen and it panics. On a routine SIGTERM that is a crash where a clean exit was
+  expected.
+- **How we fixed it:** `Run` defers `factory.Shutdown()` after `defer close(w.events)`,
+  and client-go v0.31's `Shutdown` → `wg.Wait` chain returns every handler
+  goroutine before the close runs. `TestInformerCallbacksStopBeforeTheChannelCloses`
+  drives informer traffic during shutdown and, under `-race`, reproduces the race
+  as a data race when the shutdown wait is removed.
+
+### The generalisable forms
+
+1. *A validator that checks structure is not a validator that checks strength.*
+   "Parses, in order, compiles" and "is the manifest this engine was built for"
+   are different questions. When a document claims a negative property — nothing
+   can disable a rule — the loader has to enforce it, because a shipped ConfigMap
+   is an attack surface and "well-formed" is not "safe".
+2. *A suite can pass because of order rather than correctness.* When tests mutate
+   shared state without restoring it, the result is a property of execution order,
+   not of the code. Restore on cleanup, and prove the current claim by reverting
+   the fix.
+3. *A fix is not done until its test fails without it.* Each fix above was reverted
+   in a scratch copy and confirmed to redden. R-F01 turned that into the strongest
+   form available, a `-race` data race. A test that passes with and without the
+   change proves nothing, which is §21 with the safety on.
+
+### What the audit could not do, stated plainly
+
+The security, correctness, and deployment reviewers were launched twice and failed
+to start both times on a plan quota error, so those three domains were
+cross-examined directly against the source rather than by a fresh reviewer. That is
+recorded as NOT RUN. The watched-tree audit also left the `ShutdownGrace` (20s) /
+`terminationGracePeriodSeconds` (45) / `perIncidentTimeout` (135s) arithmetic as it
+found it: `internal/deploy.TestSentinelTerminationGraceExceedsTheDrainBudget`
+asserts 45 > 20 across the two files, so the drain is never SIGKILLed short, and
+the over-20s drop window on shutdown is the intended design. No number in this
+entry is reported from memory; the gate outputs it cites ran on branch
+`audit/b71a420` on 2026-10-10.
