@@ -41,6 +41,37 @@ scripts/
 # Documentation and governance files.
 *.md
 
+# The application test suite and its config.
+#
+# These need ANCHORED patterns, and that is a measured fact rather than a style
+# preference. `COPY agent/ /app/` copies the whole tree, and the unanchored
+# `tests/` directly above did not stop it: a probe of the built image found
+# `/app/tests` with 80 files in it, alongside `conftest.py` and `pytest.ini`.
+# Anchored to the context root, `/agent/tests/` cannot be mistaken for a sibling
+# and cannot drift if the directory is ever renamed.
+#
+# Why it matters beyond leanness: this pod is the egress path for scrubbed
+# incident data, and its root filesystem is read-only. A copied-in test suite is
+# 80 files an attacker does not need, several of which carry fixtures with
+# deliberately-planted secret-shaped strings.
+/agent/tests/
+/agent/conftest.py
+/agent/pytest.ini
+/agent/pyproject.toml
+
+# Bytecode and test caches.
+#
+# The root `.dockerignore` excludes these, but this file REPLACES that one under
+# BuildKit, which is the default builder - so the exclusion was not in force and
+# the probe found two `__pycache__` directories and one `.pytest_cache` in the
+# image. Both forms are listed because the unanchored one matches what the root
+# file uses and the anchored one matches what this context actually contains.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+/agent/__pycache__/
+/agent/.pytest_cache/
+
 # Belt and braces on the virtualenv: the root file already excludes `.venv*/`, and
 # this repeats it so the agent context stays lean even if a future edit to the root
 # file relaxes that pattern for an unrelated image.
