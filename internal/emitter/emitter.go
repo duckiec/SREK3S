@@ -231,6 +231,13 @@ type EmitError struct {
 	StatusCode int
 	// Detail is the agent's response body, truncated. Diagnostic only - it is the
 	// agent talking to the Sentinel, not cluster telemetry, so it is not scrubbed.
+	//
+	// It is also a disclosure channel, because Error() interpolates it and
+	// pool.go logs that error verbatim. It is therefore populated ONLY where the
+	// body is needed to decide the next action - currently the 429 branch, which
+	// reads Retry-After from it. The 2xx branch leaves it empty and reports the
+	// diagnosis through Err instead; see verifyVerdict. Adding a field here is a
+	// decision about what may reach the log, not a convenience.
 	Detail string
 	// Attempts is how many POSTs were made.
 	Attempts int
@@ -342,9 +349,17 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 			// 200, and the earlier version counted every one of them as a
 			// delivered verdict with srek3s_sentinel_emitter_failures_total
 			// sitting at zero - a monitoring green light over total loss.
+			//
+			// Detail is DELIBERATELY EMPTY here. EmitError.Error() interpolates
+			// it and pool.go logs that error, so carrying the body would put up
+			// to 512 bytes of untrusted response into the Sentinel's log on
+			// exactly the path where the response is least trustworthy. Detail
+			// stays for the paths that need it - Retry-After lives in a body -
+			// and verifyVerdict's message carries the diagnosis without the
+			// content.
 			if err := verifyVerdict(response, payload); err != nil {
 				return &EmitError{
-					Outcome: OutcomeEscalate, StatusCode: status, Detail: detail,
+					Outcome: OutcomeEscalate, StatusCode: status,
 					Attempts: attempt, Err: err,
 				}
 			}
@@ -438,6 +453,24 @@ type verdictEnvelope struct {
 //     which is how a stub can make a broken pipeline look healthy.
 //   - The tier is one this Sentinel knows. An unrecognised value means the two
 //     sides have drifted, and reporting it as delivered hides exactly that.
+//
+// # Why no value from the body is ever in the returned error
+//
+// Every field read here came from an untrusted response, and this error is
+// logged. The first version of this function interpolated them
+// (`blast_radius_tier=%q`, `incident_id=%q`), which is a disclosure channel: a
+// party who can answer on the agent's port chooses what the Sentinel's log
+// contains. Measured on the pass that found this - a malformed 200 whose body
+// carried a planted credential produced 12 verbatim occurrences of it in
+// sentinel.log, with the credential arriving through two separate paths.
+//
+// So the error describes the *shape* of the failure: which field was missing, how
+// long the body was, whether it parsed. Lengths and presence are properties of
+// the response an operator has to debug; the values are the untrusted part, and
+// they do not go in a log line.
+//
+// Callers must also leave [EmitError.Detail] empty on this path, because
+// Error() interpolates Detail. See the 2xx branch in Emit.
 func verifyVerdict(body []byte, sent *IncidentPayload) error {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return fmt.Errorf("%w: the agent returned %d with an empty body, which is not a triage verdict",
@@ -445,22 +478,36 @@ func verifyVerdict(body []byte, sent *IncidentPayload) error {
 	}
 	var v verdictEnvelope
 	if err := json.Unmarshal(body, &v); err != nil {
-		return fmt.Errorf("%w: the agent's 2xx body is not JSON (%v); a 2xx from a proxy or portal is not a triage verdict",
-			ErrEscalate, truncate(err.Error(), 120))
+		// A json.SyntaxError reports a byte offset, never the input. That is why
+		// the parse error can be quoted here while field values cannot.
+		return fmt.Errorf("%w: the agent's 2xx body is not JSON (%v) at %d bytes; a 2xx from a proxy or portal is not a triage verdict",
+			ErrEscalate, truncate(err.Error(), 120), len(body))
 	}
-	if v.IncidentID == "" || v.Status == "" || v.BlastRadiusTier == "" {
-		return fmt.Errorf("%w: the agent's 2xx body parsed as JSON but carries no verdict "+
-			"(incident_id=%q status=%q blast_radius_tier=%q)", ErrEscalate, v.IncidentID, v.Status, v.BlastRadiusTier)
+	var missing []string
+	if v.IncidentID == "" {
+		missing = append(missing, "incident_id")
+	}
+	if v.Status == "" {
+		missing = append(missing, "status")
+	}
+	if v.BlastRadiusTier == "" {
+		missing = append(missing, "blast_radius_tier")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: the agent's 2xx body parsed as JSON but is missing %s (body %d bytes)",
+			ErrEscalate, strings.Join(missing, ", "), len(body))
 	}
 	if sent != nil && v.IncidentID != sent.IncidentID {
-		return fmt.Errorf("%w: the agent's verdict is for incident %q, not the %q that was sent",
-			ErrEscalate, v.IncidentID, sent.IncidentID)
+		// Only our own id is named. The body's is the untrusted half of a
+		// mismatch, and naming it would hand the sender control of this line.
+		return fmt.Errorf("%w: the agent's verdict names incident %q, not the one that was sent",
+			ErrEscalate, sent.IncidentID)
 	}
 	switch v.BlastRadiusTier {
 	case "TIER_1_TOIL", "TIER_2_ARCHITECTURAL":
 	default:
-		return fmt.Errorf("%w: the agent returned unrecognised blast_radius_tier %q, so the two sides have drifted",
-			ErrEscalate, truncate(v.BlastRadiusTier, 40))
+		return fmt.Errorf("%w: the agent returned an unrecognised blast_radius_tier (%d bytes), so the two sides have drifted",
+			ErrEscalate, len(v.BlastRadiusTier))
 	}
 	return nil
 }
