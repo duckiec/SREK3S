@@ -530,6 +530,35 @@ class AffectedScope(_Strict):
         return self
 
 
+def _max_str_length(model: type[BaseModel], field: str) -> int | None:
+    """The declared ``max_length`` of a string field, or ``None`` if unbounded.
+
+    Read from the field's own constraint metadata rather than restated, so a clip
+    that truncates model prose to a field's ceiling cannot drift from the schema
+    it is protecting. If the schema's limit moves, this moves with it, and the
+    clip stays correct with no companion edit.
+    """
+    for constraint in model.model_fields[field].metadata:
+        limit = getattr(constraint, "max_length", None)
+        if isinstance(limit, int):
+            return limit
+    return None
+
+
+def _clip_to_max_length(value: str, limit: int | None) -> str:
+    """Truncate an oversize string to ``limit``, or return it unchanged.
+
+    Clip rather than reject, per the model-prose policy: a truncated paragraph
+    is still useful to a responder, and a ValidationError raised during response
+    construction becomes an HTTP 500 that loses the whole incident. Non-strings
+    and within-limit values pass through untouched, so this is inert for every
+    field whose value a caller already sized correctly.
+    """
+    if limit is not None and isinstance(value, str) and len(value) > limit:
+        return value[: limit - 3].rstrip() + "..."
+    return value
+
+
 class RootCause(_Strict):
     """Human-diagnosable root cause with traceable evidence (ARCH §5.1)."""
 
@@ -546,6 +575,17 @@ class RootCause(_Strict):
             if len(item) > 512:
                 raise ValueError("evidence item exceeds 512 characters")
         return value
+
+    # A model can return a summary longer than the 2000-char ceiling. Before
+    # this, that raised during construction and became an HTTP 500 that lost the
+    # incident, because triage clipped model prose to the looser rca_markdown
+    # ceiling (20000) rather than to this field's own. mode="before" runs ahead
+    # of Pydantic's max_length check, and the limit is read from the field, so
+    # the clip is correct by construction.
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _clip_summary_to_max_length(cls, value: str) -> str:
+        return _clip_to_max_length(value, _max_str_length(cls, "summary"))
 
 
 class Remediation(_Strict):
@@ -720,6 +760,18 @@ class TriageResponse(_Strict):
     rca_markdown: str = Field(min_length=1, max_length=20_000)
     analysis_latency_ms: int = Field(ge=0)
     agent_version: str = Field(min_length=1, max_length=64)
+
+    # rca_markdown is composed (the war-room dispatch plus the model's long-form
+    # section) and then assigned, and _Strict validates on assignment. A model
+    # section near the ceiling pushes the combined document past 20000 and the
+    # assignment raised - an incident already escalated correctly turned into a
+    # 500. mode="before" clips the composed value to the field's own limit; the
+    # truncation falls on the model prose at the tail, leaving the dispatch's
+    # DO-NOT-APPLY marker and escalation reasons intact.
+    @field_validator("rca_markdown", mode="before")
+    @classmethod
+    def _clip_rca_markdown_to_max_length(cls, value: str) -> str:
+        return _clip_to_max_length(value, _max_str_length(cls, "rca_markdown"))
 
     @field_validator("incident_id")
     @classmethod
