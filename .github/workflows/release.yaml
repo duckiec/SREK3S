@@ -302,7 +302,12 @@ jobs:
           import re, sys
 
           sentinel_digest, agent_digest = sys.argv[1], sys.argv[2]
-          placeholder = re.compile(r"sha256:0{64}")
+          # Match any 64-hex digest, not only the all-zero placeholder. After the
+          # first release the overlays carry real digests, so matching only 0{64}
+          # made the substitution a no-op and left the pin branch with zero
+          # commits - which failed `gh pr create` ("No commits between main").
+          # Matching the existing digest lets each release refresh the pins.
+          placeholder = re.compile(r"sha256:[0-9a-f]{64}")
 
           for path in (
               "deploy/overlays/quickstart/kustomization.yaml",
@@ -324,14 +329,22 @@ jobs:
               open(path, "w", encoding="utf-8").write("".join(out))
           PY
 
+          git add deploy/overlays/
+          # A no-op substitution (digests already current for this ref) must not
+          # fail the release: `gh pr create` errors on a branch with no commits.
+          # Stage first, and only branch/commit/push/PR when the substitution
+          # actually changed something.
+          if git diff-index --cached --quiet HEAD; then
+            echo "::notice::Kustomize digests are already current for ${{ github.ref_name }}; nothing to pin"
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           BRANCH_NAME="release/pin-digests-${{ github.ref_name }}"
           git checkout -b "$BRANCH_NAME"
-
-          git add deploy/overlays/
-          git diff-index --quiet HEAD || git commit -m "chore(release): pin image digests for ${{ github.ref_name }}"
+          git commit -m "chore(release): pin image digests for ${{ github.ref_name }}"
           git push origin "$BRANCH_NAME"
 
           gh pr create \
