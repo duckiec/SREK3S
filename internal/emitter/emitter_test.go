@@ -3,6 +3,7 @@ package emitter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -907,6 +908,102 @@ func TestEmitIsBoundedByTheAttemptDeadline(t *testing.T) {
 	// would sit for the server's full 10 seconds.
 	if elapsed > 5*time.Second {
 		t.Errorf("Emit took %s; the 300ms per-attempt deadline did not bound the calls", elapsed)
+	}
+}
+
+// errRoundTripper is a Transport that always fails, simulating an unreachable
+// agent (connection refused, reset) rather than an HTTP error status.
+type errRoundTripper struct{ err error }
+
+func (r errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, r.err
+}
+
+// TestATransportFailureBacksOffBetweenAttempts pins the R (reliability) fix: a
+// transport failure used to retry with no pause, so a down agent was hit
+// MaxAttempts times back-to-back. It is retried with the same capped full-jitter
+// backoff the 429 path uses - but "did it pause" cannot be read off a clock,
+// because full jitter delays uniformly in [0, ceiling) and can be ~0. So the
+// backoff is counted through the injected sleep instead: a pause must be invoked
+// once per gap between attempts, deterministically.
+//
+// Before the fix the transport path never called c.wait, so backoffs was 0 and
+// this test failed; after, three attempts space two pauses.
+func TestATransportFailureBacksOffBetweenAttempts(t *testing.T) {
+	t.Parallel()
+
+	backoffs := 0
+	c, err := New(Config{
+		BaseURL:         "http://agent.invalid",
+		HTTPClient:      &http.Client{Transport: errRoundTripper{err: errors.New("connection refused")}},
+		MaxAttempts:     3,
+		Timeout:         time.Second,
+		SentinelVersion: "0.1.0",
+		Now:             func() time.Time { return fixedDetection.Add(412 * time.Millisecond) },
+		Events:          goldenEvents,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+	// Return immediately - no real delay - so the test is fast and deterministic,
+	// but record every invocation: that is what distinguishes the fixed path.
+	c.sleep = func(ctx context.Context, _ time.Duration) bool {
+		backoffs++
+		return ctx.Err() == nil
+	}
+
+	emitErr := asEmitError(t, c.Dispatch(context.Background(), goldenIncident(t)))
+
+	if emitErr.Outcome != OutcomeEscalate {
+		t.Errorf("outcome = %s, want %s after exhausting retries", emitErr.Outcome, OutcomeEscalate)
+	}
+	if emitErr.Attempts != 3 {
+		t.Errorf("attempts = %d, want 3", emitErr.Attempts)
+	}
+	if backoffs != 2 {
+		t.Errorf("backed off %d times, want 2: a transport failure must space its "+
+			"retries, not fire them back-to-back against an unreachable agent", backoffs)
+	}
+}
+
+// TestATransportFailureAbortsWhenTheWorkerIsCancelled: the backoff must be
+// context-aware, so a worker torn down mid-retry is not held for the full
+// backoff. This is what keeps the retry loop from outliving the pool worker that
+// started it (AGENTS.md §3.2).
+func TestATransportFailureAbortsWhenTheWorkerIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	c, err := New(Config{
+		BaseURL:         "http://agent.invalid",
+		HTTPClient:      &http.Client{Transport: errRoundTripper{err: errors.New("connection refused")}},
+		MaxAttempts:     3,
+		Timeout:         time.Second,
+		SentinelVersion: "0.1.0",
+		Now:             func() time.Time { return fixedDetection.Add(412 * time.Millisecond) },
+		Events:          goldenEvents,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel while the first backoff is pending. The injected sleep reports the
+	// cancellation, exactly as timerSleep does on ctx.Done.
+	c.sleep = func(ctx context.Context, _ time.Duration) bool {
+		cancel()
+		return false
+	}
+
+	emitErr := asEmitError(t, c.Emit(ctx, buildGolden(t)))
+
+	if emitErr.Outcome != OutcomeEscalate {
+		t.Errorf("outcome = %s, want %s", emitErr.Outcome, OutcomeEscalate)
+	}
+	if emitErr.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1: the worker was cancelled during the first "+
+			"backoff, so no second POST may fire", emitErr.Attempts)
 	}
 }
 

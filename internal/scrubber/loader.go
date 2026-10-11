@@ -96,15 +96,73 @@ func LoadManifestBytes(raw []byte) error {
 			return fmt.Errorf("scrubber: manifest has duplicate rule id %q", r.ID)
 		}
 		seen[r.ID] = true
+		// An ID outside the normative set is refused outright. Without this the
+		// two branches below cannot catch it: an unknown ID is neither the
+		// expected canonical rule nor one isCanonical recognises, so it falls
+		// through with no error, and the strength check then compares it against
+		// the zero value of a missing map key. A rule {"id":"x","pattern":""}
+		// therefore passes "" == "", compiles to an empty regex that matches at
+		// every offset, and installs a 12th rule that shreds every line before
+		// the canonical rules can mask a secret - the exact defect
+		// TestAnEmptyPatternCannotReachTheManifest closes, entered through an
+		// unknown ID instead of a misspelled key. strength_test.go pins it.
+		if !isCanonical(r.ID) {
+			return fmt.Errorf("scrubber: manifest rule %q is not one of the 11 CONTRIBUTING.md §5 rules", r.ID)
+		}
 		if canonicalAt < len(manifestOrder) && r.ID == manifestOrder[canonicalAt] {
 			canonicalAt++
-		} else if isCanonical(r.ID) {
+		} else {
 			return fmt.Errorf("scrubber: manifest places rule %q out of normative order (CONTRIBUTING.md §5)", r.ID)
 		}
 	}
 	if canonicalAt != len(manifestOrder) {
 		return fmt.Errorf("scrubber: manifest omits one or more of the 11 CONTRIBUTING.md §5 rules")
 	}
+	// STRENGTH, not just shape. The checks above prove the manifest is
+	// well-formed; they do not prove it is the manifest this engine was built
+	// to run. A ConfigMap edit that flips one boolean, weakens one pattern to
+	// something that still compiles, or rewrites one template is accepted by
+	// every check above and installs cleanly:
+	//
+	//   multiLine=false on pem_private_key takes the rule out of the M3
+	//     cross-line pass, so rule 11 redacts only the BEGIN marker and the
+	//     block body survives (defect D-3, "the leak was total").
+	//
+	//   pattern="x" compiles, so the rule installs and never fires.
+	//
+	//   template="${1}${2}${3}" makes ExpandString substitute the captured
+	//     groups back, so the output is byte-identical to the input while
+	//     RedactionReport still records a hit - a rule that reports success
+	//     while redacting nothing.
+	//
+	// docs/security-invariants.md states the contract: "There is no
+	// configuration that disables a rule, redacts nothing, or substitutes a
+	// different placeholder." That is only true if the loader enforces it, and
+	// until this check it did not. The shipped manifests all agree with
+	// manifest.go (asserted by TestEveryShippedManifestCopyMatchesTheCompiledOne),
+	// so refusing a divergence costs nothing that ships.
+	for _, r := range mf.Rules {
+		if r.Pattern != rulePatterns[r.ID] {
+			return fmt.Errorf(
+				"scrubber: manifest rule %q pattern does not match the compiled table; "+
+					"the manifest is a transcription of CONTRIBUTING.md §5 and may not be edited",
+				r.ID,
+			)
+		}
+		if r.MultiLine != multiLineRules[r.ID] {
+			return fmt.Errorf(
+				"scrubber: manifest rule %q multiLine=%v does not match the compiled table (%v)",
+				r.ID, r.MultiLine, multiLineRules[r.ID],
+			)
+		}
+		if r.Template != canonicalTemplates[r.ID] {
+			return fmt.Errorf(
+				"scrubber: manifest rule %q template %q does not match the compiled table",
+				r.ID, r.Template,
+			)
+		}
+	}
+
 	rules := make([]Rule, 0, len(mf.Rules))
 	templates := make(map[RuleID]string)
 	for _, r := range mf.Rules {

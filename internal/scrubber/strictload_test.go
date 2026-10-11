@@ -22,6 +22,7 @@ import (
 
 func loadWith(t *testing.T, mutate func(string) string) error {
 	t.Helper()
+	t.Cleanup(captureGlobals())
 	raw := strings.Replace(
 		string(mustRead(t, "../../deploy/scrubber-configmap.yaml")),
 		"    scrubber.json: |\n",
@@ -106,6 +107,7 @@ func TestAnEmptyPatternCannotReachTheManifest(t *testing.T) {
 }
 
 func TestTruncatedJSONIsStillRefused(t *testing.T) {
+	t.Cleanup(captureGlobals())
 	for name, raw := range map[string]string{
 		"truncated":     `{"version":"1","rules":[{"id":"pem_private_key"`,
 		"not json":      `version: 1`,

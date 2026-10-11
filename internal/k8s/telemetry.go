@@ -30,6 +30,21 @@ const (
 	// this inside the 2s detection budget (ARCH §7).
 	LogLimitBytes int64 = 51200
 
+	// ClusterEventsMax caps how many events are fetched per incident.
+	//
+	// This is a cross-language contract value, not a tuning knob. The agent's
+	// IncidentPayload.cluster_events is Field(max_length=CLUSTER_EVENTS_MAX=64)
+	// (agent/models.py), and that bound is a hard reject: a payload carrying more
+	// than 64 events is refused 422 and the incident is escalated. Before this
+	// bound the List had no Limit, so a pod with a long event history - a
+	// crash-loop that has been crashing for days - produced hundreds of events,
+	// and the incident the Sentinel worked hardest to build was discarded by the
+	// agent as invalid.
+	//
+	// Kept in sync with the agent by cmd/sentinel's TestClusterEventsMaxMatchesAgent
+	// and the agent's own test_phase4_regressions. If either side changes, change both.
+	ClusterEventsMax int64 = 64
+
 	// TelemetryTimeout bounds each network call independently.
 	//
 	// Strictly bounded per call, not per incident: a slow log fetch must not eat
@@ -166,6 +181,9 @@ func (t *Telemetry) Events(ctx context.Context, namespace, podUID string) ([]cor
 		Events(namespace).
 		List(callCtx, metav1.ListOptions{
 			FieldSelector: FieldSelectorEventUID(podUID),
+			// Bounded at the agent's hard cap; see ClusterEventsMax. An unbounded
+			// List makes the incident the Sentinel builds unloadable by the agent.
+			Limit: ClusterEventsMax,
 		})
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: fetching events for uid %s: %s", podUID, RedactError(err))

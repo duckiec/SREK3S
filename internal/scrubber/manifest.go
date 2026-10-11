@@ -146,8 +146,8 @@ var rulePatterns = map[RuleID]string{
 // therefore which take part in the M3 cross-line re-scan (defect D-5).
 //
 // Derived by probing each compiled pattern with newline-bearing inputs, not by
-// inspection. Only pem_private_key and generic_secret_kv qualify, so the
-// cross-line pass runs two patterns instead of eleven.
+// inspection. Only pem_private_key qualifies, so the cross-line pass runs one
+// pattern instead of eleven.
 //
 //nolint:gochecknoglobals // Immutable, read-only after init.
 var multiLineRules = map[RuleID]bool{
@@ -168,6 +168,15 @@ var ruleTemplates = map[RuleID]string{
 	// instead of destroying the surrounding JSON structure.
 	RuleGenericSecretKV: `${1}` + RedactionSentinel + `${3}`,
 }
+
+// canonicalTemplates aliases the init-time ruleTemplates map. LoadManifestBytes
+// REASSIGNS ruleTemplates (it never mutates the map in place), so this variable
+// keeps pointing at the compiled table's templates after a load. The loader
+// validates a manifest's template against this, so a ConfigMap that rewrites a
+// template cannot install a rule that reports a hit while redacting nothing.
+//
+//nolint:gochecknoglobals // Immutable, read-only after init.
+var canonicalTemplates = ruleTemplates
 
 func init() {
 	Manifest = make([]Rule, 0, len(manifestOrder))

@@ -213,6 +213,24 @@ func TestFieldSelectorEventUIDFormat(t *testing.T) {
 	}
 }
 
+// TestClusterEventsMaxMatchesTheAgentContract pins a cross-language bound.
+//
+// The agent's IncidentPayload.cluster_events is Field(max_length=CLUSTER_EVENTS_MAX)
+// (agent/models.py:372 = 64) and a payload above the cap is a hard 422 - the
+// incident the Sentinel worked hardest to build is discarded as invalid. Before
+// Events() bounded its List, a crash-looping pod with a long event history
+// produced hundreds of events and every one of them took the whole payload down.
+//
+// This constant is the Limit Events() passes to the API server. The agent's
+// matching cap is pinned on the Python side (agent/tests/test_phase4_regressions.py
+// ::test_cluster_events_cap_is_pinned_to_the_documented_value). If either side
+// changes, change both.
+func TestClusterEventsMaxMatchesTheAgentContract(t *testing.T) {
+	if ClusterEventsMax != 64 {
+		t.Errorf("ClusterEventsMax = %d, want 64 (must match agent models.CLUSTER_EVENTS_MAX)", ClusterEventsMax)
+	}
+}
+
 // TestEventsWithEmptyUIDIsNotAnError: a pod deleted between the watch event and
 // this call has no events to find. Failing the whole incident over that would lose
 // the logs already collected.

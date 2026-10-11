@@ -119,6 +119,13 @@ type Client struct {
 	events        func(*worker.Incident) []ClusterEvent
 	version       string
 	ownsTransport bool
+	// sleep pauses for d or until ctx is done, reporting whether the pause ran
+	// to completion. Injectable so a test can count backoffs deterministically:
+	// retryDelay is full-jitter, so its *duration* is ~uniform in [0, ceiling)
+	// and is not a deterministic signal, but whether it was invoked at all is -
+	// and that is exactly the property the transport-failure retry test asserts.
+	// The production value is timerSleep.
+	sleep func(context.Context, time.Duration) bool
 }
 
 // Compile-time proof that the emitter is a valid sink. A signature drift in
@@ -162,6 +169,7 @@ func New(cfg Config) (*Client, error) {
 		now:          now,
 		events:       cfg.Events,
 		version:      cfg.SentinelVersion,
+		sleep:        timerSleep,
 	}
 	if cfg.HTTPClient != nil {
 		client.http = cfg.HTTPClient
@@ -341,6 +349,20 @@ func (c *Client) Emit(ctx context.Context, payload *IncidentPayload) error {
 				return &EmitError{Outcome: OutcomeEscalate, Attempts: attempt, Err: ctx.Err()}
 			}
 			last = &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: err}
+			if attempt == c.maxAttempts {
+				return last
+			}
+			// A transport failure is retryable, but it must not be retried
+			// instantly. Connection-refused against a down agent used to fire the
+			// remaining POSTs back-to-back, and the only thing bounding a retry
+			// loop against an unreachable host was MaxAttempts - three attempts of
+			// "refuse instantly, refuse instantly, escalate" is a busy loop with
+			// extra steps, and it collides with every other worker's retry. Back
+			// off exactly as the 429 path does: capped full jitter via c.wait,
+			// context-aware so it cannot outlive the worker's cancellation.
+			if !c.wait(ctx, attempt, detail) {
+				return &EmitError{Outcome: OutcomeEscalate, StatusCode: status, Detail: detail, Attempts: attempt, Err: ctx.Err()}
+			}
 
 		case status >= 200 && status < 300:
 			// A 2xx is a claim about transport, not about triage. The body has
@@ -520,8 +542,15 @@ func verifyVerdict(body []byte, sent *IncidentPayload) error {
 // alive past the point its context was cancelled, which is the goroutine leak
 // ROADMAP 3.5.4 is written to catch.
 func (c *Client) wait(ctx context.Context, attempt int, detail string) bool {
-	delay := retryDelay(attempt, retryAfter(detail))
-	timer := time.NewTimer(delay)
+	return c.sleep(ctx, retryDelay(attempt, retryAfter(detail)))
+}
+
+// timerSleep is the production sleep: a context-aware pause, never a bare
+// time.Sleep - a bare sleep would keep a pool worker alive past the point its
+// context was cancelled, which is the goroutine leak ROADMAP 3.5.4 is written to
+// catch.
+func timerSleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-timer.C:

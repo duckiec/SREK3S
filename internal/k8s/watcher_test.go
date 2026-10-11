@@ -1,11 +1,14 @@
 package k8s
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -822,6 +825,144 @@ func TestRunClosesEventsOnShutdown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Events() was not closed on shutdown")
 	}
+}
+
+// TestRunLogsTheAppliedResyncPeriod pins the R (reliability) logging fix.
+//
+// WithResyncPeriod changes w.resync, but Run logged the DefaultResyncPeriod
+// constant instead of the value it actually applied - so an operator reading the
+// log deduced the wrong resync cadence. The log must report the applied value.
+func TestRunLogsTheAppliedResyncPeriod(t *testing.T) {
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Seed a pod: an empty-store informer and the normal path differ, and this
+	// test targets the normal startup path.
+	watcher := NewPodWatcher(newFakeClient(newPod("resync-probe", withStatus(oomKilled(1)))),
+		WithLogger(log),
+		WithResyncPeriod(5*time.Minute))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watcher.Run(stop)
+	}()
+
+	// Wait until Run actually logs the start line. Closing stop before Run has
+	// reached it makes Run take the "cache did not sync" early return - a different
+	// code path that never logs resync - so the test would race its own subject.
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(logs.String(), "pod watcher started") {
+		if time.Now().After(deadline) {
+			t.Fatalf("Run never logged 'pod watcher started'; logged:\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	<-done
+
+	out := logs.String()
+	if !strings.Contains(out, "resync=5m0s") {
+		t.Errorf("Run did not log the applied resync=5m0s; logged:\n%s", out)
+	}
+	if strings.Contains(out, "resync=30s") {
+		t.Errorf("Run logged the DefaultResyncPeriod constant (30s) rather than the applied 5m0s:\n%s", out)
+	}
+}
+
+// syncBuffer is a concurrency-safe sink for a slog handler. Run logs from its own
+// goroutine while the test polls the buffer, so an unsynchronised bytes.Buffer is
+// itself a data race under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestInformerCallbacksStopBeforeTheChannelCloses guards the shutdown ordering.
+//
+// Run closes w.events on the way out, and every informer handler it registered
+// does a non-blocking select-send on that channel. A send on a closed channel is
+// "ready", so the send case is chosen and it panics. Before the fix Run closed
+// the channel without ever waiting for the informer to stop: factory.Start runs
+// the handlers on goroutines the factory owns, and one dispatched in the window
+// after stop closed sent on the closed channel - a SIGKILL-shaped crash on a
+// routine SIGTERM. The fix defers factory.Shutdown() after close so LIFO runs
+// Shutdown first; client-go v0.31's Shutdown -> wg.Wait chain has returned every
+// handler goroutine before close runs.
+//
+// The assertion is the -race detector: concurrent send and close on a channel is
+// a data race it flags, and a send-after-close is a runtime panic that fails the
+// test binary. This drives real informer traffic through the watcher's own
+// goroutines while stopping, so the shutdown path and the handler dispatch
+// overlap. It increases the pressure on that window (it is not a
+// guaranteed-reproduce test - the bug is timing-dependent) and, combined with
+// -race, is what CI relies on.
+func TestInformerCallbacksStopBeforeTheChannelCloses(t *testing.T) {
+	pod := newPod("shutdown-race", withStatus(oomKilled(1)))
+	client := newFakeClient(pod)
+	watcher := NewPodWatcher(client, WithLogger(discardLogger()))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watcher.Run(stop)
+	}()
+
+	waitForSync(t, watcher)
+
+	// Consume throughout, so a handler is never blocked on a full egress channel
+	// and the sends-under-load are real. The range ends when Run closes Events().
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range watcher.Events() {
+		}
+	}()
+
+	// Hammer the informer with updates from another goroutine while we stop it,
+	// so the informer's handler dispatch and Run's teardown genuinely overlap.
+	updates := make(chan struct{})
+	go func() {
+		defer close(updates)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			updated := pod.DeepCopy()
+			updated.Status.ContainerStatuses = []corev1.ContainerStatus{crashLooping(int32(i % 9))}
+			_, _ = client.CoreV1().Pods("payments").Update(newCtx(t), updated, metav1.UpdateOptions{})
+		}
+	}()
+
+	close(stop)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after stop closed")
+	}
+	// If Events() was never closed, the consumer's range never ends.
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Events() was not closed on shutdown")
+	}
+	<-updates
 }
 
 // ---------------------------------------------------------------------------
