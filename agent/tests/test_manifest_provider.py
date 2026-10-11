@@ -20,6 +20,7 @@ passing for the wrong reason.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pathlib
@@ -32,6 +33,7 @@ import pytest
 
 import classifier
 import models
+import rescan
 import triage
 import warroom
 from classifier import (
@@ -1023,3 +1025,34 @@ def test_the_tier_one_rca_is_not_the_dispatch(checkout: pathlib.Path) -> None:
     outcome = triage_payload(payload, manifest_provider=FileManifestProvider(checkout))
     assert outcome.response.rca_markdown.startswith("# RCA:")
     assert "## Evidence" in outcome.response.rca_markdown
+
+
+def test_the_tier_one_root_cause_is_rescanned(checkout: pathlib.Path) -> None:
+    """I-B6 on the Tier-1 path (triage.py:783).
+
+    test_ib6_response_strings.py covers both tiers, but every parametrised case
+    there reaches Tier-2 (no provider is passed), so the Tier-1 ``root_cause``
+    construction was never exercised with a planted credential. The Tier-1
+    summary is the deterministic rationale, which quotes ``previous_reason``, so a
+    secret parked there must reach the re-scan on this path too.
+    """
+    payload = models.IncidentPayload.model_validate(
+        incident_document(previous_reason="AKIAIOSFODNN7EXAMPLE")
+    )
+    outcome = triage_payload(payload, manifest_provider=FileManifestProvider(checkout))
+    assert (
+        outcome.tier.value == "TIER_1_TOIL"
+    ), "the payload must take the Tier-1 path or the test is vacuous"
+
+    body = json.loads(outcome.response.model_dump_json())
+    assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(
+        body
+    ), "I-B6: the credential reached the Tier-1 Contract B body"
+    # A rule fired rather than the field being absent: the masked sentinel is
+    # present in the summary the rationale built from previous_reason. Without
+    # this, a Tier-1 path that simply dropped the reason would pass the leak
+    # assertion while proving nothing about the re-scan.
+    assert rescan.MASK in outcome.response.root_cause.summary, (
+        "the Tier-1 summary carries no masked reason; either previous_reason never "
+        "reached it (the test is vacuous) or the re-scan removed the whole clause"
+    )
