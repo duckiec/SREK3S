@@ -721,7 +721,7 @@ def test_with_no_base_url_the_sdk_default_is_used(
     """Unset is not the same request as empty, and must reach the real default."""
     wire = openai_serving(monkeypatch, json.dumps(_VALID))
     providers.OpenAIProvider(api_key="sk-test", env={}).complete("e")
-    assert "api.openai.com" in wire.url
+    assert httpx.URL(wire.url).host == "api.openai.com"
 
 
 def test_an_unreachable_base_url_fails_rather_than_falling_back(
